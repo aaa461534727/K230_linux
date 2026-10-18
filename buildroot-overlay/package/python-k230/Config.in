@@ -1,0 +1,13 @@
+config BR2_PACKAGE_PYTHON_K230
+    tristate "python-k230"
+    select BR2_PACKAGE_PYTHON3
+    select BR2_PACKAGE_PYTHON_PYBIND if BR2_INSTALL_LIBSTDCPP
+    select BR2_PACKAGE_LVGL
+    select BR2_PACKAGE_LIBNNCASE
+    select BR2_PACKAGE_LIBMMZ
+    select BR2_PACKAGE_GSL_LITE
+    select BR2_PACKAGE_JSON_FOR_MODERN_CPP
+    help
+        Python test for k230
+        Requires lvgl version 97a99a8affe966617f048830a007bbf8bea63da6
+        (uses the lvgl_private staging headers only installed by that version)

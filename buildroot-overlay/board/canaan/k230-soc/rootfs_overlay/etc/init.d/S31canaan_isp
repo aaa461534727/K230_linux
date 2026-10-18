@@ -1,0 +1,16 @@
+#!/bin/sh
+mmc_bootddev=$(cat /proc/cmdline  | sed  -n  "s#root=\(\/dev\/mmcblk[0-9]\).*#\1#p" )
+
+if [ -n "${mmc_bootddev}" ] && [ -b "${mmc_bootddev}" ]; then
+    mount ${mmc_bootddev}p1 /boot
+fi
+modprobe vvcam_isp
+modprobe vvcam_mipi
+modprobe vvcam_vb
+modprobe vvcam_isp_subdev
+modprobe vvcam_video mcm_mask=1
+modprobe nonai2d
+ISP_MEDIA_SENSOR_DRIVER=/usr/lib/libvvcam.so /usr/bin/isp_media_server > /dev/null 2> /tmp/isp.err.log &
+
+
+vo_init &
