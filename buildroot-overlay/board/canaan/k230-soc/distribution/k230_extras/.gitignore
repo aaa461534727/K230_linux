@@ -1,0 +1,2 @@
+# 构建机本地 WiFi 凭证 (SSID|PASS), 不入 git
+root/wifi.secret

@@ -120,6 +120,96 @@ get_image_last_name() {
 
 
 
+# ---------------------------------------------------------------------------
+# K230 本地补丁 (2026-10-20): 发行版 rootfs 内置常用命令 + 板载 WiFi 预配置
+#   文件: distribution/k230_extras/ (20-wlan0.network / wpa_supplicant-wlan0.conf / setup_wifi.sh)
+#   凭证: distribution/k230_extras/root/wifi.secret (build 机本地文件, 不入 git)
+#   说明: K230/docs/ROOTFS_UBUNTU.md §9
+# ---------------------------------------------------------------------------
+k230_chroot_install() {
+    local rootfs="$1"; shift
+    local pkgs="$*"
+    local qemu="/usr/bin/qemu-riscv64-static"
+
+    if ! command -v chroot >/dev/null 2>&1 || [ ! -x "${qemu}" ]; then
+        print_red "K230 extras: 需要 chroot 和 qemu-riscv64-static (apt install qemu-user-static)"
+        return 1
+    fi
+
+    print_blue "K230 extras: 安装常用命令 (${pkgs}) ..."
+    cp -f "${qemu}" "${rootfs}/usr/bin/qemu-riscv64-static"
+
+    # 临时 DNS: 记录原状 (ubuntu24 的 /etc/resolv.conf 是指向 stub-resolv.conf 的软链)
+    local rc="${rootfs}/etc/resolv.conf"
+    local rc_link="" rc_backup=""
+    if [ -L "${rc}" ]; then
+        rc_link="$(readlink "${rc}")"
+        rm -f "${rc}"
+    elif [ -f "${rc}" ]; then
+        rc_backup="${rc}.k230bak"
+        cp -f "${rc}" "${rc_backup}"
+    fi
+    printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > "${rc}"
+
+    mount --bind /proc "${rootfs}/proc" 2>/dev/null || true
+    local ret=0
+    chroot "${rootfs}" /bin/bash -c \
+        "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y --no-install-recommends ${pkgs}" \
+        || ret=$?
+    umount "${rootfs}/proc" 2>/dev/null || true
+
+    # 还原 DNS, 清掉 qemu 与 apt 缓存
+    rm -f "${rootfs}/usr/bin/qemu-riscv64-static"
+    if [ -n "${rc_link}" ]; then
+        ln -sfn "${rc_link}" "${rc}"
+    elif [ -n "${rc_backup}" ]; then
+        mv -f "${rc_backup}" "${rc}"
+    else
+        rm -f "${rc}"
+    fi
+    rm -rf "${rootfs}/var/lib/apt/lists/"* "${rootfs}/var/cache/apt/archives/"*.deb
+    return "${ret}"
+}
+
+k230_apply_extras() {
+    local distname="$1"
+    local rootfs="$2"
+    local extras="${K230_SDK_ROOT}/buildroot-overlay/board/canaan/k230-soc/distribution/k230_extras"
+
+    [ -d "${extras}" ] || return 0
+
+    print_blue "K230 extras: 覆盖 network / wpa_supplicant / setup_wifi.sh ..."
+    cp -a "${extras}/." "${rootfs}/"
+
+    # 可选: build 机本地 WiFi 凭证 (SSID|PASS), 烧进镜像即上电自连
+    local secret="${extras}/root/wifi.secret"
+    local wpa_conf="${rootfs}/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"
+    if [ -f "${secret}" ] && command -v wpa_passphrase >/dev/null 2>&1; then
+        local w_ssid w_pass
+        w_ssid="$(cut -d'|' -f1 "${secret}")"
+        w_pass="$(cut -d'|' -f2- "${secret}")"
+        if [ -n "${w_ssid}" ] && [ -n "${w_pass}" ]; then
+            print_blue "K230 extras: 预置 WiFi 凭证 (SSID=${w_ssid})"
+            if printf '%s' "${w_pass}" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+                # 第二段已是 64 位 hex PSK (与 SSID 绑定), 直接写
+                printf 'network={\n\tssid="%s"\n\tpsk=%s\n}\n' "${w_ssid}" "${w_pass}" >> "${wpa_conf}"
+            else
+                wpa_passphrase "${w_ssid}" "${w_pass}" >> "${wpa_conf}"
+                sed -i '/^[[:space:]]*#psk=/d' "${wpa_conf}"
+            fi
+        fi
+    else
+        print_yellow "K230 extras: 无 ${secret}, 镜像不含 WiFi 凭证 (上板跑 /root/setup_wifi.sh <PASS>)"
+    fi
+    chmod 600 "${wpa_conf}"
+
+    if [ "${distname}" = "ubuntu" ]; then
+        k230_chroot_install "${rootfs}" \
+            "net-tools iproute2 dnsutils curl wget vim-tiny htop wireless-tools iw wpasupplicant" \
+            || { print_red "K230 extras: 额外软件包安装失败"; exit 1; }
+    fi
+}
+
 # Generate distribution rootfs and finalize image
 # $1: dist name (debian/ubuntu)
 # $2: dist_rootfs tarball name (debian13/ubuntu24)
@@ -273,11 +363,21 @@ distribution_rootfs_replace() {
     ln -s root/app app
     cd - >/dev/null
 
+    # K230 本地补丁: 常用命令 + WiFi 预配置 (2026-10-20)
+    k230_apply_extras "${distname}" "${distr_rootfs}"
+
     # Generate ext4 image for rootfs
     print_blue "Generating ext4 image..."
     local rootfs_size
     rootfs_size=$(( $(sudo du -sm "${distr_rootfs}" | cut -f1) + 300 ))
     mkfs.ext4 -F -d "${distr_rootfs}" -r 1 -N 0 -m 1 -L "rootfs" "${distr_rootfs}.ext4" "${rootfs_size}m"
+
+    # K230 本地补丁: 保证 ext4 干净; 有错误时首启 growfs/resize2fs 会被内核拒绝
+    e2fsck -fy "${distr_rootfs}.ext4" >/dev/null 2>&1 || true
+    if ! e2fsck -fn "${distr_rootfs}.ext4" >/dev/null 2>&1; then
+        print_red "Error: ${distr_rootfs}.ext4 校验仍有错误"
+        exit 1
+    fi
 
     # Resize the main image and embed the ext4 rootfs
     print_blue "Embedding rootfs into image..."
@@ -327,9 +427,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-print_blue "Updating package lists..."
-apt-get update
-apt-get install -y  parted curl
+# K230 本地补丁: 宿主机若开了外架 (arm64/i386), apt-get update 会因 404 返回非 0
+# 而 set -e 直接中断构建 (2026-10-18 踩过). 因此只在缺依赖时才动 apt, 且 update 失败不致命.
+if ! command -v parted >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    print_blue "Installing host dependencies (parted, curl)..."
+    apt-get update || print_yellow "apt-get update 有失败项 (外架 404), 继续用旧索引"
+    apt-get install -y parted curl
+fi
 
 # Determine download mirror
 
