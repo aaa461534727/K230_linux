@@ -10,7 +10,7 @@
 | 包 | 补丁 | 改了哪些文件 | 一览 |
 |---|---|---|---|
 | `rtl8189fs` (94cc959d…) | `buildroot-overlay/package/rtl8189fs/0100-k230-miracast.patch` | `core/rtw_mlme_ext.c` · `os_dep/linux/ioctl_cfg80211.c` | 4 处: P2P/WFD IE 上 beacon/probe-resp · change_beacon 吃动态 WPS IE (PBC 位) · device 角色上报 probe req · 单信道扫描 6→5 |
-| `wpa_supplicant` 2.11 | `buildroot-overlay/package/wpa_supplicant/0100-k230-miracast.patch` | `src/p2p/p2p_go_neg.c` · `src/p2p/p2p_pd.c` · `src/p2p/p2p_group.c` · `src/p2p/p2p_i.h` · `src/eapol_supp/eapol_supp_sm.c` · `wpa_supplicant/p2p_supplicant.c` · `wpa_supplicant/wpa_supplicant.c` | 6 处: GO-Neg 自动接受 · PD 响应带 Group ID/Operating Channel · 关联前 cancel ROC · EAPOL-Start 立即发 · WPS 退避封顶 1.5 s · p2p_group_get_ssid |
+| `wpa_supplicant` 2.11 | `buildroot-overlay/package/wpa_supplicant/0100-k230-miracast.patch` | `src/p2p/p2p_go_neg.c` · `src/p2p/p2p_pd.c` · `src/p2p/p2p_group.c` · `src/p2p/p2p_i.h` · `src/eapol_supp/eapol_supp_sm.c` · `wpa_supplicant/p2p_supplicant.c` · `wpa_supplicant/wpa_supplicant.c` | 7 处: GO-Neg 自动接受 · **GO-Neg-Resp 不再省略 Operating Channel + Channel List 收成单信道** · PD 响应带 Group ID/Operating Channel · 关联前 cancel ROC · EAPOL-Start 立即发 · WPS 退避封顶 1.5 s · p2p_group_get_ssid |
 
 两个目录里各有一份 `README.md`, 写着每处改动的理由、证据、重编与回滚命令。
 
@@ -79,8 +79,12 @@ $SSH 'nohup setsid sh /root/wfd-device-watcher.sh >>/tmp/wfd-device-watcher.log 
 - 手机 GO 在"刚建组、零客户端"的 16 s 窗口内, 对我们的合法 AUTH **0 ACK**
   (17:49 轮: 179 帧 AUTH / 0 ACK, 手机却回了 168 beacon + 36 probe-resp);
 - 唯一一次真机连上是 2026-10-23 16:42 (ch11/2462, WPS 全通, 持活 25 s);
-- 新根因候选: 板上 `p2p_pref_chan=81:11` 让 `p2p->num_pref_freq` 恒 0 ⇒ 我们继续
-  `Omit Operating Channel`, 手机不知道我们只支持 2.4G ⇒ 才协商到 ch8 / ch149。
-- 下一步: 改 `src/p2p/p2p_go_neg.c::p2p_build_go_neg_resp()` 让 REMOTE_GO 时**无条件**带
-  Operating Channel (81/11), 并删掉 `p2p_pref_chan`; 判据 = `P2P-GO-NEG-SUCCESS ... freq=2462`。
+- 根因 (已定位, 已改): 板上 `p2p_pref_chan=81:11` 让 `p2p->num_pref_freq` 恒 0 ⇒ 我们继续
+  `Omit Operating Channel`, 手机不知道我们只支持 2.4G ⇒ 才协商到 ch8 / ch149 ⇒ 对我们
+  179 帧合法 AUTH 一帧不 ACK。
+- **补丁已落 (2026-10-23)**: `p2p_build_go_neg_resp()` 里 REMOTE_GO 且 `cfg_op_channel` 时
+  照样带 Operating Channel, 并把 Channel List 收成单信道; 板上配置改成
+  `p2p_oper_reg_class=81` + `p2p_oper_channel=$LISTEN_CHANNEL`, **不再写 `p2p_pref_chan`**。
+  判据 = `P2P-GO-NEG-SUCCESS ... freq=2462` + 日志有 `K230P2P: advertise single channel 81/11`。
+  细节见 `buildroot-overlay/package/wpa_supplicant/README.md` 末尾一节。
   改完照 §2 重编, 板端只需换 supplicant (§3)。
