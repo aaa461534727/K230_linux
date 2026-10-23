@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# S45netauto — 给所有有线网卡 (eth* / enx*) 自动跑 DHCP
+#
+# 背景: 原 /etc/network/interfaces 里 `auto eth0` 是注释掉的, 且 pre-up 引用了
+#       不存在的 /etc/network/nfs_check; 板上实际常用 USB 网卡 (enx00e04c88106c),
+#       刷完机后网络起不来就 ssh 不进去。本脚本不依赖接口名, 有线网卡一律 udhcpc。
+#
+# 用法: /etc/init.d/S45netauto {start|stop|restart}
+
+DAEMON_ARGS="-b -q -t 5 -T 5"
+PIDDIR=/var/run/netauto
+
+is_wireless() {
+    [ -d "/sys/class/net/$1/wireless" ] || [ -e "/sys/class/net/$1/phy80211" ]
+}
+
+start_net() {
+    mkdir -p "$PIDDIR"
+    n=0
+    # 最多等 10s, 让 USB 网卡 / 驱动枚举完成
+    while [ $n -lt 10 ]; do
+        [ -n "$(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enx|usb)' )" ] && break
+        n=$((n + 1))
+        sleep 1
+    done
+
+    for i in $(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enx|usb)'); do
+        is_wireless "$i" && continue
+        ip link set "$i" up 2>/dev/null
+        echo "S45netauto: udhcpc on $i"
+        udhcpc $DAEMON_ARGS -i "$i" -p "$PIDDIR/udhcpc-$i.pid" >/dev/null 2>&1 &
+    done
+}
+
+stop_net() {
+    for p in "$PIDDIR"/*.pid; do
+        [ -e "$p" ] || continue
+        kill "$(cat "$p")" 2>/dev/null
+        rm -f "$p"
+    done
+}
+
+case "$1" in
+    start)   start_net ;;
+    stop)    stop_net ;;
+    restart) stop_net; start_net ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0

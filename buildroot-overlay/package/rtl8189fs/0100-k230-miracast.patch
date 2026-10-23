@@ -1,0 +1,273 @@
+--- a/core/rtw_mlme_ext.c
++++ b/core/rtw_mlme_ext.c
+@@ -1480,10 +1480,21 @@
+ 	u8 wifi_test_chk_rate = 1;
+ 
+ #ifdef CONFIG_IOCTL_CFG80211
++	/* K230P2P: report Probe Request to cfg80211 also when we are NOT an AP/GO, i.e.
++	 * when wpa_supplicant drives this interface as a P2P device in listen state.
++	 * The legacy gate (!P2P_STATE_NONE) only holds while the driver runs its own
++	 * P2P state machine; under DRIVER_CFG80211 wdinfo state stays P2P_STATE_NONE,
++	 * so a device role silently dropped every Probe Request and was undiscoverable.
++	 * GO behaviour unchanged: MLME_IS_AP() && state != NONE still falls through to
++	 * the in-driver issue_probersp_p2p() path below.
++	 */
+ 	if ((pwdinfo->driver_interface == DRIVER_CFG80211)
+-	    && !rtw_p2p_chk_state(pwdinfo, P2P_STATE_NONE)
+-	    && (GET_CFG80211_REPORT_MGMT(adapter_wdev_data(padapter), IEEE80211_STYPE_PROBE_REQ) == _TRUE)
++	    && (!MLME_IS_AP(padapter)
++		|| ((GET_CFG80211_REPORT_MGMT(adapter_wdev_data(padapter), IEEE80211_STYPE_PROBE_REQ) == _TRUE)
++		    && !rtw_p2p_chk_state(pwdinfo, P2P_STATE_NONE)))
+ 	) {
++		pr_info("K230P2P: probe req -> cfg80211 (ap=%d p2p_state=%d)\n",
++			MLME_IS_AP(padapter), rtw_p2p_state(pwdinfo));
+ 		rtw_cfg80211_rx_probe_request(padapter, precv_frame);
+ 		return _SUCCESS;
+ 	}
+@@ -8249,11 +8260,24 @@
+ #endif
+ 
+ #ifdef CONFIG_P2P
+-	if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO)
++	if ((rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO) || rtw_p2p_chk_role(pwdinfo, P2P_ROLE_DEVICE))
+ 	    /* IOT issue, When wifi_spec is not set, send probe_resp with P2P IE even if probe_req has no P2P IE */
+ 	    && (is_valid_p2p_probereq || !padapter->registrypriv.wifi_spec)) {
+ 		u32 len;
+ #ifdef CONFIG_IOCTL_CFG80211
++		/* K230 2026-10-21: P2P client/device 模式(手机当 GO)也必须能被手机发现。
++		 * 原逻辑只在 P2P_ROLE_GO 时附带 P2P/WFD IE, 而 Android 手机投屏时它是 GO、
++		 * 我们只是 P2P device/client ⇒ 探针响应里没有 P2P IE ⇒ 手机列表里根本看不到。
++		 * role=DEVICE 时改用驱动按角色自组装的 P2P IE (group cap 非 GO)。 */
++		if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_DEVICE)) {
++			static int _k230_dbg = 0;
++			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
++			if (_k230_dbg < 5) {
++				pr_info("K230P2P: probe resp P2P IE (role=DEVICE) len=%u\n", len);
++				_k230_dbg++;
++			}
++			goto k230_p2p_ie_done;
++		}
+ 		if (adapter_wdev_data(padapter)->p2p_enabled && pwdinfo->driver_interface == DRIVER_CFG80211) {
+ 			/* if pwdinfo->role == P2P_ROLE_DEVICE will call issue_probersp_p2p() */
+ 			len = pmlmepriv->p2p_go_probe_resp_ie_len;
+@@ -8264,7 +8288,7 @@
+ 		{
+ 			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
+ 		}
+-
++k230_p2p_ie_done:
+ 		pframe += len;
+ 		pattrib->pktlen += len;
+ 
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -2865,7 +2865,16 @@
+ 	struct sitesurvey_parm parm;
+ 	_irqL	irqL;
+ 	u8 survey_times = 3;
+-	u8 survey_times_for_one_ch = 6;
++	/*
++	 * K230: 上游把"单信道扫描"重复 6 遍, 一次目标 BSSID 扫描要 0.90 s。
++	 * 起初以为这 0.9 s 是坏的, 压到 1 遍 (0.188 s) —— 结果反而更糟:
++	 * 手机 GO 刚发完 GO-Neg-Confirmation, beacon 已经在空口上, 但组内部还没就绪;
++	 * 这 0.19 s 内扫到就立刻发 AUTH, 手机全部静默丢弃 (2026-10-23 16:51 / 17:17 两轮实测:
++	 * 89 个 AUTH 0 ACK), 且之后十几秒都不再放行。
++	 * 唯一成功的 16:42 那轮, 恰好第一次扫空 (0 BSSes) -> 等 0.25 s 重扫 -> +0.66 s 才关联 -> 一次成。
++	 * 所以这里不再抢快, 留约 0.75 s 给手机 GO 起组, 首帧 AUTH 才落进它愿意应答的窗口。
++	 */
++	u8 survey_times_for_one_ch = 5;
+ 	struct cfg80211_ssid *ssids = request->ssids;
+ 	int social_channel = 0, j = 0;
+ 	bool need_indicate_scan_done = _FALSE;
+@@ -4935,6 +4944,93 @@
+ 	return 0;
+ }
+ #else
++#ifdef CONFIG_P2P
++/* K230 (2026-10-20): 上游 wpa_supplicant (cfg80211) 把 P2P IE / WFD IE 放在
++ * "额外 IE" 里 (start_ap 的 beacon_ies / proberesp_ies), 而原厂 start_ap 只用了
++ * settings->beacon.head/tail。
++ * 后果: rtw_add_beacon() 里 "先看到 P2P IE 才启用 GO 角色" 的逻辑不触发,
++ * issue_beacon()/issue_probersp() 的 GO 分支不会追加 P2P IE 和 WFD IE,
++ * 抓包实测 beacon / probe-resp 只有 222 B 且最后一个 IE 是 WPS ⇒ 手机
++ * Wi-Fi Direct + WFD 扫描直接丢掉本 sink (海奇板同样场景是 285 B 三 IE 齐全)。
++ * 这里把额外 IE 交给驱动自己的解析函数, 并直接置好 GO 角色
++ * (不走 rtw_p2p_enable(), 它在 CONFIG_CONCURRENT_MODE 下要求
++ *  iface_id == sel_p2p_iface, 而 GO 跑在 wlan1 会失败)。
++ * type: 0x1=beacon 0x2=probe_resp 0x4=assoc_resp
++ */
++/* K230 (2026-10-22): 把对外宣告的 P2P Group Capability 改成指定值。
++ * 背景: 我们是常驻 GO, supplicant 报 group_capab=0x0b (GO|Persistent|IntraBSS);
++ * 而能连上的海奇板虽然也在跑组, 对外报的是 0x00。实测同一台 Win10:
++ *   · 看到 0x0b 的 K230 -> 发完 PD Request 就再不说话 (零 GO-Neg / 零 Invitation)
++ *   · 若对端 group_capab=0x82 (Win10 自报) 双方都是 GO, 协商无从谈起
++ * P2P Capability 属性布局: id(1) + len(2, LE) + dev_capab(1) + group_capab(1)。
++ * 就地改写 supplicant 传来的额外 IE 缓冲 (cfg80211 的请求内存), 空口立即生效。 */
++static void rtw_k230_force_group_capab(u8 *ies, size_t ies_len, u8 val)
++{
++	size_t i = 0;
++
++	while (i + 2 <= ies_len) {
++		u8 id = ies[i], elen = ies[i + 1];
++		u8 *p = ies + i + 2;
++		size_t j = 4;   /* OUI(3) + type(1) */
++
++		if (i + 2 + elen > ies_len)
++			break;
++		if (id == 221 && elen >= 8 && p[0] == 0x50 && p[1] == 0x6f &&
++		    p[2] == 0x9a && p[3] == 0x09) {
++			while (j + 3 <= elen) {
++				u8 aid = p[j];
++				u16 alen = (u16)(p[j + 1] | (p[j + 2] << 8));
++
++				if ((size_t)j + 3 + alen > elen)
++					break;
++				if (aid == 2 && alen == 2) {   /* P2P Capability */
++					if (p[j + 4] != val) {
++						pr_info("K230P2P: group_capab 0x%02x -> 0x%02x\n",
++							p[j + 4], val);
++						p[j + 4] = val;
++					}
++					return;
++				}
++				j += 3 + alen;
++			}
++		}
++		i += 2 + elen;
++	}
++}
++
++static void rtw_k230_p2p_apply_extra_ies(struct net_device *ndev, const u8 *ies,
++					 size_t ies_len, int type)
++{
++	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
++	struct wifidirect_info *pwdinfo = &(adapter->wdinfo);
++	u32 p2p_ielen = 0;
++	u8 *p2p_ie;
++
++	if (!ies || !ies_len)
++		return;
++
++	/* 对端 (Win10 自报 group_capab=0x82) 与我们都宣称自己是 GO 时, 协商直接死掉;
++	 * 对齐海奇的做法: 对外报 0x00 (空闲设备), 由对端决定建组方式。 */
++	rtw_k230_force_group_capab((u8 *)ies, ies_len, 0x00);
++
++	p2p_ie = rtw_get_p2p_ie((u8 *)ies, ies_len, NULL, &p2p_ielen);
++	pr_info("K230P2P: extra ies type=%d len=%zu p2p_ielen=%u\n",
++		type, ies_len, p2p_ielen);
++
++	if (type == 0x1 && p2p_ie && p2p_ielen > 0) {
++		rtw_p2p_set_role(pwdinfo, P2P_ROLE_GO);
++		rtw_p2p_set_state(pwdinfo, P2P_STATE_GONEGO_OK);
++		pwdinfo->intent = 15;
++#ifdef CONFIG_IOCTL_CFG80211
++		adapter_wdev_data(adapter)->p2p_enabled = _TRUE;
++#endif
++		adapter->stapriv.expire_to = 3;
++	}
++
++	rtw_cfg80211_set_mgnt_wpsp2pie(ndev, (char *)ies, ies_len, type);
++}
++#endif /* CONFIG_P2P */
++
+ static int cfg80211_rtw_start_ap(struct wiphy *wiphy, struct net_device *ndev,
+ 		struct cfg80211_ap_settings *settings)
+ {
+@@ -4943,6 +5039,9 @@
+ 
+ 	RTW_INFO(FUNC_NDEV_FMT" hidden_ssid:%d, auth_type:%d\n", FUNC_NDEV_ARG(ndev),
+ 		settings->hidden_ssid, settings->auth_type);
++	pr_info("K230P2P: start_ap enter head=%zu tail=%zu bies=%zu pries=%zu\n",
++		settings->beacon.head_len, settings->beacon.tail_len,
++		settings->beacon.beacon_ies_len, settings->beacon.proberesp_ies_len);
+ 
+ 	if (rtw_cfg80211_sync_iftype(adapter) != _SUCCESS) {
+ 		ret = -ENOTSUPP;
+@@ -4952,6 +5051,16 @@
+ 	rtw_mi_buddy_set_scan_deny(adapter, 300);
+ 
+ 	adapter->mlmeextpriv.mlmext_info.hidden_ssid_mode = settings->hidden_ssid;
++#ifdef CONFIG_P2P
++	/* K230 (2026-10-21): 必须先置 wdinfo(P2P IE / GO 角色) 再 rtw_add_beacon(),
++	 * 否则 beacon 模板已生成并交固件, 之后再设 wdinfo 不会重生成模板 ⇒ 空口
++	 * beacon/probe-resp 永远缺 P2P/WFD IE (抓包实证: 只有 WMM+WPS)。
++	 */
++	rtw_k230_p2p_apply_extra_ies(ndev, settings->beacon.beacon_ies,
++		settings->beacon.beacon_ies_len, 0x1);
++	rtw_k230_p2p_apply_extra_ies(ndev, settings->beacon.proberesp_ies,
++		settings->beacon.proberesp_ies_len, 0x2);
++#endif
+ 	ret = rtw_add_beacon(adapter, settings->beacon.head, settings->beacon.head_len,
+ 		settings->beacon.tail, settings->beacon.tail_len);
+ 
+@@ -4994,8 +5103,32 @@
+ 
+ 	RTW_INFO(FUNC_NDEV_FMT"\n", FUNC_NDEV_ARG(ndev));
+ 
++#ifdef CONFIG_P2P
++	/* K230 2026-10-22: ★ 真正生效的路径 ★
++	 * kernel >= 4.1 起, supplicant 的 "Set beacon" 走 NL80211_CMD_SET_BEACON
++	 * → ops->change_beacon (不是 ops->set_beacon!), 所以补丁必须放这里。
++	 *
++	 * 背景 (抓包实证): WPS PBC 起来后 supplicant 打出
++	 *   "WPS: Selected registrar information changed" + "nl80211: Set beacon (beacon_set=1)"
++	 * 它把带 Selected Registrar / DevPwId=PBC 的 WPS IE 放在 **beacon_ies /
++	 * proberesp_ies** (额外 IE), 而原逻辑只取 head/tail ⇒ 额外 IE 被丢弃 ⇒
++	 * 空口 beacon 永远只有 55 B 的老 WPS IE (无 0x1041/0x1012) ⇒ 任何 WPS
++	 * enrollee (MIUI 手机 / 海奇板) 都判 "AP without active PBC Registrar"
++	 * 而拒绝入组。这里补齐额外 IE, 并强制重发一次 beacon。 */
++	pr_info("K230P2P: change_beacon bies=%zu pries=%zu\n",
++		info->beacon_ies_len, info->proberesp_ies_len);
++	rtw_k230_p2p_apply_extra_ies(ndev, info->beacon_ies,
++				     info->beacon_ies_len, 0x1);
++	rtw_k230_p2p_apply_extra_ies(ndev, info->proberesp_ies,
++				     info->proberesp_ies_len, 0x2);
++#endif
++
+ 	ret = rtw_add_beacon(adapter, info->head, info->head_len, info->tail, info->tail_len);
+ 
++#ifdef CONFIG_P2P
++	_update_beacon(adapter, 0xFF, NULL, _TRUE, "k230 change_beacon refresh");
++#endif
++
+ 	return ret;
+ }
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,19, 2))
+@@ -7434,9 +7567,26 @@
+ 		frame_type, reg);
+ #endif
+ 
+-	/* Wait QC Verify */
+-	return;
++	/* K230P2P: the stock code returned here ("Wait QC Verify") and never recorded the
++	 * registration, so GET_CFG80211_REPORT_MGMT() stayed 0 forever and OnProbeReq()
++	 * refused to hand Probe Requests to cfg80211 -> a P2P *device* (listen state)
++	 * could never answer probes and was invisible to phones.  Record both
++	 * registrations instead.  For kernel >= 5.8 the mask arrives in mgmt_frame_regs.
++	 */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
++	{
++		u32 mask = BIT(IEEE80211_STYPE_PROBE_REQ >> 4) |
++			   BIT(IEEE80211_STYPE_ACTION >> 4);
+ 
++		pwdev_priv->report_mgmt &= ~mask;
++		if (upd->global_stypes & BIT(IEEE80211_STYPE_PROBE_REQ >> 4))
++			SET_CFG80211_REPORT_MGMT(pwdev_priv, IEEE80211_STYPE_PROBE_REQ, 1);
++		if (upd->global_stypes & BIT(IEEE80211_STYPE_ACTION >> 4))
++			SET_CFG80211_REPORT_MGMT(pwdev_priv, IEEE80211_STYPE_ACTION, 1);
++	}
++	(void)frame_type;
++	(void)reg;
++#else
+ 	switch (frame_type) {
+ 	case IEEE80211_STYPE_PROBE_REQ: /* 0x0040 */
+ 		SET_CFG80211_REPORT_MGMT(pwdev_priv, IEEE80211_STYPE_PROBE_REQ, reg);
+@@ -7447,6 +7597,8 @@
+ 	default:
+ 		break;
+ 	}
++#endif
++	RTW_INFO("K230P2P: mgmt_frame_register report_mgmt=0x%x\n", pwdev_priv->report_mgmt);
+ 
+ exit:
+ 	return;

@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# S96miracast — 开机拉起 Miracast 接收链路 (全部硬件解码):
+#
+#   wfd-sink (RTSP/RTP 收 H.264, 输出裸流到 stdout)
+#        |  v4l2_dec (K230 mvx 硬解 /dev/video0, 输出 NV12 + 16 字节帧头)
+#        |  drmplay  (DRM 直出 480x800 屏, 等比缩放 + 黑边)
+#
+# 关键点 (踩过的坑, 别改回去):
+#   1) v4l2_dec 必须 -H: 每帧前加头, drmplay 才能按真实分辨率自适应 (手机可能推 1080p)
+#   2) wfd-sink 的 -d /dev/stdout 写的是 **管道**, 日志一律走 stderr
+#   3) 三个进程用 sh 管道串起来, 任何一个挂掉整条链路重启
+#
+# 用法: /etc/init.d/S96miracast {start|stop|restart|status}
+# 日志: /var/log/miracast.log (sink) / miracast-dec.log / miracast-play.log
+
+BIN_SINK=/usr/bin/wfd-sink
+BIN_DEC=/usr/bin/v4l2_dec
+BIN_PLAY=/usr/bin/drmplay
+LOGDIR=/var/log
+PIDFILE=/var/run/miracast.pid
+SCREEN_W=480
+SCREEN_H=800
+
+start_pipeline() {
+    mkdir -p "$LOGDIR"
+    echo "S96miracast: 启动 wfd-sink | v4l2_dec(硬解) | drmplay"
+    setsid sh -c "
+        while :; do
+            $BIN_SINK -d /dev/stdout 2>>$LOGDIR/miracast.log \
+              | $BIN_DEC /dev/stdin /dev/stdout -H 2>>$LOGDIR/miracast-dec.log \
+              | $BIN_PLAY -H -p nv12 -w $SCREEN_W -h $SCREEN_H -r 30 \
+                    2>>$LOGDIR/miracast-play.log
+            echo \"\$(date '+%F %T') 链路退出, 2s 后重启\" >> $LOGDIR/miracast.log
+            sleep 2
+        done
+    " >/dev/null 2>&1 &
+    echo $! > "$PIDFILE"
+}
+
+stop_pipeline() {
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE")
+        # setsid 起的是进程组长, 负号杀整组 (含三个子进程)
+        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    pkill -x wfd-sink 2>/dev/null
+    pkill -x v4l2_dec 2>/dev/null
+    pkill -x drmplay 2>/dev/null
+}
+
+case "$1" in
+    start)   stop_pipeline; start_pipeline ;;
+    stop)    stop_pipeline ;;
+    restart) stop_pipeline; sleep 1; start_pipeline ;;
+    status)
+        pgrep -x wfd-sink >/dev/null && echo "wfd-sink: running" || echo "wfd-sink: stopped"
+        pgrep -x v4l2_dec >/dev/null && echo "v4l2_dec: running" || echo "v4l2_dec: stopped"
+        pgrep -x drmplay  >/dev/null && echo "drmplay: running"  || echo "drmplay: stopped"
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+
+exit 0
