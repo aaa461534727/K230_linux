@@ -1,6 +1,6 @@
---- a/core/rtw_mlme_ext.c
-+++ b/core/rtw_mlme_ext.c
-@@ -1480,10 +1480,21 @@
+--- a/core/rtw_mlme_ext.c	2025-01-12 23:02:59.000000000 -0800
++++ b/core/rtw_mlme_ext.c	2026-10-24 06:34:33.338194544 -0700
+@@ -1480,10 +1480,19 @@
  	u8 wifi_test_chk_rate = 1;
  
  #ifdef CONFIG_IOCTL_CFG80211
@@ -15,16 +15,31 @@
  	if ((pwdinfo->driver_interface == DRIVER_CFG80211)
 -	    && !rtw_p2p_chk_state(pwdinfo, P2P_STATE_NONE)
 -	    && (GET_CFG80211_REPORT_MGMT(adapter_wdev_data(padapter), IEEE80211_STYPE_PROBE_REQ) == _TRUE)
-+	    && (!MLME_IS_AP(padapter)
-+		|| ((GET_CFG80211_REPORT_MGMT(adapter_wdev_data(padapter), IEEE80211_STYPE_PROBE_REQ) == _TRUE)
-+		    && !rtw_p2p_chk_state(pwdinfo, P2P_STATE_NONE)))
++	    && !MLME_IS_AP(padapter)
  	) {
 +		pr_info("K230P2P: probe req -> cfg80211 (ap=%d p2p_state=%d)\n",
 +			MLME_IS_AP(padapter), rtw_p2p_state(pwdinfo));
  		rtw_cfg80211_rx_probe_request(padapter, precv_frame);
  		return _SUCCESS;
  	}
-@@ -8249,11 +8260,24 @@
+@@ -1522,8 +1531,14 @@
+ 					return _SUCCESS;
+ 				}
+ 
+-				if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO))
+-					goto _continue;
++				if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO)) {
++					/* K230 2026-10-24: GO 态的 P2P probe-req 直接走 issue_probersp_p2p,
++					 * 否则落到 issue_probersp 且 _FW_LINKED 条件不满足, GO 态对手机
++					 * 的 P2P 探测完全不回 probe-resp。issue_probersp_p2p 的缓存路径会
++					 * 带上 wps_probe_resp_ie + p2p_probe_resp_ie + WFD IE 三件套。 */
++					issue_probersp_p2p(padapter, get_sa(pframe));
++					return _SUCCESS;
++				}
+ 			}
+ 		}
+ 	}
+@@ -8249,22 +8264,44 @@
  #endif
  
  #ifdef CONFIG_P2P
@@ -50,7 +65,20 @@
  		if (adapter_wdev_data(padapter)->p2p_enabled && pwdinfo->driver_interface == DRIVER_CFG80211) {
  			/* if pwdinfo->role == P2P_ROLE_DEVICE will call issue_probersp_p2p() */
  			len = pmlmepriv->p2p_go_probe_resp_ie_len;
-@@ -8264,7 +8288,7 @@
+-			if (pmlmepriv->p2p_go_probe_resp_ie && len > 0)
++			if (pmlmepriv->p2p_go_probe_resp_ie && len > 0) {
+ 				_rtw_memcpy(pframe, pmlmepriv->p2p_go_probe_resp_ie, len);
++			} else if (pmlmepriv->p2p_probe_resp_ie && pmlmepriv->p2p_probe_resp_ie_len > 0) {
++				/* K230 2026-10-24: force_group_capab 把 group 位清零后 set_probe_resp_wpsp2pie
++				 * 走的是 p2p_probe_resp_ie 分支 (is_GO=FALSE), p2p_go_probe_resp_ie 恒为空;
++				 * 这里 GO 态回退用 p2p_probe_resp_ie (含 device name 的完整 P2P IE)。 */
++				len = pmlmepriv->p2p_probe_resp_ie_len;
++				_rtw_memcpy(pframe, pmlmepriv->p2p_probe_resp_ie, len);
++			} else {
++				len = build_probe_resp_p2p_ie(pwdinfo, pframe);
++			}
+ 		} else
+ #endif /* CONFIG_IOCTL_CFG80211 */
  		{
  			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
  		}
@@ -59,8 +87,8 @@
  		pframe += len;
  		pattrib->pktlen += len;
  
---- a/os_dep/linux/ioctl_cfg80211.c
-+++ b/os_dep/linux/ioctl_cfg80211.c
+--- a/os_dep/linux/ioctl_cfg80211.c	2025-01-12 23:02:59.000000000 -0800
++++ b/os_dep/linux/ioctl_cfg80211.c	2026-10-24 06:19:40.871047360 -0700
 @@ -2865,7 +2865,16 @@
  	struct sitesurvey_parm parm;
  	_irqL	irqL;
