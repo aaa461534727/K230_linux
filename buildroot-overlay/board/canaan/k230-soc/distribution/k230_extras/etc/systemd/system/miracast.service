@@ -1,13 +1,14 @@
 [Unit]
-Description=Miracast sink: wfd-sink -> v4l2_dec (K230 mvx 硬解) -> drmplay (DRM 直出)
+Description=Miracast sink: P2P client (wfd-p2p.sh client) 自动建组 + wfd-sink 收流硬解上屏
 After=network.target
 
 [Service]
 Type=simple
-# 三个进程串成管道; 任一环节挂掉 sh 退出, systemd 拉起整条链路
-ExecStart=/bin/sh -c '/usr/bin/wfd-sink -d /dev/stdout 2>>/var/log/miracast.log | /usr/bin/v4l2_dec /dev/stdin /dev/stdout -H 2>>/var/log/miracast-dec.log | /usr/bin/drmplay -H -p nv12 -w 480 -h 800 -r 30 2>>/var/log/miracast-play.log'
+# K230 2026-10-24: 开机进入 P2P client 模式 (手机当 GO, K230 拨手机 RTSP :7236)
+# 建组后脚本自动配 IP + 起 wfd-sink | v4l2_dec | drmplay; 拆组后自动复位
+ExecStart=/bin/sh /root/wfd-p2p.sh client
 Restart=always
-RestartSec=2
+RestartSec=3
 KillMode=control-group
 
 [Install]
