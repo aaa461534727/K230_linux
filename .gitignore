@@ -19,3 +19,6 @@ gtags.files
 df/
 .vscode/settings.json
 __pycache__/
+
+# K230 2026-10-25: 驱动 ko 不入仓 —— 由 rtl8189fs 补丁在本机编译产出
+buildroot-overlay/**/lib/modules/*/updates/*.ko

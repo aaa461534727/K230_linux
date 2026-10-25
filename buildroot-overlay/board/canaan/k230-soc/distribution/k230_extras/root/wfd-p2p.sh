@@ -37,7 +37,7 @@
 #
 # 用法:
 #   wfd-p2p.sh start [额外 p2p_group_add 参数]   起 GO + 广播 WFD IE + DHCP
-#   wfd-p2p.sh client                           ★推荐: 当 P2P client (手机当 GO, 静态 192.168.49.128)
+#   wfd-p2p.sh client                           ★推荐: 当 P2P client (手机/PC 当 GO, 地址自动判别)
 #   wfd-p2p.sh listen                           只进入 P2P listen (不建组), 兼容只认 device 的 ROM
 #   wfd-p2p.sh stop                              停 GO 并恢复原 station 配置
 #   wfd-p2p.sh status                            看当前 P2P 状态 / GO SSID / WFD IE
@@ -115,7 +115,10 @@ DEVINFO="${WFD_DEVINFO:-000601511c44012c}"
 # 取值 "none" = 不发该子元素 (对照实验用)
 WFD_SUBELEM_ASSOC_BSSID="${WFD_SUBELEM_ASSOC_BSSID:-0006000000000000}"
 WFD_SUBELEM_COUPLED_SINK="${WFD_SUBELEM_COUPLED_SINK:-000700000000000000}"
-GO_FREQ="${WFD_GO_FREQ:-2437}"           # 2.4G ch6; 8189fs 只支持 2.4G
+# 2026-10-25: 默认改 ch11 (2462)。Windows 10 的 P2P listen/操作信道默认就是 ch11,
+# 我们若停在 ch6, 它发的 GO Negotiation Confirmation 落在 ch11 我们听不到 ⇒
+# 双方都超时 (PC 弹"无法连接")。8189fs 只支持 2.4G, ch11 与手机历史成功帧一致。
+GO_FREQ="${WFD_GO_FREQ:-2462}"           # 2.4G ch11
 # listen 信道必须跟组信道一致 (手机把 GO-Neg/PD 发到它看到的 listen 信道)。
 # 由 GO_FREQ 反推: 2412→1, 2437→6, 2462→11; 也可用 WFD_LISTEN_CHANNEL 直接指定。
 case "$GO_FREQ" in
@@ -170,6 +173,16 @@ write_conf() {
     else
         _go_intent_line="# p2p_go_intent 默认 7 (autonomous GO 不需要)"
     fi
+    # 2026-10-25 修复「连一次后第二次连不上」: 旧 conf 里的**对端持久组**要留着。
+    # wpa_supplicant 把上次建组时拿到的 PSK 存成 network{} 块 (带 bssid=),
+    # 对端 (Windows / 手机) 记得那个组, 再点会用 Invitation 邀请我们回去;
+    # 我们这边一旦把 conf 重写掉, 就成了 unknown-network ⇒ 只能重协商,
+    # 而 Windows 这时候正等 Invitation Response, 于是对不上 ⇒ "无法连接"。
+    _keep_nets=""
+    if [ -f "$P2P_CONF" ]; then
+        _keep_nets=$(awk '/^network=\{/{f=1; buf=""} f{buf=buf $0 "\n"} f&&/^\}/ {f=0; if (buf ~ /bssid=/) printf "%s", buf}' "$P2P_CONF" 2>/dev/null)
+    fi
+
     cat > "$P2P_CONF" <<EOF
 # 由 wfd-p2p.sh 生成 — 只用于 Miracast sink 的 P2P 模式
 ctrl_interface=DIR=$CTRL_DIR GROUP=netdev
@@ -193,6 +206,18 @@ config_methods=display push_button keypad virtual_display physical_display
 # 单网卡 (8189fs) 不要再开 group interface, 直接用 wlan0 当 GO
 p2p_no_group_iface=1
 
+# 2026-10-25 修复「连一次就再也连不上」: wpa_supplicant 默认在建组后按
+# p2p_group_idle 秒数做空闲回收 —— 组起来后若 10 s 内没有数据流量
+# (DHCP/RTSP 还没跑起来、或手机刚断开), 它自己就把组拆了:
+#   P2P-GROUP-REMOVED reason=IDLE → 对端看到掉线 → 再点就"无法连接"。
+# 0 = 关闭空闲回收, 组只由对端结束会话或本脚本 stop/重建时拆。
+p2p_group_idle=0
+
+# 2026-10-25: 对端 (Windows/手机) 再点连接时会发 Invitation 回旧组。
+# 不打开这个开关, supplicant 只抛 P2P-INVITATION-RECEIVED 事件不动作;
+# 打开后它按已存的持久组自动回 Invitation Response 并重新入组。
+persistent_reconnect=1
+
 # 2026-10-21 关键修复: listen 信道必须 = 组所在信道 (ch6)。
 # 默认 listen 是 ch11, 手机会把 GO Negotiation 发到它看到的 listen 信道,
 # 而我们 GO 在 ch6 -> 一帧 GO Neg 都收不到 (现象: PD 全收到, 之后死等 30s 重发)。
@@ -210,8 +235,6 @@ p2p_listen_channel=$LISTEN_CHANNEL
 # ⚠ 绝对不要写 p2p_pref_chan: p2p_check_pref_chan() 见到 cfg->num_pref_chan 非零就
 #   直接 return, num_pref_freq 永远 0 —— 补丁之前正是它让属性一直被省略 (见
 #   docs/MIRACAST_AUTH_WINDOW.md §10.3)。它只对"我们自己发 GO-Neg-Req"那条路生效。
-p2p_oper_reg_class=81
-p2p_oper_channel=$LISTEN_CHANNEL
 
 # 固定 SSID 后缀, 免得每次 p2p_group_add 都换一个 "DIRECT-XXK230" 名字,
 # 手机那边缓存/用户认名字都会乱 (2026-10-21)。
@@ -240,7 +263,24 @@ network={
 #   · Wi-Fi Display: 编进 CONFIG_WIFI_DISPLAY 后 wifi_display_init() 就默认置 1
 #   · no_go / no_cli: 是 p2p_set 的**运行时**参数, 不是 conf 字段
 EOF
-    log "已生成 $P2P_CONF (device_name=$DEVICE_NAME)"
+    # 还原对端持久组 (见上), 并让 supplicant **自动接受**对端的 Invitation ——
+    # 否则它只抛 P2P-INVITATION-RECEIVED 事件, 前端不处理就超时。
+    if [ -n "$_keep_nets" ]; then
+        printf '%s\n' "$_keep_nets" >> "$P2P_CONF"
+        log "已还原 $(printf '%s\n' "$_keep_nets" | grep -c '^network={') 个对端持久组"
+    fi
+
+    # 2026-10-25: 操作信道默认**不**钉死。钉死时 (上面补丁) GO-Neg-Resp 会带
+    # Operating Channel 且 Channel List 只剩 1 个信道; 实测 Windows 10 收到这种
+    # 应答后**不发 GO Negotiation Confirmation**, 600 ms 后我们超时 ⇒ PC "无法连接"。
+    # 手机老路 (钉死 ch6, 防手机挑到 ch8) 用 WFD_FORCE_OPER_CH=1 打开。
+    if [ "${WFD_FORCE_OPER_CH:-0}" = "1" ]; then
+        cat >> "$P2P_CONF" <<EOF2
+p2p_oper_reg_class=81
+p2p_oper_channel=$LISTEN_CHANNEL
+EOF2
+    fi
+    log "已生成 $P2P_CONF (device_name=$DEVICE_NAME, force_oper_ch=${WFD_FORCE_OPER_CH:-0})"
 }
 
 stop_supplicant() {
@@ -560,8 +600,78 @@ cmd_listen() {
 # 所以组建成 client 后, 必须把 pipeline 从「监听服务端」切成「客户端去连」,
 # 否则手机永远等不到 SETUP/PLAY (手机不会主动来连我们)。
 SINK_PIPE_PID=/tmp/wfd-sink-client.pid
-SINK_GO_IP="${WFD_SINK_GO_IP:-192.168.49.1}"
+# GO / RTSP 服务端地址: 留空 = 建组后自动判别 (不写死, 见 prepare_client_net)
+#   安卓手机当 GO: 192.168.49.1 (静态 192.168.49.128, 历史成功链路)
+#   Windows 10 当 GO: 192.168.137.1 (ICS 段, 必须 DHCP 拿租约)
+SINK_GO_IP="${WFD_SINK_GO_IP:-}"
 SINK_GO_PORT="${WFD_SINK_GO_PORT:-7236}"
+CLIENT_IF=""
+DHCP_WAIT="${WFD_DHCP_WAIT:-6}"
+
+# ---- 网络自适应 (2026-10-24 加: 让 PC/Win10 也能投进来) --------------------
+iface_ip() { ip -4 addr show dev "$1" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1; }
+iface_gw() { ip route 2>/dev/null | awk -v d="$1" '$1=="default" && $NF==d {print $3; exit}'; }
+
+# 跑一次 DHCP 客户端, 成功时 stdout 只输出 GO(server) 的 IP。
+#   ① 优先板端自带的极简客户端 (不做 ARP probe; 手机 GO 用 dhcpcd 会卡在探测)
+#   ② dhcpcd / udhcpc 兜底, 从默认网关或本端子网 .1 推 GO
+dhcp_acquire() {
+    _if="$1"
+    for _p in /usr/local/bin/k230-dhcp-simple.py /root/k230-dhcp-simple.py /tmp/k230-dhcp-simple.py; do
+        [ -f "$_p" ] || continue
+        _out=$(timeout $((DHCP_WAIT + 4)) python3 "$_p" "$_if" "$DHCP_WAIT" 2>&1 || true)
+        _srv=$(printf '%s\n' "$_out" | sed -n 's/.*SERVER=\([0-9.]*\).*/\1/p' | tail -1)
+        if [ -n "$_srv" ]; then printf '%s' "$_srv"; return 0; fi
+    done
+    if command -v dhcpcd >/dev/null 2>&1; then
+        timeout "$DHCP_WAIT" dhcpcd -4 -q -t 4 -w -1 -m 2000 "$_if" >/dev/null 2>&1 || true
+    elif command -v udhcpc >/dev/null 2>&1; then
+        timeout "$DHCP_WAIT" udhcpc -i "$_if" -t 4 -T 1 -n -q >/dev/null 2>&1 || true
+    fi
+    _gw=$(iface_gw "$_if"); _ip=$(iface_ip "$_if")
+    case "$_ip" in ""|0.0.0.0|169.254.*) _ip="" ;; esac
+    if [ -n "$_gw" ]; then printf '%s' "$_gw"; return 0; fi
+    if [ -n "$_ip" ]; then printf '%s' "$(printf '%s' "$_ip" | sed 's/\.[0-9]*$/.1/')"; return 0; fi
+    return 1
+}
+
+# 建组(role=client)后: 配地址 + 认出 GO。安卓零回归, Windows 走 DHCP。
+prepare_client_net() {
+    _if="$1"
+    CLIENT_IF="$_if"
+    ip link set dev "$_if" up 2>/dev/null || true
+    ip addr flush dev "$_if" 2>/dev/null || true
+
+    # ① 安卓手机路径: 静态 + 1 s 探 GO (与历史成功链路完全一致, 不引入延迟)
+    ip addr add "$CLIENT_IP/24" dev "$_if" 2>/dev/null || true
+    if ping -c1 -W1 -I "$_if" 192.168.49.1 >/dev/null 2>&1; then
+        SINK_GO_IP=192.168.49.1
+        log "✅ GO=192.168.49.1 (Android 手机路径, 静态 $CLIENT_IP/24)"
+        return 0
+    fi
+
+    # ② Windows 10 / 任何按标准跑 DHCP 的 GO: Windows 只认租约, 不给地址它不发 RTSP
+    log "没探到 192.168.49.1 (Android), 按 Windows/标准 GO 走 DHCP..."
+    ip addr flush dev "$_if" 2>/dev/null || true
+    _go=$(dhcp_acquire "$_if" 2>/dev/null || true)
+    if [ -n "$_go" ]; then
+        SINK_GO_IP="$_go"
+        log "✅ DHCP 完成: 本端 $(iface_ip "$_if") / GO=$SINK_GO_IP"
+        return 0
+    fi
+
+    # ③ 兜底: Windows ICS 固定段静态试一次
+    ip addr add 192.168.137.128/24 dev "$_if" 2>/dev/null || true
+    if ping -c1 -W1 -I "$_if" 192.168.137.1 >/dev/null 2>&1; then
+        SINK_GO_IP=192.168.137.1
+        log "⚠ 没拿到租约, 静态 192.168.137.128/24 探到 GO=192.168.137.1"
+        return 0
+    fi
+
+    SINK_GO_IP=192.168.49.1
+    log "⚠ 既没探到安卓 GO 也没拿到 DHCP 租约, 按 $SINK_GO_IP 兜底 (大概率连不上, 看下面日志)"
+    return 0
+}
 
 stop_sink_client() {
     if [ -f "$SINK_PIPE_PID" ]; then
@@ -603,32 +713,67 @@ start_client_watcher() {
             *P2P-GO-NEG-REQUEST*)
                 log "🤝 收到 GO Negotiation (我们 intent=0 ⇒ 手机当 GO)" ;;
             *P2P-INVITATION-RECEIVED*)
-                log "📥 收到 Invitation: $(printf '%s' "$line" | cut -c1-90)" ;;
+                # Windows 记住上一轮的 PERSISTENT 组后, 再点一次不会走 GO Negotiation,
+                # 而是直接发 Invitation 邀请我们回到那个组 —— 此时**必须由前端应答**
+                # (supplicant 只抛事件, 不会自动加入), 否则对端超时 ⇒ "无法连接"。
+                # 2026-10-25 11:09 实测: PC 发 Invitation(persistent=4) 后我们只打了一行日志,
+                # 组没建起来, PC 报无法连接。
+                _inv_sa=$(printf '%s\n' "$line" | sed -n 's/.*[ ]sa=\([0-9a-fA-F:]*\).*/\1/p')
+                _inv_pg=$(printf '%s\n' "$line" | sed -n 's/.*persistent=\([0-9]*\).*/\1/p')
+                # ⚠ 2026-10-25 实测教训: 事件里若不是已知持久组 (行尾带 unknown-network),
+                # **绝不能**回 p2p_connect —— 那会发 GO Negotiation Request, 而对端此刻
+                # 正等 Invitation Response, 于是直接回 status 5 拒绝 (12:30:01 现场),
+                # 而且 supplicant 此后停在 IDLE 不再 listen ⇒ 越点越连不上。
+                # 已知组交给 persistent_reconnect=1 自动接受; 这里只负责兜底重挂 listen。
+                log "📥 收到 Invitation: sa=${_inv_sa:-?} persistent=${_inv_pg:-?}"
+                if [ -n "$_inv_pg" ] && [ -n "$_inv_sa" ]; then
+                    wpa p2p_connect "$_inv_sa" pbc persistent="$_inv_pg" >/dev/null 2>&1 \
+                        || wpa p2p_listen >/dev/null 2>&1 || true
+                else
+                    log "   (未知持久组: 不动 supplicant, 等对端回落到全新协商)"
+                    wpa p2p_listen >/dev/null 2>&1 || true
+                fi ;;
+            *P2P-GO-NEG-FAILURE*)
+                # 协商被拒/超时后 supplicant 会停在 IDLE, 必须重挂 listen,
+                # 否则板子从此"消失", 对端删设备重连也找不到 (12:30 现场)。
+                log "⚠ 协商失败, 重挂 listen"
+                sleep 1
+                wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true ;;
             *P2P-GROUP-STARTED*)
                 _gif=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="P2P-GROUP-STARTED"){print $(i+1); exit}}')
                 _role=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="P2P-GROUP-STARTED"){print $(i+2); exit}}')
                 log "✅ 组已建立: iface=$_gif role=$_role"
                 if [ "$_role" = "client" ]; then
-                    ip addr flush dev "$_gif" 2>/dev/null || true
-                    ip addr add "$CLIENT_IP/24" dev "$_gif" 2>/dev/null || true
-                    ip link set dev "$_gif" up 2>/dev/null || true
-                    log "✅ 已配静态地址 $CLIENT_IP/24 (手机=GO=192.168.49.1)"
-                    log "   wfd-sink 主动连 rtsp://$SINK_GO_IP:$SINK_GO_PORT (抓包实证: 手机才是 RTSP 服务端)"
+                    prepare_client_net "$_gif"
+                    log "   wfd-sink 主动连 rtsp://$SINK_GO_IP:$SINK_GO_PORT (GO=手机或 PC, 由上面判定)"
                     sleep 1
                     start_sink_client
                     log "   看 sink 日志: tail -f /var/log/miracast.log"
+                else
+                    log "⚠ 本端成了 GO (role=$_role); Windows 源码一般自己当 GO —— 若对方是 PC 请查 p2p_go_intent 是否 0"
                 fi ;;
             *P2P-GROUP-REMOVED*)
                 log "⚠ 组已移除: $(printf '%s' "$line" | cut -c1-80)"
                 stop_sink_client
-                ip addr flush dev wlan1 2>/dev/null || true
+                ip addr flush dev "${CLIENT_IF:-$IFACE}" 2>/dev/null || true
+                SINK_GO_IP=""
+                wpa p2p_group_remove "${CLIENT_IF:-$IFACE}" >/dev/null 2>&1 || true
                 sleep 1
-                wpa p2p_find >/dev/null 2>&1 || true
-                log "♻ 已清理(进程+IP)并重挂 p2p_find, 恢复可被发现" ;;
+                wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                log "♻ 已清理(进程+IP)并重挂 listen, 恢复可被发现" ;;
+            *P2P-GROUP-FORMATION-FAILURE*)
+                # 组没建成 (对端取消/超时/信道不合): 必须重新挂 listen,
+                # 否则 supplicant 停在 IDLE, 对端再点就"扫不到/无法连接"。
+                log "⚠ 建组失败, 重挂 listen (可让对端再试一次)"
+                stop_sink_client
+                ip addr flush dev "${CLIENT_IF:-$IFACE}" 2>/dev/null || true
+                SINK_GO_IP=""
+                sleep 1
+                wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true ;;
             *CTRL-EVENT-DISCONNECTED*)
                 log "⚠ 与 GO 断开: $(printf '%s' "$line" | cut -c1-70)" ;;
-            *P2P-FIND-STOPPED*)
-                wpa p2p_find >/dev/null 2>&1 || true ;;
+            *P2P-FIND-STOPPED*|*P2P-LISTEN-STOPPED*)
+                wpa p2p_listen >/dev/null 2>&1 || true ;;
         esac
     done ) &
     echo $! > "$CLIENT_WATCH_PID"
@@ -657,13 +802,22 @@ cmd_client() {
     wpa wfd_subelem_set 6 "$WFD_SUBELEM_COUPLED_SINK" >/dev/null 2>&1 || true
     wpa p2p_set ssid_postfix "$SSID_POSTFIX" >/dev/null 2>&1 || true
 
-    # 只做发现 + 监听, **不建组**: 等手机发起 GO Negotiation / Invitation
-    wpa p2p_find >/dev/null 2>&1 || die "p2p_find 失败, 看 $P2P_LOG"
+    # 只做监听, **不建组**: 等手机/PC 发起 GO Negotiation / Invitation。
+    # 2026-10-25: 用 p2p_listen 而不是 p2p_find —— 实测 p2p_find 是「扫 0.7 s →
+    # 听 0.3 s」的循环, sink 只在 30% 时间停在 ch6, PC/手机经常扫不到(表现为
+    # "很久才连上"或"直接连不上"); listen 是 100% 驻留, 谁要连我们就发过来。
+    wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || die "p2p_listen 失败, 看 $P2P_LOG"
     start_client_watcher
 
-    log "✅ 已进入 client 模式: P2P device (不建组), p2p_go_intent=0 ⇒ 手机当 GO"
-    log "现在手机「无线投屏」里点 $DEVICE_NAME"
-    log "成功后应看到: grep -E 'P2P-GROUP-STARTED|$CLIENT_IP|AP-STA' $P2P_LOG"
+    log "✅ 已进入 client 模式: P2P device (不建组), p2p_go_intent=0 ⇒ 对端(手机/PC)当 GO"
+    log "现在用: 手机「无线投屏」/ Windows 10 「Win+K → 连接到无线显示器」里点 $DEVICE_NAME"
+    log "  · 安卓 GO=192.168.49.1 → 静态 $CLIENT_IP; Windows GO=192.168.137.1 → DHCP 拿租约"
+    log "  · Windows 侧注意: 只留一块支持无线显示器的网卡 (netsh wlan show drivers 有那一行为 是)"
+    log "成功后应看到: grep -E 'P2P-GROUP-STARTED|✅ GO=|✅ DHCP' $P2P_LOG"
+    # 驻留: 作为 systemd service 时进程不能退 (Type=simple + KillMode=control-group,
+    # 一退就整组被杀 ⇒ 监听器/ supplicant 全没, 服务每 3 s 重启一次空转)。
+    log "（前台驻留, Ctrl+C 或 $0 stop 结束）"
+    wait
 }
 
 cmd_stop() {

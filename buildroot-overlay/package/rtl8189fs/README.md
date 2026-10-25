@@ -31,3 +31,6 @@ make rtl8189fs CONF=k230_canmv_01studio_defconfig
 rm buildroot-overlay/package/rtl8189fs/0100-k230-miracast.patch
 make rtl8189fs-dirclean rtl8189fs CONF=k230_canmv_01studio_defconfig
 ```
+
+> **2026-10-25 起 ko 不入仓**: `8189fs.ko` 由本补丁在 buildroot 里编译产出, overlay 不再放预编译 ko。
+> 另一台机器 clone 后 `make rtl8189fs` 即可得到同一份驱动; 产物 md5 见上 (若因编译器版本略有差异, 以 "行为一致" 为准: survey=5 且 GO 态 probe-resp 走 issue_probersp_p2p 之外的老路)。
