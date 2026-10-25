@@ -178,6 +178,14 @@ write_conf() {
     # 对端 (Windows / 手机) 记得那个组, 再点会用 Invitation 邀请我们回去;
     # 我们这边一旦把 conf 重写掉, 就成了 unknown-network ⇒ 只能重协商,
     # 而 Windows 这时候正等 Invitation Response, 于是对不上 ⇒ "无法连接"。
+    # 2026-10-25 再修一层: /tmp 是 tmpfs, **断电/重启就没了** ⇒ 对端的持久组凭据
+    # 必须存一份到 /root, 起动时先恢复, 否则手机拿旧组发 Invitation 我们回 status 8
+    # (unknown group), 它就退回全新协商并把我们踢出组 (实测 18:30 轮)。
+    P2P_CONF_BAK=/root/wfd-p2p-persistent.conf
+    if [ ! -f "$P2P_CONF" ] && [ -f "$P2P_CONF_BAK" ]; then
+        cp -f "$P2P_CONF_BAK" "$P2P_CONF" 2>/dev/null || true
+        log "已从 $P2P_CONF_BAK 恢复持久组凭据"
+    fi
     _keep_nets=""
     if [ -f "$P2P_CONF" ]; then
         _keep_nets=$(awk '/^network=\{/{f=1; buf=""} f{buf=buf $0 "\n"} f&&/^\}/ {f=0; if (buf ~ /bssid=/) printf "%s", buf}' "$P2P_CONF" 2>/dev/null)
@@ -280,6 +288,7 @@ p2p_oper_reg_class=81
 p2p_oper_channel=$LISTEN_CHANNEL
 EOF2
     fi
+    cp -f "$P2P_CONF" /root/wfd-p2p-persistent.conf 2>/dev/null || true
     log "已生成 $P2P_CONF (device_name=$DEVICE_NAME, force_oper_ch=${WFD_FORCE_OPER_CH:-0})"
 }
 
@@ -682,7 +691,7 @@ stop_sink_client() {
     fi
     # K230: setsid sh -c 的 while 循环会不断重起 wfd-sink, 必须按命令行 SIGKILL
     pkill -9 -f "/usr/bin/wfd-sink" 2>/dev/null || true
-    for _b in wfd-sink v4l2_dec drmplay; do
+    for _b in wfd-sink v4l2_dec drmplay vgplay; do
         pkill -9 -x "$_b" 2>/dev/null || true
     done
     sleep 1
@@ -708,20 +717,60 @@ start_blank() {
     sleep 0.3
 }
 
+# 上屏播放器: GPU (VGLite 硬件缩放) 优先, 自检不过或没装则回落 CPU (drmplay)
+#   WFD_PLAYER=cpu  强制 CPU 缩放 (老路, 出问题时的保险)
+#   WFD_PLAYER=gpu  强制 GPU (跳过自检, 调试用)
+PLAYER_BIN=/usr/bin/drmplay
+PLAYER_OPTS="-H -p nv12 -w 480 -h 800"
+select_player() {
+    PLAYER_BIN=/usr/bin/drmplay
+    PLAYER_OPTS="-H -p nv12 -w 480 -h 800"
+    case "${WFD_PLAYER:-auto}" in
+        cpu) log "🎛 上屏: CPU 缩放 (drmplay, 强制)"; return 0 ;;
+    esac
+    # ⚠ 2026-10-25: GPU 路径实测会把板子跑死 (1280x720 缩放 blit), 所以**默认不开**;
+    # 只有在板上跑完 scripts/board_hwscale_test.sh 全过并 touch /root/.vgplay-ok 才启用。
+    if [ ! -x /usr/bin/vgplay ] || [ ! -f /root/.vgplay-ok ]; then
+        log "🎛 上屏: CPU 缩放 (drmplay; GPU 路径未验证/未启用)"
+        return 0
+    fi
+    if [ "${WFD_PLAYER:-auto}" = "gpu" ] || /usr/bin/vgplay --selftest >>/var/log/miracast-vg.log 2>&1; then
+        PLAYER_BIN=/usr/bin/vgplay
+        PLAYER_OPTS="-H -w 480 -h 800 -r 30"
+        log "🎛 上屏: VGLite 硬件缩放 (GPU)"
+    else
+        log "⚠ VGLite 自检失败 (见 /var/log/miracast-vg.log) → 回落 CPU 缩放"
+    fi
+    return 0
+}
+
 start_sink_client() {
     stop_sink_client
     stop_blank
+    select_player
     setsid sh -c '
+        PLAYER_BIN="'"$PLAYER_BIN"'"
+        PLAYER_OPTS="'"$PLAYER_OPTS"'"
         i=0
         while [ $i -lt 20 ]; do
             /usr/bin/wfd-sink -c '"$SINK_GO_IP"':'"$SINK_GO_PORT"' -d /dev/stdout 2>>/var/log/miracast.log | \
-            /usr/bin/v4l2_dec /dev/stdin /dev/stdout -H 2>>/var/log/miracast-dec.log | \
-            /usr/bin/drmplay -H -p nv12 -w 480 -h 800 -r 30 2>>/var/log/miracast-play.log
-            i=$((i+1))
+            /usr/bin/v4l2_dec /dev/stdin /dev/stdout -H -D 2>>/var/log/miracast-dec.log | \
+            "$PLAYER_BIN" $PLAYER_OPTS 2>>/var/log/miracast-play.log
+            _rc=$?
+            # GPU 播放器起不来 (没 /dev/vg_lite / map 失败等) 立刻回落 CPU, 不让主人看到黑屏
+            if [ "$_rc" -ne 0 ] && [ "$PLAYER_BIN" = /usr/bin/vgplay ]; then
+                echo "$(date) vgplay 退出码 $_rc → 回落 CPU 缩放 (drmplay)" >>/var/log/miracast-play.log
+                PLAYER_BIN=/usr/bin/drmplay
+                PLAYER_OPTS="-H -p nv12 -w 480 -h 800"
+            fi
+            /usr/bin/drmplay -B -w 480 -h 800 >/dev/null 2>&1 &
+            _bl=$!
             sleep 2
+            kill -9 "$_bl" 2>/dev/null
+            i=$((i+1))
         done' >/dev/null 2>&1 &
     echo $! > "$SINK_PIPE_PID"
-    log "▶ sink 客户端模式已启动: rtsp://$SINK_GO_IP:$SINK_GO_PORT → v4l2_dec → drmplay (pid $(cat "$SINK_PIPE_PID"))"
+    log "▶ sink 客户端模式已启动: rtsp://$SINK_GO_IP:$SINK_GO_PORT → v4l2_dec → $PLAYER_BIN (pid $(cat "$SINK_PIPE_PID"))"
 }
 
 start_client_watcher() {
