@@ -600,6 +600,7 @@ cmd_listen() {
 # 所以组建成 client 后, 必须把 pipeline 从「监听服务端」切成「客户端去连」,
 # 否则手机永远等不到 SETUP/PLAY (手机不会主动来连我们)。
 SINK_PIPE_PID=/tmp/wfd-sink-client.pid
+BLANK_PID=/tmp/drmplay-blank.pid
 # GO / RTSP 服务端地址: 留空 = 建组后自动判别 (不写死, 见 prepare_client_net)
 #   安卓手机当 GO: 192.168.49.1 (静态 192.168.49.128, 历史成功链路)
 #   Windows 10 当 GO: 192.168.137.1 (ICS 段, 必须 DHCP 拿租约)
@@ -687,8 +688,29 @@ stop_sink_client() {
     sleep 1
 }
 
+# 空闲占屏: 用 drmplay -B 把 CRTC 占成纯黑。
+# 不占的话平面被拆掉 ⇒ 面板扫到未定义内容, 现场表现就是"全屏紫色跟投屏抢显示"。
+stop_blank() {
+    if [ -f "$BLANK_PID" ]; then
+        _bp=$(cat "$BLANK_PID" 2>/dev/null || echo "")
+        [ -n "$_bp" ] && kill -9 -- "-$_bp" 2>/dev/null || true
+        [ -n "$_bp" ] && kill -9 "$_bp" 2>/dev/null || true
+        rm -f "$BLANK_PID"
+    fi
+    pkill -9 -f "drmplay -B" 2>/dev/null || true
+    pkill -9 -f "drmplay --blank" 2>/dev/null || true
+}
+start_blank() {
+    [ -x /usr/bin/drmplay ] || return 0
+    stop_blank
+    setsid /usr/bin/drmplay -B -w 480 -h 800 >>/var/log/miracast-blank.log 2>&1 < /dev/null &
+    echo $! > "$BLANK_PID"
+    sleep 0.3
+}
+
 start_sink_client() {
     stop_sink_client
+    stop_blank
     setsid sh -c '
         i=0
         while [ $i -lt 20 ]; do
@@ -760,6 +782,7 @@ start_client_watcher() {
                 wpa p2p_group_remove "${CLIENT_IF:-$IFACE}" >/dev/null 2>&1 || true
                 sleep 1
                 wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                start_blank
                 log "♻ 已清理(进程+IP)并重挂 listen, 恢复可被发现" ;;
             *P2P-GROUP-FORMATION-FAILURE*)
                 # 组没建成 (对端取消/超时/信道不合): 必须重新挂 listen,
@@ -817,6 +840,8 @@ cmd_client() {
     # 驻留: 作为 systemd service 时进程不能退 (Type=simple + KillMode=control-group,
     # 一退就整组被杀 ⇒ 监听器/ supplicant 全没, 服务每 3 s 重启一次空转)。
     log "（前台驻留, Ctrl+C 或 $0 stop 结束）"
+    # 开机/进入 client 模式后先把屏幕刷黑占住, 避免空闲时面板显示未定义内容 (紫色)
+    start_blank
     wait
 }
 
