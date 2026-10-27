@@ -9,6 +9,11 @@ ExecStart=/root/k230-screen.sh
 Restart=always
 RestartSec=1
 KillMode=control-group
+# ★ 2026-10-27: drmplay 的日志全走 **stderr**。以前这里写 StandardError=inherit,
+#   systemd 作为 PID1 的 stderr 可能是 /dev/null ⇒ 现场 (16:05) 出现「屏黑 + journal
+#   里一行 drmplay 都没有」, 完全没法判断。显式指定 journal, 保证三份日志同在一条时间轴。
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -871,20 +871,44 @@ start_player() {
         PLAYER_FIFO_MODE=0
         return 0
     fi
-    if [ -f "$PLAYER_PIDFILE" ]; then
+    # ★ 2026-10-27: 体检判据 = pidfile 活 + fd 0 指向**当前**管道 + 管道在。
+    #   老写法只看「pid 活着」就复用, 于是玩家拿着 (deleted) 旧 inode 也判"健康"
+    #   ⇒ 解码器 fopen 永久阻塞、屏上全黑 (现场 16:00)。
+    player_ok() {
         _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo 0)
-        if [ -n "$_pp" ] && [ "$_pp" != 0 ] && kill -0 "$_pp" 2>/dev/null; then
-            PLAYER_FIFO_MODE=1
-            return 0            # 已经在跑, 别重启 (重启就是一次紫屏)
+        if [ -z "$_pp" ] || [ "$_pp" = 0 ] || ! kill -0 "$_pp" 2>/dev/null; then
+            _pp=$(pgrep -f "drmplay .*-F $PLAYER_FIFO" 2>/dev/null | head -1)
         fi
-    fi
-    if pgrep -f "drmplay .*-F $PLAYER_FIFO" >/dev/null 2>&1; then
+        [ -n "$_pp" ] || return 1
+        [ -p "$PLAYER_FIFO" ] || return 1
+        _tgt=$(readlink "/proc/$_pp/fd/0" 2>/dev/null || echo "")
+        case "$_tgt" in
+            *"(deleted)") return 1 ;;
+            *"$PLAYER_FIFO") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    if player_ok; then
         PLAYER_FIFO_MODE=1
-        return 0
+        return 0            # 已经在跑且管道正常, 别重启 (重启就是一次紫屏)
     fi
-    # 先把 -B 占位让出来 (它持有 DRM master, 不让出新的会 SETCRTC Permission denied)
+    # 不健康 / 没有玩家 ⇒ 交给唯一所有者 k230-screen.service 重建 (它先 pkill 再 mkfifo)
+    if systemctl is-enabled --quiet k230-screen.service 2>/dev/null ||
+       systemctl is-active --quiet k230-screen.service 2>/dev/null; then
+        log "⚠ 常驻播放器不健康 → 重启 k230-screen 重新接管屏"
+        systemctl restart k230-screen.service 2>/dev/null || true
+        sleep 1.5
+        if player_ok; then
+            PLAYER_FIFO_MODE=1
+            log "✅ 播放器已重新接管 (pid $(cat "$PLAYER_PIDFILE" 2>/dev/null))"
+            return 0
+        fi
+        log "⚠ 重启 k230-screen 后仍不健康 (黑屏风险): 看 /var/log/k230-screen.log"
+    fi
+    # 兜底 (单跑本脚本 / k230-screen 被禁): 本地起一个。
+    #   注意 **不 rm 管道** —— 只补建缺失的; 删 inode 正是黑屏的根源。
     stop_blank
-    rm -f "$PLAYER_FIFO"; mkfifo "$PLAYER_FIFO" 2>/dev/null || true
+    [ -p "$PLAYER_FIFO" ] || { mkfifo "$PLAYER_FIFO" 2>/dev/null || true; }
     chmod 666 "$PLAYER_FIFO" 2>/dev/null || true
     setsid /usr/bin/drmplay $PLAYER_OPTS -F "$PLAYER_FIFO" \
         >>/var/log/miracast-play.log 2>&1 < /dev/null &
@@ -903,6 +927,11 @@ stop_player() {
     pkill -9 -x drmplay 2>/dev/null || true
     rm -f "$PLAYER_FIFO"
     PLAYER_FIFO_MODE=0
+    # ★ 2026-10-27: 管子被删掉后, 屏上就没有 plane 了 (紫)。把重建交回唯一所有者,
+    #   否则删 inode 会让还活着的玩家拿着 (deleted) 管道 ⇒ 解码器卡死在 open()。
+    if systemctl is-enabled --quiet k230-screen.service 2>/dev/null; then
+        systemctl restart k230-screen.service 2>/dev/null || true
+    fi
 }
 
 # 空闲占屏: 用 drmplay -B 把 CRTC 占成纯黑。

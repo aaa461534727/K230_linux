@@ -22,29 +22,43 @@ LOG="${AIRPLAY_LOG:-/var/log/airplay.log}"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
 
 ensure_player() {
-    # 与 wfd-p2p.sh 的 start_player 幂等同款: 同一 pidfile / 同一 pgrep 判据,
-    # 谁先起都行, 后起的那个直接复用, 不会两个 drmplay 抢 DRM master。
-    if [ -f "$PLAYER_PIDFILE" ]; then
+    # ★ 2026-10-27: 本函数原来也自己「pkill -B → rm -f 管道 → mkfifo → setsid drmplay」。
+    #   和 k230-screen.sh / wfd-p2p.sh 三份逻辑撞在一起时, 后到的会把别人刚建好的管道
+    #   inode 删掉 ⇒ 活着的玩家 fd 指向 (deleted) inode, 新管道没有读者 ⇒ 解码器 fopen
+    #   永久阻塞 ⇒ 「手机提示投屏成功但屏上全黑」(现场 16:00)。现在**只体检, 不起玩家**,
+    #   不健康就交给唯一所有者 k230-screen.service (Restart=always) 重新接管。
+    #
+    # 体检判据 (三个都要过):
+    #   ① pidfile 里的 pid 活着
+    #   ② 该 pid 的 fd 0 指向**当前**管道 (不能是 "...(deleted)")
+    #   ③ 管道本身还在 (S_ISFIFO)
+    player_ok() {
         _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo 0)
-        if [ -n "$_pp" ] && [ "$_pp" != 0 ] && kill -0 "$_pp" 2>/dev/null; then
-            return 0
+        if [ -z "$_pp" ] || [ "$_pp" = 0 ] || ! kill -0 "$_pp" 2>/dev/null; then
+            # pidfile 缺失/过期: 退回按命令行找 (老版本 k230-screen.sh 不写 pidfile)
+            _pp=$(pgrep -f "drmplay .*-F $PLAYER_FIFO" 2>/dev/null | head -1)
         fi
-    fi
-    if pgrep -f "drmplay .*-F $PLAYER_FIFO" >/dev/null 2>&1; then
+        [ -n "$_pp" ] || return 1
+        [ -p "$PLAYER_FIFO" ] || return 1
+        _tgt=$(readlink "/proc/$_pp/fd/0" 2>/dev/null || echo "")
+        case "$_tgt" in
+            *"(deleted)") return 1 ;;
+            *"$PLAYER_FIFO") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    if player_ok; then
         return 0
     fi
-    # -B 占位进程持有 DRM master, 不让出新的会 SETCRTC: Permission denied
-    pkill -9 -f "drmplay .*-B" 2>/dev/null || true
-    pkill -9 -f "drmplay -B" 2>/dev/null || true
-    sleep 0.2
-    rm -f "$PLAYER_FIFO"
-    mkfifo "$PLAYER_FIFO" 2>/dev/null || true
-    chmod 666 "$PLAYER_FIFO" 2>/dev/null || true
-    setsid /usr/bin/drmplay $PLAYER_OPTS -F "$PLAYER_FIFO" \
-        >>/var/log/miracast-play.log 2>&1 </dev/null &
-    echo $! >"$PLAYER_PIDFILE"
-    sleep 0.4
-    log "常驻播放器已起 (pid $(cat "$PLAYER_PIDFILE" 2>/dev/null))"
+    log "⚠ 常驻播放器不健康 (pidfile/管道 inode 不匹配) → 重启 k230-screen 重新接管"
+    systemctl restart k230-screen.service 2>/dev/null || true
+    sleep 1.5
+    if player_ok; then
+        log "✅ 播放器已由 k230-screen 重新接管"
+    else
+        log "⚠ 重启后仍不健康 (黑屏风险): 看 /var/log/k230-screen.log"
+    fi
+    return 0
 }
 
 start_decoder() {
