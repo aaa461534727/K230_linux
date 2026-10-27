@@ -1,0 +1,15 @@
+[Unit]
+Description=K230 audio owner: resident ALSA player (FIFO in, silence on idle)
+After=local-fs.target sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/rm -f /run/wfd-audio.pcm
+ExecStart=/root/k230-audio.sh
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

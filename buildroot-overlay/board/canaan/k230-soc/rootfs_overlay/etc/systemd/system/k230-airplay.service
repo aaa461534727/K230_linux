@@ -1,0 +1,23 @@
+[Unit]
+Description=K230 AirPlay receiver (UxPlay -> H.264 ES -> v4l2_dec -> drmplay)
+Documentation=file:///root/k230-airplay
+# 注意: **不要** After/Wants=network-online.target —— 本板 systemd-networkd-wait-online
+# 要卡满 2 分钟才失败收场, 实测冷启动后 AirPlay 广播整整晚 2 分 20 秒才出现,
+# 而 k230-cast (After=本服务) 跟着一起卡住不干活。UxPlay 是 bind 0.0.0.0, 不需要
+# 先有 IP; mDNS 记录会在接口就绪后自己补发。
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+Environment=UXPLAY_VIDEO_PIPE=1
+Environment=AIRPLAY_NAME=K230-AirPlay
+ExecStart=/root/k230-airplay run
+# 内核 netlink 事件/DRM 都要在本地文件系统起来之后; 起不来就重试两次, 别无限刷
+Restart=on-failure
+RestartSec=3
+StartLimitBurst=3
+KillMode=control-group
+TimeoutStopSec=8
+
+[Install]
+WantedBy=multi-user.target

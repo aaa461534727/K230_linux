@@ -1,0 +1,122 @@
+#!/bin/sh
+# k230-cast —— 投屏仲裁器: 安卓 (Miracast) 与 苹果 (AirPlay) 二选一, 同时只有一个能投
+#
+# 规则 (主人 2026-10-26 定):
+#   · 默认两边都在广播/待命 (wlan1 = P2P GO 给安卓, eth0 LAN 上的 mDNS 给苹果)
+#   · 安卓连上 (TCP 7236 有连接, 或 P2P 有终端关联) ⇒ 立刻停 AirPlay (uxplay 退出, 广播消失)
+#   · 苹果连上 (TCP 7001 有连接, 见下)              ⇒ 立刻停 Miracast (GO 撤掉, 安卓搜不到)
+#   · 谁断开了, 恢复另一方的广播 (2 s 去抖, 防抖振)
+#
+# 探测口径:
+#   安卓: ss -tn state established sport = :7236   (手机拨 RTSP 进来看得最早/最准)
+#         或 iw dev wlan1 station dump 里有 Station (已关联, 还没进 RTSP)
+#   苹果: ss -tn state established sport = :7001   (iOS 的 GET /info 就是这条)
+#         ⚠ UxPlay 的 -p 7000 是「三连端口的第一个」: 0 号 7000 是镜像数据口(不监听),
+#           真正的 HTTP/RTSP 服务口是 tcp[1] = 7001 (lib/raop.c: raop->port = tcp[1]).
+#           所以探测必须看 7001; 7000 也留着, 万一以后改成 -p tcp 单独指定.
+#
+set -u
+
+MIRACAST_UNIT="${MIRACAST_UNIT:-k230-miracast.service}"
+AIRPLAY_UNIT="${AIRPLAY_UNIT:-k230-airplay.service}"
+INTERVAL="${CAST_INTERVAL:-1}"
+HOLD="${CAST_HOLD:-/run/k230-cast.hold}"   # 存在则本脚本不动作 (调试/单测时 touch 一下)
+LOG="${CAST_LOG:-/var/log/k230-cast.log}"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
+
+# 统计某本地端口上的已建立连接数 (busybox 没有 ss 就用 /proc/net/tcp)
+conn_on_port() {
+    _p=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -tn state established 2>/dev/null | awk -v p=":$_p" 'NR>1 { if ($3 ~ p"$" || $4 ~ p"$") c++ } END { print c+0 }'
+        return 0
+    fi
+    # /proc/net/tcp: 本地地址:端口 是 16 进制 (7236 = 1C44, 7000 = 1B58)
+    _h=$(printf '%04X' "$_p")
+    awk -v h=":$_h" 'NR>1 && $4 == "01" && (index($2, h) || index($3, h)) { c++ } END { print c+0 }' /proc/net/tcp
+}
+
+android_active() {
+    [ "$(conn_on_port 7236)" -gt 0 ] && return 0
+    iw dev wlan1 station dump 2>/dev/null | grep -q '^Station' && return 0
+    return 1
+}
+
+airplay_active() {
+    for _ap in ${AIRPLAY_PORTS:-7001 7000}; do
+        [ "$(conn_on_port "$_ap")" -gt 0 ] && return 0
+    done
+    return 1
+}
+
+unit_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+
+ensure() {   # ensure <start|stop> <unit> <tag>
+    _act=$1; _unit=$2; _tag=$3
+    [ -z "$_unit" ] && return 0
+    if [ "$_act" = start ]; then
+        if unit_active "$_unit"; then return 0; fi
+        log "▶ 起 $_tag ($_unit)"
+        systemctl start "$_unit" >>"$LOG" 2>&1 || log "⚠ 起 $_unit 失败"
+    else
+        if ! unit_active "$_unit"; then return 0; fi
+        log "⏹ 停 $_tag ($_unit)"
+        systemctl stop "$_unit" >>"$LOG" 2>&1 || log "⚠ 停 $_unit 失败"
+    fi
+}
+
+# uxplay 没装就别反复尝试起 AirPlay (避免日志刷屏 + systemd 反复失败)
+if ! command -v "${UXPLAY_BIN:-/usr/local/bin/uxplay}" >/dev/null 2>&1; then
+    log "⚠ 未安装 uxplay (${UXPLAY_BIN:-/usr/local/bin/uxplay}) → 本次只跑安卓 Miracast"
+    AIRPLAY_UNIT=""
+fi
+
+log "仲裁器启动: 安卓=$MIRACAST_UNIT 苹果=$AIRPLAY_UNIT 轮询=${INTERVAL}s"
+MODE=""
+a_cnt=0; p_cnt=0
+
+while :; do
+    if [ -f "$HOLD" ]; then
+        sleep "$INTERVAL"
+        continue
+    fi
+
+    # 去抖: 连续 2 次采样才算"真的连上"; 断开立刻生效 (先断先恢复)
+    if android_active; then a_cnt=$((a_cnt+1)); else a_cnt=0; fi
+    if airplay_active; then p_cnt=$((p_cnt+1)); else p_cnt=0; fi
+
+    want=""
+    if [ "$a_cnt" -ge 2 ]; then
+        want=miracast
+    elif [ "$p_cnt" -ge 1 ]; then
+        want=airplay
+    else
+        want=idle
+    fi
+
+    if [ "$want" != "$MODE" ]; then
+        case "$want" in
+            miracast)
+                log "📱 安卓已连接 → 停 AirPlay 广播, 保留 Miracast"
+                ensure stop  "$AIRPLAY_UNIT"  "AirPlay"
+                ensure start "$MIRACAST_UNIT" "Miracast"
+                ;;
+            airplay)
+                log "🍎 苹果已连接 → 停 Miracast GO (安卓搜不到), 保留 AirPlay"
+                ensure stop  "$MIRACAST_UNIT" "Miracast"
+                ensure start "$AIRPLAY_UNIT"  "AirPlay"
+                ;;
+            idle)
+                if [ -n "$MODE" ]; then
+                    log "⏸ 双方都空闲 → 恢复两边广播"
+                fi
+                ensure start "$MIRACAST_UNIT" "Miracast"
+                ensure start "$AIRPLAY_UNIT"  "AirPlay"
+                ;;
+        esac
+        MODE="$want"
+    fi
+
+    sleep "$INTERVAL"
+done

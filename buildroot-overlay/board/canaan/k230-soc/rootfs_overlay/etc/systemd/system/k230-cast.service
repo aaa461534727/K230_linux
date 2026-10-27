@@ -1,0 +1,14 @@
+[Unit]
+Description=K230 cast arbiter: Miracast (Android) XOR AirPlay (iOS)
+After=k230-miracast.service k230-airplay.service
+Wants=k230-miracast.service k230-airplay.service
+
+[Service]
+Type=simple
+ExecStart=/root/k230-cast
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

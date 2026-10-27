@@ -1,0 +1,23 @@
+# /etc/systemd/system/k230-miracast.service
+# 2026-10-27 基线: Miracast 走 client 形态 (K230 当 P2P client, 手机/PC 当 GO)
+#   这是 2026-10-27 现场验证 PC + 红米 K80 + 努比亚 三台都能投 的唯一形态。
+#   GO 形态 (本机当 GO, 手机当 STA) 在真机上必然卡在 手机发完 PD 就不说话,
+#   已在 2026-10-21 ~ 10-27 反复证伪 (换 4 个 supplicant 版本都不动), 不要再改回去。
+#   细节: /root/k230-baseline-20261027/README.md + 仓内 K230/docs/BASELINE.md
+[Unit]
+Description=K230 Miracast sink (client: 本机当 P2P client, 手机/PC 当 GO)
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/rm -f /run/wfd-p2p.hold
+ExecStart=/bin/sh /root/wfd-p2p.sh client
+ExecStop=/bin/sh /root/wfd-p2p.sh stop
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

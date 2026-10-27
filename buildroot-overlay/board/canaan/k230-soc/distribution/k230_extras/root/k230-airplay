@@ -1,0 +1,115 @@
+#!/bin/sh
+# k230-airplay —— 苹果 AirPlay 投屏接收 (UxPlay 只跑协议, 视频交给本板硬解)
+#
+# 链路: uxplay ──(H.264 Annex-B)──► /run/airplay.h264 (命名管道)
+#                                     └─► v4l2_dec (VPU 硬解) ──► /run/wfd-player.fifo
+#                                                                   └─► drmplay (常驻上屏)
+#
+# 为什么不用 UxPlay 自己的 GStreamer 上屏: K230 是单核 RISC-V, 软解 720p/1080p 跑不动;
+# 本板有 VPU 硬解, 而且 Miracast 那条链路已经把「硬解 → 常驻播放器」打磨好了, 直接复用。
+#
+# 用法: k230-airplay [run]    (默认 run; systemd 直接调用)
+set -u
+
+NAME="${AIRPLAY_NAME:-K230-AirPlay}"
+ES_FIFO="${AIRPLAY_ES_FIFO:-/run/airplay.h264}"
+PLAYER_FIFO="${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}"
+PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
+PLAYER_OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800}"
+UXPLAY="${UXPLAY_BIN:-/usr/local/bin/uxplay}"
+LOG="${AIRPLAY_LOG:-/var/log/airplay.log}"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
+
+ensure_player() {
+    # 与 wfd-p2p.sh 的 start_player 幂等同款: 同一 pidfile / 同一 pgrep 判据,
+    # 谁先起都行, 后起的那个直接复用, 不会两个 drmplay 抢 DRM master。
+    if [ -f "$PLAYER_PIDFILE" ]; then
+        _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo 0)
+        if [ -n "$_pp" ] && [ "$_pp" != 0 ] && kill -0 "$_pp" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if pgrep -f "drmplay .*-F $PLAYER_FIFO" >/dev/null 2>&1; then
+        return 0
+    fi
+    # -B 占位进程持有 DRM master, 不让出新的会 SETCRTC: Permission denied
+    pkill -9 -f "drmplay .*-B" 2>/dev/null || true
+    pkill -9 -f "drmplay -B" 2>/dev/null || true
+    sleep 0.2
+    rm -f "$PLAYER_FIFO"
+    mkfifo "$PLAYER_FIFO" 2>/dev/null || true
+    chmod 666 "$PLAYER_FIFO" 2>/dev/null || true
+    setsid /usr/bin/drmplay $PLAYER_OPTS -F "$PLAYER_FIFO" \
+        >>/var/log/miracast-play.log 2>&1 </dev/null &
+    echo $! >"$PLAYER_PIDFILE"
+    sleep 0.4
+    log "常驻播放器已起 (pid $(cat "$PLAYER_PIDFILE" 2>/dev/null))"
+}
+
+start_decoder() {
+    rm -f "$ES_FIFO"
+    mkfifo "$ES_FIFO" 2>/dev/null || true
+    chmod 666 "$ES_FIFO" 2>/dev/null || true
+    # 自己持有一个读写端: ① 管道永远有写端 ⇒ v4l2_dec 的 open(O_RDONLY) 立刻返回,
+    # 不会卡在 open 上等 uxplay; ② 解码器重启的那 0.5 s 里 uxplay 写管道也不会
+    # 拿到 EPIPE/SIGPIPE (否则 uxplay 直接被打死, 表现为「投上去就断」)。
+    exec 9<>"$ES_FIFO"
+    # 看护循环: 解码器退出 (上一路码流 EOF / 会话结束) 立刻重开管道等下一次。
+    # 少了这个循环, 第一路会话结束后就再也没人解码 ⇒ 第二次投屏只有声音没有画面。
+    # 故意**不 setsid**: 让子进程留在本 unit 的 cgroup 里, systemctl stop 时一起收掉,
+    # 不会留下一个抱着 /run/wfd-player.fifo 的僵尸解码器挡 Miracast。
+    (
+        while :; do
+            /usr/bin/v4l2_dec "$ES_FIFO" "$PLAYER_FIFO" -H -D -A \
+                >>/var/log/miracast-dec.log 2>&1 </dev/null
+            _rc=$?
+            printf '[%s] 硬解退出 (rc=%d) → 0.5s 后重开管道等下一次投屏\n' \
+                "$(date +%H:%M:%S)" "$_rc" >>"$LOG"
+            sleep 0.5
+        done
+    ) &
+    DEC_PID=$!
+    log "硬解已起 (pid $DEC_PID, 输入 $ES_FIFO)"
+}
+
+cleanup() {
+    # 先杀看护循环 (它一死就不会再 fork 新的解码器), 再杀它的**直接子进程**。
+    # ⚠ 不能写 pkill -f "v4l2_dec $ES_FIFO": 重启时旧实例的 cleanup 会晚几秒跑,
+    #    按名字杀会把**新实例刚起的解码器**一起打死 (实测 21:43:09 rc=137 就是它)。
+    if [ -n "${DEC_PID:-}" ]; then
+        kill -9 "$DEC_PID" 2>/dev/null || true
+        for _c in $(pgrep -P "$DEC_PID" 2>/dev/null); do kill -9 "$_c" 2>/dev/null || true; done
+    fi
+    exec 9>&- 2>/dev/null || true
+    rm -f "$ES_FIFO" 2>/dev/null || true
+    log "airplay 结束"
+}
+trap cleanup EXIT INT TERM
+
+case "${1:-run}" in
+    run)
+        [ -x "$UXPLAY" ] || { log "✗ 找不到 $UXPLAY"; echo "uxplay 未安装: $UXPLAY" >&2; exit 1; }
+        ensure_player
+        start_decoder
+        # -vdmp 把解密后的 H.264 Annex-B 写到 "<参数>.h264" —— 正好就是 ES_FIFO。
+        # 它先对 "<参数>" 做一次可写性检查, 所以那个基名用一个普通空文件占位。
+        ES_BASE=$(echo "$ES_FIFO" | sed "s/[.]h264$//")
+        touch "$ES_BASE"
+        log "启动 AirPlay: name=$NAME es=$ES_FIFO"
+        # -n    服务名;  -nh 名字不加 @hostname
+        # -vdmp 视频直通到命名管道;  -s 只向手机要 720p30 (单核 + VPU 的舒服档)
+        # -p 7000 固定端口 (仲裁器按 7000 的已建立连接判断"苹果连上了")
+        # 音频: 不再用 -a 关掉。UXPLAY_AUDIO_PIPE 让 UxPlay 把解码后的 PCM 写成
+        # S16LE 48k 2ch 丢进同一条管道, 由常驻 pcmplay 出声 (与 Miracast 共用出口)。
+        export UXPLAY_AUDIO_PIPE="${AIRPLAY_AUDIO_PIPE:-/run/wfd-audio.pcm}"
+        "$UXPLAY" -n "$NAME" -nh -p 7000 -s 1280x720@30 -vdmp "$ES_BASE" >>"$LOG" 2>&1
+        RC=$?
+        log "uxplay 退出 (rc=$RC)"
+        exit $RC
+        ;;
+    *)
+        echo "用法: $0 [run]" >&2
+        exit 2
+        ;;
+esac

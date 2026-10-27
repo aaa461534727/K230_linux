@@ -1,0 +1,14 @@
+[Unit]
+Description=K230 screen owner: resident DRM player (idle -> black, never purple)
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/root/k230-screen.sh
+Restart=always
+RestartSec=1
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

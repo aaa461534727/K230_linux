@@ -39,7 +39,8 @@
 #   wfd-p2p.sh start [额外 p2p_group_add 参数]   起 GO + 广播 WFD IE + DHCP
 #   wfd-p2p.sh client                           ★推荐: 当 P2P client (手机/PC 当 GO, 地址自动判别)
 #   wfd-p2p.sh listen                           只进入 P2P listen (不建组), 兼容只认 device 的 ROM
-#   wfd-p2p.sh stop                              停 GO 并恢复原 station 配置
+#   wfd-p2p.sh stop                              停 GO + 置 hold (开机自启不再抢设备)
+#   wfd-p2p.sh resume                            清 hold 并重新起 GO (= 解除调试独占)
 #   wfd-p2p.sh status                            看当前 P2P 状态 / GO SSID / WFD IE
 #   wfd-p2p.sh devinfo <hex>                     改设备信息子元素 (调试位定义用)
 # =============================================================================
@@ -65,7 +66,22 @@ else
     IFACE=wlan0
 fi
 STATION_IFACE="${WFD_STATION_IFACE:-wlan0}"
+# 帧率口径 (2026-10-26 晚 主人: 「先保证有一版能使用先」):
+#   默认 = 30fps 基线 —— 只广告 720p30 (CEA bit5), native/preferred 留 00 00,
+#   与 17:43 真机跑通那版 (3076 帧 / 102.5 s = 30.0 fps, RESULT: PASS) 完全一致。
+#   历史: 1080p 在单核 + 2.4 GHz 上扛不住 (峰值 ~1 MB/s, 5 s 丢 194~653 包 = 花屏),
+#   720p 只要 1/2.25 的像素, 所以默认档一直是 720p。
+#   WFD 没有单独帧率字段, 帧率完全取决于广告的 CEA 位: bit5=720p30, bit6=720p60。
+#   要 60fps (验证中, 未验收): WFD_CEA=0x40 sh wfd-p2p.sh start
+#   要 1080p30:              WFD_CEA=0x80 sh wfd-p2p.sh start
+#   要 720p 双档:            WFD_CEA=0x60 sh wfd-p2p.sh start
+WFD_LOWLAT="${WFD_LOWLAT:-0}"; export WFD_LOWLAT
 PIDFILE="${WFD_PIDFILE:-/run/wfd-p2p.pid}"
+# 2026-10-26 自启与调试的隔离阀: 有本文件时自启**空跑退出**, 不会去抢 wlan1 / 7236。
+#   · stop 子命令默认置位 (调试时停一次就不会被 systemd 再拉起来)
+#   · resume 子命令 / systemctl start k230-miracast 清除并启动
+#   · 调试脚本要绕过: WFD_FORCE=1 sh wfd-p2p.sh start
+HOLD_FILE="${WFD_HOLD_FILE:-/run/wfd-p2p.hold}"
 PBC_PIDFILE="${WFD_PBC_PIDFILE:-/run/wfd-pbc.pid}"
 CTRL_DIR="${WFD_CTRL_DIR:-/run/wpa_supplicant}"
 P2P_CONF="${WFD_P2P_CONF:-/tmp/wfd-p2p.conf}"
@@ -80,6 +96,10 @@ GO_IP="${WFD_GO_IP:-192.168.49.1}"       # GO 自身地址 (手机加入后才�
 #   参考 sink=192.168.49.128, 且整个抓包里一帧 DHCP 都没有 ⇒ 静态地址。
 CLIENT_IP="${WFD_CLIENT_IP:-192.168.49.128}"
 CLIENT_WATCH_PID="${WFD_CLIENT_PIDFILE:-/run/wfd-client-watch.pid}"
+# GO 模式(本机当 GO)下的收流 watcher pid: 等 source(手机) 关联 + 拿租约后再起 pipeline
+GO_WATCH_PID="${WFD_GO_PIDFILE:-/run/wfd-go-client-watch.pid}"
+GO_SUP_PID="${WFD_GO_SUP_PIDFILE:-/run/wfd-go-supervisor.pid}"
+GO_IF=""                                  # GO 模式实际承载组的接口 (cmd_start 里填)
 DHCP_POOL="${WFD_DHCP_POOL:-192.168.49.10}"  # dhcpd 发的地址池起始
 DHCP_LOG="${WFD_DHCP_LOG:-/tmp/dhcpd.log}"
 # ⚠ 注意编码: wpa_supplicant 的 WFD_SUBELEM_SET 存的是 [id 由它自己加] + 你给的 hex 原样,
@@ -118,7 +138,11 @@ WFD_SUBELEM_COUPLED_SINK="${WFD_SUBELEM_COUPLED_SINK:-000700000000000000}"
 # 2026-10-25: 默认改 ch11 (2462)。Windows 10 的 P2P listen/操作信道默认就是 ch11,
 # 我们若停在 ch6, 它发的 GO Negotiation Confirmation 落在 ch11 我们听不到 ⇒
 # 双方都超时 (PC 弹"无法连接")。8189fs 只支持 2.4G, ch11 与手机历史成功帧一致。
-GO_FREQ="${WFD_GO_FREQ:-2462}"           # 2.4G ch11
+# 2026-10-26: 默认改回 ch1 (2412)。依据是现场铁证 —— K80 的 P2P Listen Channel
+#   实测 = ch1 (Op Class 81), 只在 ch1 听; 我们 GO 若起在 ch11, 它要撞运气才看得到
+#   ("找到一次, 刷新又没了")。之前靠 shell 里手敲 WFD_GO_FREQ=2412 才凑效, 手敲一丢
+#   就又回到 ch11 ⇒ 现在把 2412 写进默认值, 裸 start 就是已知可用配置。
+GO_FREQ="${WFD_GO_FREQ:-2412}"           # 2.4G ch1 (对齐 K80 的 listen channel)
 # listen 信道必须跟组信道一致 (手机把 GO-Neg/PD 发到它看到的 listen 信道)。
 # 由 GO_FREQ 反推: 2412→1, 2437→6, 2462→11; 也可用 WFD_LISTEN_CHANNEL 直接指定。
 case "$GO_FREQ" in
@@ -188,7 +212,20 @@ write_conf() {
     fi
     _keep_nets=""
     if [ -f "$P2P_CONF" ]; then
-        _keep_nets=$(awk '/^network=\{/{f=1; buf=""} f{buf=buf $0 "\n"} f&&/^\}/ {f=0; if (buf ~ /bssid=/) printf "%s", buf}' "$P2P_CONF" 2>/dev/null)
+        # 2026-10-27 现场定因 (K80 首次点投屏 70% 失败):
+        #   持久组块里存着 bssid=<对端 P2P **设备**地址> (da:85:76:6f:f8:2d)。
+        #   手机每次建组都换一个随机组接口 MAC (实测 ...f8:1d / ...f8:ce / ...f8:01),
+        #   把 bssid 钉死 ⇒ 重新入组时按旧地址关联, 空口上那个 MAC 根本不存在
+        #   ⇒ ASSOCIATING 干等 2~3 s 后 reason 1 (UNSPECIFIED), 连试 3 次
+        #   ⇒ P2P-GROUP-FORMATION-FAILURE (就是"连好几次才成功"的那 30%)。
+        #   修法: 保留持久组凭据 (ssid/psk, 否则对端 Invitation 会变 unknown-group),
+        #   但**丢掉 bssid= 那一行**, 让 supplicant 每次按 SSID 扫到当前真实的
+        #   GO 组接口地址再关联。
+        _keep_nets=$(awk '/^network=\{/{f=1; buf=""} f{if ($0 !~ /^[ \t]*bssid=/) buf=buf $0 "\n"} f&&/^\}/ {f=0; if (buf ~ /psk=/ || buf ~ /key_mgmt=/) printf "%s", buf}' "$P2P_CONF" 2>/dev/null)
+        if [ -n "$_keep_nets" ]; then
+            _kn=$(printf '%s\n' "$_keep_nets" | grep -c '^network={' 2>/dev/null || true)
+            log "保留 [$_kn] 个持久组凭据 (已去掉 bssid 引脚, 重连时自己找当前组地址)"
+        fi
     fi
 
     cat > "$P2P_CONF" <<EOF
@@ -390,6 +427,24 @@ stop_supplicant() {
 }
 
 start_supplicant() {
+    # 2026-10-26 实测: 同一块板反复 `start` 会**叠加**出多个 wpa_supplicant
+    # (现场攒到 5 个: 每个都 `-dd` 往同一份 /tmp/wfd-p2p.log 写, 每个都还占着
+    #  /run/wpa_supplicant/wlan1 这个路径; 新实例 bind 失败 → 脚本把 wlan1 down/up
+    #  一次才挤进去 ⇒ 每次重起都抖一下)。所以起新实例前先按"命令行里带我们这份
+    #  P2P 配置"精准清场 (不会碰 wlan0 station 的 supplicant)。
+    for _p in $(pgrep -x wpa_supplicant 2>/dev/null); do
+        grep -qa "wfd-p2p.conf" "/proc/$_p/cmdline" 2>/dev/null && kill -9 "$_p" 2>/dev/null
+    done
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        _left=0
+        for _p in $(pgrep -x wpa_supplicant 2>/dev/null); do
+            grep -qa "wfd-p2p.conf" "/proc/$_p/cmdline" 2>/dev/null && _left=1
+        done
+        [ "$_left" = 0 ] && break
+        _i=$((_i + 1)); sleep 0.2
+    done
+    rm -f "$CTRL_DIR/$IFACE" "$CTRL_DIR/p2p-dev-$IFACE" 2>/dev/null || true
     : > "$P2P_LOG"
     if ! wpa_supplicant -B -P "$PIDFILE" -i "$IFACE" -D nl80211 -c "$P2P_CONF" -f "$P2P_LOG" -dd -t; then
         # 常见原因: 上一个实例在 AP 模式下被强杀, 驱动/vif 状态没释放
@@ -417,9 +472,42 @@ start_supplicant() {
 
 cmd_start() {
     need_root
+    # 自启与调试隔离 (2026-10-26): 调试时执行过 stop 就会留下 HOLD_FILE,
+    #   自启看到它**空跑退出**, 绝不抢 wlan1 / 7236 / DRM。要恢复: 本脚本 resume。
+    if [ -f "$HOLD_FILE" ] && [ "${WFD_FORCE:-0}" != "1" ]; then
+        log "⏸ 存在 $HOLD_FILE (上次 stop 或调试独占) —— 本次不启动。解除: sh $0 resume"
+        exit 0
+    fi
+    # 2026-10-26 实测: 本板 net.core.rmem_max 只有 212992 (208 KB), 而 1080p30 的
+    #   WFD 码流峰值 ~1 MB/s ⇒ 收包缓冲只够 200 ms, 手机一突发就丢包 (现场
+    #   wfd-sink 统计 lost 5 s 内 0→194→653)。wfd_sink 里虽然请求了 4 MB,
+    #   但被 rmem_max 截断。这里先把上限抬高, 让 SO_RCVBUF 真能生效。
+    sysctl -w net.core.rmem_max=4194304 >/dev/null 2>&1 ||
+        echo 4194304 > /proc/sys/net/core/rmem_max 2>/dev/null || true
+    # 2026-10-26 紫屏根治: 上屏进程不再跟着管线起落, 而是**从开机就常驻**。
+    #   早一点起来 = 少一段"没人持有 CRTC"的空白 (= 紫屏)。这里先清掉上一轮的残留
+    #   (孤儿占着 DRM master 会让新的 SETCRTC 报 Permission denied), 再立刻起播放器。
+    # 2026-10-26 晚: 屏由 k230-screen.service 独占 (它自己 Restart=always)。只有当它
+    # 没在跑 (单跑本脚本、或服务被禁) 时才由本脚本兜底起一个播放器 —— 否则在这里
+    # pkill 会连它一起杀掉, 立刻露一次紫屏。
+    if ! systemctl is-active --quiet k230-screen.service 2>/dev/null; then
+        pkill -9 -x drmplay 2>/dev/null || true
+        sleep 0.2
+    fi
+    select_player
+    start_player
     backup_conf
     write_conf
-    systemctl start miracast.service 2>/dev/null || true
+    # ⚠ GO 模式下 wlan1 + /tmp/wfd-p2p.conf 必须由本脚本独占: miracast.service 跑的
+    #   是 client 模式 (同一张网卡 / 同一份 conf), 两个 supplicant 会互相 kill ⇒
+    #   默认先停服务; 需要并存时显式 WFD_WITH_SERVICE=1。
+    #   (2026-10-26 实测: stop 结尾会拉起服务, 手动起 GO 后服务把 supplicant 抢回去,
+    #    表现为 GO 组消失 / /tmp/wfd-p2p.log 被重写)
+    if [ "${WFD_WITH_SERVICE:-0}" = "1" ]; then
+        systemctl start miracast.service 2>/dev/null || true
+    else
+        systemctl stop miracast.service 2>/dev/null || true
+    fi
     rm -f /tmp/wfd-p2p.done /tmp/wfd-p2p.failed
     start_supplicant
 
@@ -493,6 +581,20 @@ cmd_start() {
     # 4.5) WPS PBC 自动应答: 手机点选后发 PROV-DISC-PBC-REQ, 不回就连不上
     start_pbc_watcher
 
+    # 4.6) GO 模式收流 (2026-10-26): source 关联进来 + 拿到租约后立刻起 RTSP pipeline,
+    #      否则手机把画面推到 192.168.49.1:7236 时无人应答 ⇒ 表现为「连不上」。
+    GO_IF="${go_if:-$IFACE}"
+    stop_go_watchers
+    start_go_sink_watch
+
+    # 4.7) 先起「纯监听」pipeline: 手机一关联上来就有人应答 :7236
+    #      (等它拿到租约后 watcher 会切成双模 `-c <手机ip>:7236`)。
+    SINK_GO_IP=""
+    start_sink_client
+
+    # 4.8) 看护: pipeline 重试用尽 / 异常退出 时自动补起 (手机还连着但没有 7236 的场景)
+    start_go_supervisor
+
     # 5) 证据: 日志里必须能找到 "WFD IE" 构建记录 (说明 beacon 会带)
     if grep -q "WFD: Update WFD IE" "$P2P_LOG"; then
         log "✅ 日志有 'WFD: Update WFD IE' (WFD IE 已生效)"
@@ -500,6 +602,19 @@ cmd_start() {
     else
         log "⚠ 日志没看到 'WFD: Update WFD IE', 下面贴相关行:"
         grep -i "wfd" "$P2P_LOG" | tail -10 || true
+    fi
+
+    # 5.5) 单实例自检 (2026-10-26): 只允许 1 份 P2P supplicant + 1 组 pbc-watcher
+    #      (以前每次 start 都叠一版, 攒到 5 份 supplicant / 15 个 watcher 进程)
+    _ns=0
+    for _p in $(pgrep -x wpa_supplicant 2>/dev/null); do
+        grep -qa "wfd-p2p.conf" "/proc/$_p/cmdline" 2>/dev/null && _ns=$((_ns + 1))
+    done
+    _np=$(pgrep -f "wfd-pbc-watcher.sh" 2>/dev/null | wc -l)
+    if [ "$_ns" -eq 1 ] && [ "$_np" -le 3 ]; then
+        log "✅ 单实例自检: P2P supplicant ${_ns} 份 / pbc-watcher ${_np} 个进程 (1 主 + 2 子 = 正常)"
+    else
+        log "⚠ 单实例自检不过: supplicant ${_ns} 份 (期望 1) / pbc-watcher ${_np} 个 (期望 ≤3), 看 ps"
     fi
 
     cp "$P2P_LOG" "$BROADCAST_LOG" 2>/dev/null || true
@@ -516,6 +631,10 @@ stop_dhcpd() {
 # GO 侧必须回一次 `wps_pbc`, 手机才能用 WPS 按钮方式加入组并拿 DHCP。
 # 之前不回 => 日志里只有 P2P-PROV-DISC-PBC-REQ, 然后 P2P-DEVICE-LOST, 连不上。
 start_pbc_watcher() {
+    # 2026-10-26: 以前只在 cmd_stop 里清 watcher, 反复 `start` 会一版叠一版
+    # (现场攒到 5 组 / 15 个进程, 老的还在 tail 同一份日志、对同一事件重复
+    #  发 p2p_connect/让位 ⇒ GO 抖动、手机"点几次才成")。起新的前先清场。
+    stop_pbc_watcher
     [ -f "$P2P_LOG" ] || return 0
     # 2026-10-21: 让位逻辑已独立成 wfd-pbc-watcher.sh (同目录, 见其文件头注释):
     #   K230 在本硬件上只能用"跑 GO 组"的方式被手机看见 (managed 模式下驱动不上报
@@ -560,11 +679,16 @@ start_dhcpd() {
         return 0
     fi
     pkill -x dhcpd 2>/dev/null || true
-    setsid nohup "$bin" -i "$dev" -a "$GO_IP" -p "$DHCP_POOL" -n 16 -v \
+    # 2026-10-26 实测: 小米/红米每次投屏都换一个随机 MAC (现场 15 分钟内换了
+    #   8 个: f8:73/f8:d5/f8:ad/f8:36/f8:69/f8:28/de:f0../ae:82..), 而租约
+    #   默认 3600s 且池只有 16 个 ⇒ 一小时内点十几次就「池满, 拒绝」, 手机拿
+    #   不到 IP, 表现正是「有时候投得上、有时候投不上」。改成 64 个池 + 300s
+    #   短租约 (活动会话会自己续租, 不活动的一批 5 分钟就回收)。
+    setsid nohup "$bin" -i "$dev" -a "$GO_IP" -p "$DHCP_POOL" -n 64 -t 300 -v \
         >> "$DHCP_LOG" 2>&1 &
     sleep 1
     if pgrep -x dhcpd >/dev/null 2>&1; then
-        log "✅ dhcpd 已起: 池 $DHCP_POOL +16 (/24), 网关/DNS $GO_IP, 日志 $DHCP_LOG"
+        log "✅ dhcpd 已起: 池 $DHCP_POOL +64, 租约 300s (/24), 网关/DNS $GO_IP, 日志 $DHCP_LOG"
     else
         log "⚠ dhcpd 没起来, 看 $DHCP_LOG"
     fi
@@ -683,18 +807,102 @@ prepare_client_net() {
     return 0
 }
 
+# 2026-10-27 现场: 8189fs 默认 Power save: on + rtw_smart_ps=2。
+#   省电模式下本端在 DTIM 之间睡, P2P GO(手机) 只能把下行帧攒到信标再发, 接收侧看到的
+#   是「一坨一坨」⇒ 帧间隔忽大忽小、源端还会据此降码率/降帧 (实测同一台手机 13:17 能出
+#   59.8 fps, 13:28 只出 31~46 fps 且 lost=0 / cc_err=0, 说明不是丢包而是对端主动降)。
+#   Miracast 接收端对实时性要求最高, 省电必须关。iw 设置会被重新关联清掉, 所以每次
+#   起管线 / 进 client 模式都补一次 (幂等, 失败不影响投屏)。
+ps_off() {
+    for _psif in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+        # 只在真的是 on 时才动 (幂等: 反复 set 会让驱动重算 ps 状态)
+        if iw dev "$_psif" get power_save 2>/dev/null | grep -q 'on'; then
+            iw dev "$_psif" set power_save off >/dev/null 2>&1 && \
+                log "省电已关: $_psif (DTIM 攒帧会让对端降码率/降帧 ⇒ 卡顿)"
+        fi
+    done
+    # 驱动侧三道闸门全关: smart_ps(省电等级) / power_mgnt(PS 模式 2=最省) / lps_chk_by_tp
+    #   smart_ps 与 power_mgnt 都是可写的模块参数, 写完立即对后续收发生效 (无需重新加载驱动)。
+    for _psp in rtw_smart_ps rtw_power_mgnt; do
+        _f=/sys/module/8189fs/parameters/$_psp
+        [ -w "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" != "0" ] && \
+            echo 0 > "$_f" 2>/dev/null && log "省电已关: $_psp=0"
+    done
+    return 0
+}
 stop_sink_client() {
     if [ -f "$SINK_PIPE_PID" ]; then
         _pg=$(cat "$SINK_PIPE_PID" 2>/dev/null || echo "")
-        [ -n "$_pg" ] && kill -9 -- "-$_pg" 2>/dev/null || true
+        # 2026-10-26: dash 的 kill 不支持 `--` 分隔符 (实测报 `Illegal number: -`
+        # 且**什么都没杀**), 必须写成 kill -9 -<PGID> 才真按进程组杀。
+        [ -n "$_pg" ] && kill -9 "-$_pg" 2>/dev/null || true
         rm -f "$SINK_PIPE_PID"
     fi
     # K230: setsid sh -c 的 while 循环会不断重起 wfd-sink, 必须按命令行 SIGKILL
     pkill -9 -f "/usr/bin/wfd-sink" 2>/dev/null || true
-    for _b in wfd-sink v4l2_dec drmplay vgplay; do
+    # 2026-10-26: **不要杀 drmplay** —— 它是常驻播放器 (读命名管道, 空闲刷黑),
+    #   杀了就有一段没人持有 CRTC 的空白 ⇒ 面板扫未定义显存 = 全屏紫色。
+    #   只有 vgplay (老的 GPU 路径, 仍在管线里) 需要跟着管线走。
+    for _b in wfd-sink vgplay; do
         pkill -9 -x "$_b" 2>/dev/null || true
     done
+    # 2026-10-26 (互斥实测): **v4l2_dec 不能按名字杀** —— 板上同时有两个:
+    #   · 安卓这条读 /dev/stdin   (wfd-sink | v4l2_dec | 常驻播放器)
+    #   · 苹果这条读 /run/airplay.h264 (k230-airplay 的看护循环)
+    #   按名字 pkill 会把苹果的解码器一起打死 (airplay.log 里每切一次就一条
+    #   `硬解退出 (rc=137)`); 若那一刀正好落在 iPhone 首帧之前, 解码器重启后
+    #   从流中间接上、丢了 SPS ⇒ 「投上了但黑屏」。所以只精确杀安卓这条。
+    pkill -9 -f "v4l2_dec /dev/stdin" 2>/dev/null || true
     sleep 1
+}
+
+# ---- 常驻播放器 (2026-10-26 去紫屏) --------------------------------------
+# 一个进程从开机持有 DRM master 到关机: drmplay -F <fifo>, 管道里没数据就刷黑。
+# 好处: ① 任何时候屏上都有 plane (无紫) ② 管线重启不再抢 DRM master
+#      ③ 会话切换零空档。调试要独占屏就直接 kill 它 (自启看护会补起)。
+PLAYER_FIFO="${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}"
+PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
+PLAYER_FIFO_MODE=0
+
+start_player() {
+    [ -x "$PLAYER_BIN" ] || return 0
+    if [ "$PLAYER_BIN" != /usr/bin/drmplay ]; then
+        # vgplay 不支持 -F 常驻, 退回老的「管线里当最后一段」
+        PLAYER_FIFO_MODE=0
+        return 0
+    fi
+    if [ -f "$PLAYER_PIDFILE" ]; then
+        _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo 0)
+        if [ -n "$_pp" ] && [ "$_pp" != 0 ] && kill -0 "$_pp" 2>/dev/null; then
+            PLAYER_FIFO_MODE=1
+            return 0            # 已经在跑, 别重启 (重启就是一次紫屏)
+        fi
+    fi
+    if pgrep -f "drmplay .*-F $PLAYER_FIFO" >/dev/null 2>&1; then
+        PLAYER_FIFO_MODE=1
+        return 0
+    fi
+    # 先把 -B 占位让出来 (它持有 DRM master, 不让出新的会 SETCRTC Permission denied)
+    stop_blank
+    rm -f "$PLAYER_FIFO"; mkfifo "$PLAYER_FIFO" 2>/dev/null || true
+    chmod 666 "$PLAYER_FIFO" 2>/dev/null || true
+    setsid /usr/bin/drmplay $PLAYER_OPTS -F "$PLAYER_FIFO" \
+        >>/var/log/miracast-play.log 2>&1 < /dev/null &
+    echo $! > "$PLAYER_PIDFILE"
+    PLAYER_FIFO_MODE=1
+    sleep 0.4
+    log "🖤 常驻播放器已起 (pid $(cat "$PLAYER_PIDFILE" 2>/dev/null), 管道 $PLAYER_FIFO) —— 空闲自动刷黑, 不再紫屏"
+}
+
+stop_player() {
+    if [ -f "$PLAYER_PIDFILE" ]; then
+        _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo "")
+        [ -n "$_pp" ] && kill -9 "$_pp" 2>/dev/null || true
+        rm -f "$PLAYER_PIDFILE"
+    fi
+    pkill -9 -x drmplay 2>/dev/null || true
+    rm -f "$PLAYER_FIFO"
+    PLAYER_FIFO_MODE=0
 }
 
 # 空闲占屏: 用 drmplay -B 把 CRTC 占成纯黑。
@@ -702,7 +910,7 @@ stop_sink_client() {
 stop_blank() {
     if [ -f "$BLANK_PID" ]; then
         _bp=$(cat "$BLANK_PID" 2>/dev/null || echo "")
-        [ -n "$_bp" ] && kill -9 -- "-$_bp" 2>/dev/null || true
+        [ -n "$_bp" ] && kill -9 "-$_bp" 2>/dev/null || true
         [ -n "$_bp" ] && kill -9 "$_bp" 2>/dev/null || true
         rm -f "$BLANK_PID"
     fi
@@ -711,6 +919,11 @@ stop_blank() {
 }
 start_blank() {
     [ -x /usr/bin/drmplay ] || return 0
+    # 2026-10-26: 常驻播放器已经在占 CRTC 并会自己刷黑, 再去起一个 -B 只会抢
+    #   DRM master (现场症状: SETCRTC Permission denied + 紫屏/黑屏抖动)。
+    if pgrep -f "drmplay .*-F /run/wfd-player.fifo" >/dev/null 2>&1; then
+        return 0
+    fi
     stop_blank
     setsid /usr/bin/drmplay -B -w 480 -h 800 >>/var/log/miracast-blank.log 2>&1 < /dev/null &
     echo $! > "$BLANK_PID"
@@ -745,17 +958,51 @@ select_player() {
 }
 
 start_sink_client() {
+    # 只重启 wfd-sink / v4l2_dec; 播放器常驻 (start_player 幂等, 已在跑就不动)
+    ps_off
     stop_sink_client
-    stop_blank
     select_player
+    start_player
+    if [ "$PLAYER_FIFO_MODE" != 1 ]; then
+        stop_blank
+    fi
+    # 2026-10-26 实测定论 (dmesg 铁证): 本固件 v5/v7 H264 解码器**不支持**
+    #   DEC_DST_CROPPING —— ioctl 返回成功, 固件随后回
+    #   "set-opt h264dec: Unsupported option. (index=107)",
+    #   结果: -c 被静默忽略, 而 -s 480x800 照常生效 ⇒ 整幅 1920x1080 (含左右
+    #   黑边) 被横向压进 480 宽 ⇒ 手机内容只剩中间一条 (主人看到的"中间一点点")。
+    #   所以管线只用「解码器出原分辨率 → drmplay 自己裁黑边+缩放」
+    #   (drmplay 侧实测: 源 509x1080 @708,0 → 绘制区 377x800 @51,0, 画面正确)。
+    #   ⇒ 解码器不再传 -L/-c/-s, 学习内容区那套机制保留在工具里备用, 不进管线。
+    # SINK_GO_IP 为空 ⇒ 只监听 :7236 (GO 模式: source 会拨进来);
+    # 非空 ⇒ 双模 (同时监听 + 主动拨对端:7236), wfd_sink.c 里 listener 无条件创建。
+    if [ -n "$SINK_GO_IP" ]; then
+        SINK_ARG="-c $SINK_GO_IP:$SINK_GO_PORT"
+    else
+        SINK_ARG=""
+    fi
+    # 2026-10-26 常驻播放器: 解码器直接写命名管道 (/run/wfd-player.fifo), 播放器那一侧
+    #   一个进程吃到底 —— 管线怎么重试都不会出现"没人持有 CRTC"的空窗 (紫屏)。
+    # 2026-10-27 取证开关 (默认关): touch /run/k230-es-dump ⇒ sink 输出的 H.264 ES 再存一份
+    #   到 /run/k230-es.h264。用途: 离线逐帧比对「屏上内容不变」到底是手机编码器发的重复帧,
+    #   还是本板解码器没把新画面送出去 —— 两种结论的修法完全相反, 别靠猜。
+    #   代价: 多一个 tee 进程搬 2~4 Mbps (0.3~0.5 MB/s), 单核占用 <1%; 9 MB/30 s, /run 有 192 MB。
+    TEE_SEG=""
+    [ -f /run/k230-es-dump ] && TEE_SEG=' | /usr/bin/tee /run/k230-es.h264 2>/dev/null'
+    if [ "$PLAYER_FIFO_MODE" = 1 ]; then
+        DEC_OUT="$PLAYER_FIFO"
+        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' -H -D -A 2>>/var/log/miracast-dec.log'
+    else
+        DEC_OUT=/dev/stdout
+        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' -H -D -A 2>>/var/log/miracast-dec.log | '"$PLAYER_BIN $PLAYER_OPTS"' 2>>/var/log/miracast-play.log'
+    fi
     setsid sh -c '
         PLAYER_BIN="'"$PLAYER_BIN"'"
         PLAYER_OPTS="'"$PLAYER_OPTS"'"
+        SINK_ARG="'"$SINK_ARG"'"
         i=0
-        while [ $i -lt 20 ]; do
-            /usr/bin/wfd-sink -c '"$SINK_GO_IP"':'"$SINK_GO_PORT"' -d /dev/stdout 2>>/var/log/miracast.log | \
-            /usr/bin/v4l2_dec /dev/stdin /dev/stdout -H -D 2>>/var/log/miracast-dec.log | \
-            "$PLAYER_BIN" $PLAYER_OPTS 2>>/var/log/miracast-play.log
+        while :; do
+            '"$PIPE_ONE"'
             _rc=$?
             # GPU 播放器起不来 (没 /dev/vg_lite / map 失败等) 立刻回落 CPU, 不让主人看到黑屏
             if [ "$_rc" -ne 0 ] && [ "$PLAYER_BIN" = /usr/bin/vgplay ]; then
@@ -763,14 +1010,27 @@ start_sink_client() {
                 PLAYER_BIN=/usr/bin/drmplay
                 PLAYER_OPTS="-H -p nv12 -w 480 -h 800"
             fi
-            /usr/bin/drmplay -B -w 480 -h 800 >/dev/null 2>&1 &
-            _bl=$!
-            sleep 2
-            kill -9 "$_bl" 2>/dev/null
+            # 2026-10-26 实测修: 这里原来是「起 drmplay -B 占屏 2 s 再杀」。实测
+            #   ★每次重试都和新管线的 drmplay 抢 CRTC★ (play.log 成片
+            #   `✗ SETCRTC(crtc=52 conn=54): Permission denied`), 新管线的上屏
+            #   进程抢不到就退出 ⇒ 管线只剩 sink|v4l2_dec 两段; 而重试又恰好发生
+            #   在「手机连上、切双模」那一秒, 现场就是「连上了但黑屏 / 这次连不上」。
+            #   改成不留占位、0.5 s 后立刻重起整条管线 (空档毫秒级; 空闲态现在
+            #   常驻监听管线, 本来就有 drmplay 占着 CRTC, 不需要额外黑屏占位)。
+            sleep 0.5
             i=$((i+1))
+            # 2026-10-26: 原来封顶 20 次, 手机秒断的重拨风暴 (13:17:18) 会在一秒内
+            # 把额度烧光 ⇒ pipeline 自灭、7236 从此无人监听 (现象: 连上了但屏黑)。
+            # 改成**不封顶**, 只每 10 次打一行; 真正的"别再重拨"由 source 断开事件负责。
+            [ $((i % 10)) -eq 0 ] && \
+                echo "[$(date +%H:%M:%S)] ♻ pipeline 已重试 $i 次 (不封顶, 继续等对端)" >>/var/log/miracast.log
         done' >/dev/null 2>&1 &
     echo $! > "$SINK_PIPE_PID"
-    log "▶ sink 客户端模式已启动: rtsp://$SINK_GO_IP:$SINK_GO_PORT → v4l2_dec → $PLAYER_BIN (pid $(cat "$SINK_PIPE_PID"))"
+    if [ -n "$SINK_GO_IP" ]; then
+        log "▶ sink 客户端模式已启动: rtsp://$SINK_GO_IP:$SINK_GO_PORT → v4l2_dec → $PLAYER_BIN (pid $(cat "$SINK_PIPE_PID"))"
+    else
+        log "▶ sink 服务端模式已启动: 监听 :$SINK_GO_PORT 等 source 拨入 → v4l2_dec → $PLAYER_BIN (pid $(cat "$SINK_PIPE_PID"))"
+    fi
 }
 
 start_client_watcher() {
@@ -821,8 +1081,44 @@ start_client_watcher() {
                     start_sink_client
                     log "   看 sink 日志: tail -f /var/log/miracast.log"
                 else
-                    log "⚠ 本端成了 GO (role=$_role); Windows 源码一般自己当 GO —— 若对方是 PC 请查 p2p_go_intent 是否 0"
+                    # 2026-10-27 实测 (努比亚 Z17 miniS): 我们在 listen 状态 (还没建组) 时,
+                    #   对端不先发 PD, 而是直接发 GO Negotiation; 它 intent 让得更彻底,
+                    #   结果**我们被选成 GO** ⇒ role=GO。
+                    #   原来这里只打一行日志就撒手 ⇒ 组是个空壳: 没有 dhcpd (手机拿不到
+                    #   IP)、:7236 无人监听 ⇒ 手机连上又掉; 而且我们从此卡在 GO 组里,
+                    #   对外名字变成 "DIRECT-xxK230", 主人再点就「列表里找不到 K230」。
+                    #   现在: 既然已经是 GO, 就把 GO 该干的活全干上 (配地址 + dhcpd +
+                    #   GO 收流 watcher + 纯监听 :7236 + 看护), 让这台手机正常投上来。
+                    GO_IF="$_gif"
+                    : > /tmp/wfd-go-fallback
+                    ip addr add "$GO_IP/24" dev "$_gif" 2>/dev/null || true
+                    log "   → 按 GO 形态服务: GO_IP=$GO_IP on $_gif + dhcpd + :$SINK_GO_PORT 监听"
+                    start_dhcpd "$_gif"
+                    # 只清 GO 专用的旧 watcher (不能调 stop_go_watchers: 它会连本
+                    # client watcher 一起杀掉, 后面几步就没人执行了)
+                    for _pf in "$GO_WATCH_PID" "$GO_SUP_PID"; do
+                        [ -f "$_pf" ] && { kill_tree "$(cat "$_pf" 2>/dev/null)"; rm -f "$_pf"; }
+                    done
+                    start_go_sink_watch
+                    SINK_GO_IP=""
+                    start_sink_client
+                    start_go_supervisor
                 fi ;;
+            *AP-STA-DISCONNECTED*)
+                # client 模式下"意外当 GO"只是临时救场: 手机走了就把组拆掉回到
+                # listen (纯 P2P 设备), 否则我们长期以一个 GO 组的身份出现, 手机又
+                # 回到「发完 PD 就不说话」的死结 (2026-10-27 现场)。
+                [ -f /tmp/wfd-go-fallback ] || continue
+                log "⚠ source 离开 GO 组, 5 s 后若无 STA 就拆组回 listen"
+                ( sleep 5
+                  _sif="${GO_IF:-$IFACE}"
+                  if [ -z "$(iw dev "$_sif" station dump 2>/dev/null | awk '/^Station/{print $2; exit}')" ]; then
+                      wpa p2p_group_remove "$_sif" >/dev/null 2>&1 || true
+                      sleep 1
+                      wpa p2p_listen >/dev/null 2>&1 || true
+                      rm -f /tmp/wfd-go-fallback
+                      log "♻ 已拆临时 GO 组, 回到 listen (手机可重新发现)"
+                  fi ) & ;;
             *P2P-GROUP-REMOVED*)
                 log "⚠ 组已移除: $(printf '%s' "$line" | cut -c1-80)"
                 stop_sink_client
@@ -831,8 +1127,14 @@ start_client_watcher() {
                 wpa p2p_group_remove "${CLIENT_IF:-$IFACE}" >/dev/null 2>&1 || true
                 sleep 1
                 wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                # 2026-10-27 现场 (11:09:01 手机 GO_ENDING_SESSION): 这里只杀不建 ⇒
+                #   断开后板上**一个 wfd-sink 都没有**, :7236 无人监听, 屏也停在最后一帧。
+                #   对端再点投屏时 RTSP 直接被人拒 ⇒ 主人实测「连好几次才成功」。
+                #   照 GO 侧 AP-STA-DISCONNECTED 的教训: 停完立刻以**纯监听**重建,
+                #   空闲态也始终有人在 :$SINK_GO_PORT 等 source。
+                start_sink_client
                 start_blank
-                log "♻ 已清理(进程+IP)并重挂 listen, 恢复可被发现" ;;
+                log "♻ 已清理(进程+IP)并重挂 listen, 已重建纯监听 pipeline (:$SINK_GO_PORT)" ;;
             *P2P-GROUP-FORMATION-FAILURE*)
                 # 组没建成 (对端取消/超时/信道不合): 必须重新挂 listen,
                 # 否则 supplicant 停在 IDLE, 对端再点就"扫不到/无法连接"。
@@ -841,7 +1143,10 @@ start_client_watcher() {
                 ip addr flush dev "${CLIENT_IF:-$IFACE}" 2>/dev/null || true
                 SINK_GO_IP=""
                 sleep 1
-                wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true ;;
+                wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                # 2026-10-27: 同上 —— 失败后同样要留一个纯监听 pipeline,
+                #   否则手机紧接着重试时 :$SINK_GO_PORT 无人应答。
+                start_sink_client ;;
             *CTRL-EVENT-DISCONNECTED*)
                 log "⚠ 与 GO 断开: $(printf '%s' "$line" | cut -c1-70)" ;;
             *P2P-FIND-STOPPED*|*P2P-LISTEN-STOPPED*)
@@ -852,8 +1157,165 @@ start_client_watcher() {
     log "client 事件监听已启动 (pid $(cat "$CLIENT_WATCH_PID" 2>/dev/null))"
 }
 
+# ------------------------------------------------------- GO 模式收流 (本机当 GO)
+# 场景: 本机 p2p_group_add 当 GO, 手机/PC 以 P2P client 身份关联进来。
+#   2026-10-26 实测 (K80): AP-STA-CONNECTED → EAPOL 4-way → dhcpd ACK 192.168.49.12,
+#   但 GO 分支过去只建组+dhcpd+PBC, **没有任何 RTSP 进程** ⇒ 手机侧等待 7236 超时,
+#   表现为「点了投屏, 连不上/一直转圈」。这里补上: 关联 + 拿租约后立刻起 pipeline。
+#   wfd_sink.c 的 listener 无条件创建, 所以 GO 模式用 `-c <source-ip>:7236` 双模
+#   (既监听也主动拨), 手机把 RTSP server 放哪一侧都能通。
+
+# 从 dhcpd 日志 (或 ARP 邻居表) 查出某个 MAC 拿到的 IP。
+#   dhcpd 行格式: [dhcpd] ACK → da:85:76:6f:f8:7d 192.168.49.12 (xid=0x...)
+lease_ip_of() {
+    _mac=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    _ip=$(awk -v m="$_mac" '$2=="ACK" && tolower($4)==m { ip=$5 } END { print ip }' "$DHCP_LOG" 2>/dev/null)
+    if [ -z "$_ip" ]; then
+        _ip=$(ip neigh show dev "${GO_IF:-${CLIENT_IF:-$IFACE}}" 2>/dev/null \
+              | tr 'A-Z' 'a-z' | awk -v m="$_mac" '$5==m { print $1; exit }')
+    fi
+    printf '%s' "$_ip"
+}
+
+# 按 pid 连同它的子进程一起杀掉 (GO watcher 是 `( tail | while )&` 子 shell,
+#   只杀子 shell 会把 tail 留成孤儿继续吃事件 ⇒ 之后重复 start_sink_client 抢启停)
+# 杀一个 pid 及其所有子进程。
+# 2026-10-26 加固 (板上现场): pidfile 可能是上一轮留下的陈旧 pid, 重启后 pid 会被
+#   复用 —— 不核对就 kill 会误杀无关进程, 甚至把我们自己带走。现象是「用
+#   `setsid ... &` 后台起 GO 时, 脚本在 4.6 步静默退出」: 两次都停在
+#   `start_pbc_watcher` 之后 (`/tmp/go-start-*.log` 恰好 19 行就没了),
+#   而同一版本在前台 `sh -x` 跑就一路到底 —— 唯一差别是那次提前删了
+#   /run/wfd-client-watch.pid (陈旧 pid). 所以 kill 前必须: ① 是数字
+#   ② 是本项目进程 (命令行白名单) ③ 不是我们自己/祖先/同进程组。
+kill_tree() {
+    [ -n "$1" ] || return 0
+    case "$1" in *[!0-9]*) return 0 ;; esac                # 不是纯数字, 忽略
+    [ "$1" = "$$" ] && return 0
+    [ -r "/proc/$1/cmdline" ] || return 0                  # 进程已退出
+    _cl=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)
+    case "$_cl" in
+        *wfd-p2p.sh*|*wfd-pbc-watcher*|*wfd-p2p.log*) ;;
+        *) return 0 ;;                                     # 不是本项目的, 绝不碰
+    esac
+    _p=$$                                                 # 目标在自己的祖先链上 → 绝不杀
+    while [ -n "$_p" ] && [ "$_p" != "0" ] && [ "$_p" != "1" ]; do
+        [ "$_p" = "$1" ] && return 0
+        _p=$(awk '{print $4}' "/proc/$_p/stat" 2>/dev/null)
+        [ -z "$_p" ] && break
+    done
+    for _d in /proc/[0-9]*; do
+        _pp=$(awk '{print $4}' "$_d/stat" 2>/dev/null)
+        [ "$_pp" = "$1" ] && kill -9 "${_d#/proc/}" 2>/dev/null
+    done
+    kill -9 "$1" 2>/dev/null || true
+}
+
+# 反复 `start` 时先清掉旧的 GO 事件 watcher / 看护 / client watcher。
+# 2026-10-26: 以前只清 pbc-watcher, 这两个按 pidfile 一版叠一版 ⇒ 多个 watcher
+#   同时对同一个 AP-STA-CONNECTED 起 pipeline, 互相 kill→restart, 现场表现
+#   「点几次才成」「有时连上没画面」。
+stop_go_watchers() {
+    for _pf in "$GO_WATCH_PID" "$GO_SUP_PID" "$CLIENT_WATCH_PID"; do
+        [ -f "$_pf" ] || continue
+        _old=$(cat "$_pf" 2>/dev/null || echo "")
+        kill_tree "$_old"
+        log "🧹 清旧 GO watcher: $(basename "$_pf") pid=${_old:-?}"
+        rm -f "$_pf"
+    done
+    sleep 0.3
+}
+
+start_go_sink_watch() {
+    [ -f "$P2P_LOG" ] || return 0
+    ( tail -n 0 -F "$P2P_LOG" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            *AP-STA-CONNECTED*)
+                _mac=$(printf '%s\n' "$line" | sed -n 's/.*AP-STA-CONNECTED \([0-9a-fA-F:]*\).*/\1/p')
+                [ -n "$_mac" ] || _mac=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="AP-STA-CONNECTED"){print $(i+1); exit}}')
+                log "📶 source 已关联我们的 GO 组: ${_mac:-?} (等 DHCP 租约…)"
+                _ip=""; _n=0
+                while [ "$_n" -lt 20 ]; do
+                    _ip=$(lease_ip_of "$_mac")
+                    [ -n "$_ip" ] && break
+                    _n=$((_n + 1)); sleep 0.5
+                done
+                if [ -n "$_ip" ]; then
+                    SINK_GO_IP="$_ip"
+                    log "✅ source IP=$_ip → 起双模 pipeline (监听 :$SINK_GO_PORT + 拨 $_ip:$SINK_GO_PORT)"
+                else
+                    SINK_GO_IP=""
+                    log "⚠ 10s 没拿到 $_mac 的租约 (看 $DHCP_LOG) → 先只监听 :$SINK_GO_PORT 等对端拨入"
+                fi
+                start_sink_client ;;
+            *AP-STA-DISCONNECTED*)
+                log "⚠ source 已离开 GO 组: $(printf '%s' "$line" | cut -c1-90)"
+                SINK_GO_IP=""
+                # 2026-10-26 实测: 原来这里是 `stop_sink_client` + 黑屏占位,
+                #   **不留任何监听器** ⇒ 一旦下一轮的 AP-STA-CONNECTED 事件漏看 /
+                #   来不及处理 (watcher 正卡在 10 s 租约轮询里), 手机连上 GO、
+                #   发了 RTSP 也没人应答, 现场就是「这次连不上, 再点一次又行」。
+                #   改成停掉旧 pipeline 后**立刻以纯监听模式重建**, 空闲态也始终
+                #   有人在 :7236 等 source (管道里的 drmplay 自己占着 CRTC, 不会紫屏)。
+                start_sink_client
+                log "♻ 已切回纯监听 :$SINK_GO_PORT (等下一个 source)" ;;
+        esac
+    done ) &
+    echo $! > "$GO_WATCH_PID"
+    log "GO 收流 watcher 已启动 (pid $(cat "$GO_WATCH_PID" 2>/dev/null))"
+}
+
+# GO 模式看护 (2026-10-26 实测补): pipeline 的外层 while 只重试 20 次, 用尽后
+#   进程全没了; 此时手机**还连着**, 不会再有 AP-STA-CONNECTED 事件 ⇒ 7236 从此
+#   无人监听, 再点投屏就是"连不上"。这里每 3 s 兜一次底。
+# 2026-10-26 第二轮加固: 原来只在「有 STA + 没 sink」时补 ⇒ 没有 STA 时永不补,
+#   空闲态可能长时间**根本没有监听器** (只要有一次 watcher 漏事件/被 restart 打断)。
+#   现在改成「没 sink 就补」: 有 STA 就双模拨它, 没 STA 就纯监听。
+start_go_supervisor() {
+    ( _miss=0
+      _pdead=0
+      _plr=$(basename "${PLAYER_BIN:-/usr/bin/drmplay}")
+      while :; do
+        sleep 3
+        _sif="${GO_IF:-$IFACE}"
+        if pgrep -f "/usr/bin/wfd-sink" >/dev/null 2>&1; then
+            _miss=0
+            # 管线三段必须齐全: 上屏进程单独死了 (抢 CRTC 失败 / 异常退出) 时
+            # sink 还在监听、7236 也通, 但画面永远出不来 ⇒ 只能整条重起。
+            if pgrep -x "$_plr" >/dev/null 2>&1; then
+                _pdead=0
+            else
+                _pdead=$((_pdead + 1))
+                if [ "$_pdead" -ge 2 ]; then
+                    _pdead=0
+                    log "🛠 看护: 收流在但上屏进程($_plr)不在 → 整条 pipeline 重起"
+                    start_sink_client
+                fi
+            fi
+            continue
+        fi
+        _pdead=0
+        # 连 2 次 (6 s) 都没有才补: 避开 watcher 正在 stop→start 换模式的瞬间
+        _miss=$((_miss + 1))
+        [ "$_miss" -lt 2 ] && continue
+        _miss=0
+        _st=$(iw dev "$_sif" station dump 2>/dev/null | awk '/^Station/{print $2; exit}')
+        if [ -n "$_st" ]; then
+            _sip=$(lease_ip_of "$_st")
+            SINK_GO_IP="$_sip"
+            log "🛠 看护: source($_st) 仍在线但收流进程不在 → 重起 pipeline (ip=${_sip:-未知})"
+        else
+            SINK_GO_IP=""
+            log "🛠 看护: 收流进程不在且当前无 source → 恢复纯监听 pipeline (保证 :$SINK_GO_PORT 始终有人应答)"
+        fi
+        start_sink_client
+      done ) &
+    echo $! > "$GO_SUP_PID"
+    log "GO 看护已启动 (pid $(cat "$GO_SUP_PID" 2>/dev/null), 每 3 s 兜底)"
+}
+
 cmd_client() {
     need_root
+    ps_off
     backup_conf
     write_conf client
     stop_dhcpd            # client 模式不用 DHCP 服务端 (参考实现也是静态地址)
@@ -863,6 +1325,10 @@ cmd_client() {
     ip addr flush dev "$IFACE" 2>/dev/null || true
     rm -f /tmp/wfd-p2p.done /tmp/wfd-p2p.failed
     start_supplicant
+
+    # 建组/重新关联都会把 power_save 重置回 on, 所以整个会话期每 5 s 复核一次
+    # (ps_off 内部先判断, 只在真的是 on 时才动, 幂等且不刷日志)
+    ( while :; do ps_off; sleep 5; done ) >/dev/null 2>&1 &
 
     log "设置 WFD 设备信息: $DEVINFO"
     wpa wfd_subelem_set 0 "$DEVINFO" | grep -q OK || die "WFD_SUBELEM_SET 失败"
@@ -881,6 +1347,14 @@ cmd_client() {
     wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || die "p2p_listen 失败, 看 $P2P_LOG"
     start_client_watcher
 
+    # 2026-10-27: 进 client 模式就先把**纯监听 pipeline** 拉起来 (:7236 常驻有人应答)。
+    #   原来只等 P2P-GROUP-STARTED 才起 ⇒ 空闲态板上根本没有 wfd-sink:
+    #   手机/PC 建组后若先拨 RTSP (有的机型/Windows 就是这样), 直接被拒,
+    #   现场表现就是「连好几次才成功」。纯监听不影响后面的双模建链
+    #   (GROUP-STARTED 会 stop→start 换成带 -c 的形态)。
+    start_sink_client
+    log "📡 已常驻监听 :$SINK_GO_PORT (空闲也不撤, 等 source 随时拨入)"
+
     log "✅ 已进入 client 模式: P2P device (不建组), p2p_go_intent=0 ⇒ 对端(手机/PC)当 GO"
     log "现在用: 手机「无线投屏」/ Windows 10 「Win+K → 连接到无线显示器」里点 $DEVICE_NAME"
     log "  · 安卓 GO=192.168.49.1 → 静态 $CLIENT_IP; Windows GO=192.168.137.1 → DHCP 拿租约"
@@ -896,11 +1370,30 @@ cmd_client() {
 
 cmd_stop() {
     need_root
+    # 2026-10-26: stop 的语义 = "停掉并且别自动回来" (调试独占)。
+    #   留一个 hold 旗标, 开机自启 / systemd 重启都会空跑退出, 绝不跟调试抢 wlan1、7236、DRM。
+    if [ "${WFD_HOLD:-1}" != "0" ]; then
+        mkdir -p "$(dirname "$HOLD_FILE")" 2>/dev/null || true
+        : > "$HOLD_FILE"
+        log "⏸ 已置 $HOLD_FILE —— 开机自启不会抢回设备 (恢复: sh $0 resume)"
+    fi
     stop_pbc_watcher
     stop_sink_client
+    # 2026-10-26: 播放器不再由本脚本停 —— 屏归 k230-screen.service 所有 (常驻 drmplay)。
+    #   停掉管线后 FIFO 没有写端, 播放器自己 800 ms 后刷黑, 屏上不会紫。
+    #   停它反而会让"切去 AirPlay"那一下重新起播放器, 露出一次紫屏。
+    # (start_blank 同理不再需要: 常驻播放器本身就是黑屏占位)
     if [ -f "$CLIENT_WATCH_PID" ]; then
         kill "$(cat "$CLIENT_WATCH_PID" 2>/dev/null || echo 0)" 2>/dev/null || true
         rm -f "$CLIENT_WATCH_PID"
+    fi
+    if [ -f "$GO_WATCH_PID" ]; then
+        kill "$(cat "$GO_WATCH_PID" 2>/dev/null || echo 0)" 2>/dev/null || true
+        rm -f "$GO_WATCH_PID"
+    fi
+    if [ -f "$GO_SUP_PID" ]; then
+        kill "$(cat "$GO_SUP_PID" 2>/dev/null || echo 0)" 2>/dev/null || true
+        rm -f "$GO_SUP_PID"
     fi
     ip addr del "$CLIENT_IP/24" dev "$IFACE" 2>/dev/null || true
     stop_dhcpd
@@ -922,8 +1415,17 @@ cmd_stop() {
         ip addr del "$GO_IP/24" dev "$IFACE" 2>/dev/null || true
         ip link set dev "$IFACE" down 2>/dev/null || true
     fi
-    systemctl start miracast.service 2>/dev/null || true
+    # 2026-10-26: 这里原来会 `systemctl start miracast.service` —— 手动 stop 之后服务
+    #   立刻把 supplicant/管线抢回去, 是"调试跟自启打架"的老根子。已删除。
     log "已停 P2P; station($STATION_IFACE) IP: $(ip -4 addr show "$STATION_IFACE" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)"
+}
+
+# 解除 hold 并启动 (self-heal 入口: 自启服务与人工都用它)
+cmd_resume() {
+    need_root
+    rm -f "$HOLD_FILE"
+    log "▶ 已清 $HOLD_FILE, 启动 GO..."
+    cmd_start "$@"
 }
 
 cmd_status() {
@@ -950,6 +1452,7 @@ usage() {
 
 case "${1:-}" in
     start)   shift; cmd_start "$@" ;;
+    resume)  cmd_resume ;;
     listen)  cmd_listen ;;
     stop)    cmd_stop ;;
     client)  cmd_client ;;
