@@ -1017,7 +1017,12 @@ start_sink_client() {
     #   还是本板解码器没把新画面送出去 —— 两种结论的修法完全相反, 别靠猜。
     #   代价: 多一个 tee 进程搬 2~4 Mbps (0.3~0.5 MB/s), 单核占用 <1%; 9 MB/30 s, /run 有 192 MB。
     TEE_SEG=""
-    [ -f /run/k230-es-dump ] && TEE_SEG=' | /usr/bin/tee /run/k230-es.h264 2>/dev/null'
+    # ★ 2026-10-27 17:05 修: 原来 `tee <file>` **每次重开管线就截断** —— 会话一结束
+    #   管线自愈重启, 37 MB 的现场 ES 当场变 0 字节, 白抓一次 (主人得多投一遍)。
+    #   改用 `tee -a` 追加: 一次投屏全过程累积, 断流/重连都不丢。
+    #   ⚠ 这里**不做清空** —— start_sink_client 会在每次会话事件里重入, 清一次就又丢了;
+    #   要开新一轮取证自己 `rm -f /run/k230-es.h264`, 然后投屏。
+    [ -f /run/k230-es-dump ] && TEE_SEG=' | /usr/bin/tee -a /run/k230-es.h264 2>/dev/null'
     if [ "$PLAYER_FIFO_MODE" = 1 ]; then
         DEC_OUT="$PLAYER_FIFO"
         PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' -H -D -A 2>>/var/log/miracast-dec.log'
