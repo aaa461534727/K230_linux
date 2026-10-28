@@ -40,6 +40,24 @@ if [ ! -x /usr/bin/drmplay ]; then
     exit 1
 fi
 
+# ★ 2026-10-28: 抬内核管道上限 (drmplay 靠 F_SETPIPE_SZ 定容, 上限受这个 sysctl 约束)
+#   为什么要 4 MB: 解码出图改回「原始尺寸」(720p NV12 一帧 1350 KB) 后, 1 MB 管道
+#   只装得下 0.7 帧 ⇒ 一帧要 read() 6 次。drmplay 自己会按「2 帧 + 32 KB」申请
+#   (环境变量 WFD_PIPE_CAP 可覆盖), 但内核默认 pipe-max-size 只有 1 MB, 不在这里
+#   抬上去的话申请会被拒并回落到 256 KB —— 而且这是**内核参数, 重启即失**,
+#   只能每次开机在起播放器之前写。写失败不致命 (drmplay 会退到 1 MB/256 KB 并打日志)。
+PMAX=/proc/sys/fs/pipe-max-size
+if [ -w "$PMAX" ]; then
+    PMAX_CUR=$(cat "$PMAX" 2>/dev/null || echo 0)
+    if [ "${PMAX_CUR:-0}" -lt 4194304 ] 2>/dev/null; then
+        if echo 4194304 >"$PMAX" 2>/dev/null; then
+            log "管道上限: ${PMAX_CUR} → $(cat "$PMAX" 2>/dev/null) (FIFO 可定容到 4 MB)"
+        else
+            log "⚠ 管道上限写不进去 (仍是 ${PMAX_CUR}), 大帧会退回 1 MB 管道"
+        fi
+    fi
+fi
+
 # 互斥: 「杀玩家 + 重建管道 + 写 pidfile + 起玩家」必须原子
 # ⚠ 不要写 `exec 9>"$LOCK" 2>/dev/null` —— `exec` 只带重定向时是**改本 shell 自己的 fd**,
 #   那会把 stderr 永久接到 /dev/null, 后面 exec 出去的 drmplay 就再也打不出日志了

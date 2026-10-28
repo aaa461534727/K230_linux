@@ -152,6 +152,10 @@ case "$GO_FREQ" in
     *)    _def_ch=6 ;;
 esac
 LISTEN_CHANNEL="${WFD_LISTEN_CHANNEL:-$_def_ch}"
+# 2026-10-28: 对端持久组自动重连开关。
+#   0 (默认) = 拒绝对端 Invitation, 每次走全新 GO Negotiation
+#   1        = 老行为 (Windows 依赖它), 按已存持久组自动回 Invitation Response
+PERSIST_RECONNECT="${WFD_PERSISTENT_RECONNECT:-0}"
 DEVICE_NAME="${WFD_DEVICE_NAME:-K230-Miracast}"
 
 log()  { printf '[wfd-p2p] %s\n' "$*"; }
@@ -222,6 +226,22 @@ write_conf() {
         #   但**丢掉 bssid= 那一行**, 让 supplicant 每次按 SSID 扫到当前真实的
         #   GO 组接口地址再关联。
         _keep_nets=$(awk '/^network=\{/{f=1; buf=""} f{if ($0 !~ /^[ \t]*bssid=/) buf=buf $0 "\n"} f&&/^\}/ {f=0; if (buf ~ /psk=/ || buf ~ /key_mgmt=/) printf "%s", buf}' "$P2P_CONF" 2>/dev/null)
+        # 2026-10-28 修「越用越乱 + 角色反转」:
+        #   上面这条会把**我们自己那个 GO 持久组块** (ssid=$GO_SSID) 也一起收进来,
+        #   每次重启又 append 回去 ⇒ /tmp/wfd-p2p.conf 里 network 块**指数增长**
+        #   (现场实测一次累积到 35 个)。后果不是慢一点, 是启动时 supplicant 把
+        #   这些组当"已存在的持久组"全部拉活, 我们**抢成 GO** (role=GO),
+        #   而手机当 source 时必须是 GO ⇒ 它怎么也连不上, 只能弹回"连接"。
+        #   修法: ① 剔除 ssid 等于我们自己的那些块; ② 只留最近 4 块 (对端每次
+        #   建组会换随机 GROUP SSID, 不设上限同样会无限长)。
+        _keep_nets=$(printf '%s\n' "$_keep_nets" | awk -v own="$GO_SSID" '
+            /^network=\{/ { n++; blk[n] = "" }
+            { if (n > 0) blk[n] = blk[n] $0 "\n" }
+            END {
+                s = (n > 4) ? n - 3 : 1;
+                for (i = s; i <= n; i++)
+                    if (blk[i] !~ ("ssid=\"" own "\"")) printf "%s", blk[i];
+            }' 2>/dev/null)
         if [ -n "$_keep_nets" ]; then
             _kn=$(printf '%s\n' "$_keep_nets" | grep -c '^network={' 2>/dev/null || true)
             log "保留 [$_kn] 个持久组凭据 (已去掉 bssid 引脚, 重连时自己找当前组地址)"
@@ -258,10 +278,12 @@ p2p_no_group_iface=1
 # 0 = 关闭空闲回收, 组只由对端结束会话或本脚本 stop/重建时拆。
 p2p_group_idle=0
 
-# 2026-10-25: 对端 (Windows/手机) 再点连接时会发 Invitation 回旧组。
-# 不打开这个开关, supplicant 只抛 P2P-INVITATION-RECEIVED 事件不动作;
-# 打开后它按已存的持久组自动回 Invitation Response 并重新入组。
-persistent_reconnect=1
+# 2026-10-28: 默认**关闭**对端持久组自动重连 (WFD_PERSISTENT_RECONNECT=1 恢复老行为)。
+#   实测 K80 (MTK): 再点投屏时用存下来的持久组发 Invitation, 组直接起在 ch8/2447
+#   (或它 STA 的 5G), 既绕过 Operating Channel 钉死, 又出现 "合法 AUTH 一帧都不
+#   ACK" ⇒ 怎么点都连不上 (09:47:11 现场)。关掉后 Invitation 由前端拒绝, 手机
+#   回落全新 GO Negotiation ⇒ 走钉死的 ch1 ⇒ 一次连上。
+persistent_reconnect=$PERSIST_RECONNECT
 
 # 2026-10-21 关键修复: listen 信道必须 = 组所在信道 (ch6)。
 # 默认 listen 是 ch11, 手机会把 GO Negotiation 发到它看到的 listen 信道,
@@ -310,9 +332,12 @@ network={
 EOF
     # 还原对端持久组 (见上), 并让 supplicant **自动接受**对端的 Invitation ——
     # 否则它只抛 P2P-INVITATION-RECEIVED 事件, 前端不处理就超时。
-    if [ -n "$_keep_nets" ]; then
+    # 2026-10-28: 只在 PERSIST_RECONNECT=1 时还原; 默认丢掉, 强制全新协商。
+    if [ -n "$_keep_nets" ] && [ "$PERSIST_RECONNECT" = "1" ]; then
         printf '%s\n' "$_keep_nets" >> "$P2P_CONF"
         log "已还原 $(printf '%s\n' "$_keep_nets" | grep -c '^network={') 个对端持久组"
+    elif [ -n "$_keep_nets" ]; then
+        log "已丢弃对端持久组 (PERSIST_RECONNECT=0 ⇒ 每次全新协商, 避开旧组信道)"
     fi
 
     # 2026-10-25: 操作信道默认**不**钉死。钉死时 (上面补丁) GO-Neg-Resp 会带
@@ -1023,12 +1048,36 @@ start_sink_client() {
     #   ⚠ 这里**不做清空** —— start_sink_client 会在每次会话事件里重入, 清一次就又丢了;
     #   要开新一轮取证自己 `rm -f /run/k230-es.h264`, 然后投屏。
     [ -f /run/k230-es-dump ] && TEE_SEG=' | /usr/bin/tee -a /run/k230-es.h264 2>/dev/null'
+    # ★ 2026-10-28 清晰度根因修复 (两次试错后的结论, 别再走回头路):
+    #   症状: 投屏文字糊成一团。
+    #   根因: 原来 v4l2_dec 硬带 -A (autofit), 它把**整帧** contain 进 480x800
+    #         ⇒ 1280x720 缩成 480x270。可是竖屏手机的画面在 1280x720 帧里只占
+    #         中间 ~420x720 (两侧黑边), 缩完内容只剩 157x270, drmplay 再放大
+    #         2.96 倍铺到 465x800 ⇒ 每个源像素铺 9 个屏幕像素, 必然糊。
+    #         (不是 720p 的锅, 也不是码率: 帧里那 420px 已经够 465px 屏用。)
+    #   试错①: v4l2_dec -c 裁内容区 + -s 480x800 —— 本固件 H264 解码器**不支持
+    #         DEC_DST_CROPPING** (解码日志: `Unsupported option`), -c 被静默忽略,
+    #         只有 -s 生效 ⇒ 变成「含黑边的整帧强行拉伸 1280x720→480x800」,
+    #         更糊且变形。此路不通; WFD_DEC_SCALE 留着只作对照。
+    #   结论: 解码器输**原始尺寸**, 裁剪+缩放全交 drmplay (它按真实内容区
+    #         geom_fit, 只转绘制区, CPU 不吃亏)。
+    #   回退: WFD_DEC_FIT=1 → 老行为 (-A); WFD_DEC_OPTS 可整体覆盖。
+    if [ -z "${DEC_OPTS:-}" ]; then   # set -u: 必须带 :-
+        DEC_OPTS="-H -D"
+        if [ "${WFD_DEC_FIT:-0}" = "1" ]; then
+            DEC_OPTS="$DEC_OPTS -A"           # 老行为, 对照用
+        fi
+        if [ -n "${WFD_DEC_SCALE:-}" ]; then  # "WxH" 让 VPU 整帧缩放, 对照用
+            DEC_OPTS="$DEC_OPTS -s $WFD_DEC_SCALE"
+        fi
+    fi
+    log "🎛 解码器参数: v4l2_dec $DEC_OPTS (原始尺寸出图, 裁剪/缩放交 drmplay)"
     if [ "$PLAYER_FIFO_MODE" = 1 ]; then
         DEC_OUT="$PLAYER_FIFO"
-        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' -H -D -A 2>>/var/log/miracast-dec.log'
+        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' '"$DEC_OPTS"' 2>>/var/log/miracast-dec.log'
     else
         DEC_OUT=/dev/stdout
-        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' -H -D -A 2>>/var/log/miracast-dec.log | '"$PLAYER_BIN $PLAYER_OPTS"' 2>>/var/log/miracast-play.log'
+        PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' '"$DEC_OPTS"' 2>>/var/log/miracast-dec.log | '"$PLAYER_BIN $PLAYER_OPTS"' 2>>/var/log/miracast-play.log'
     fi
     setsid sh -c '
         PLAYER_BIN="'"$PLAYER_BIN"'"
@@ -1091,11 +1140,17 @@ start_client_watcher() {
                 # 而且 supplicant 此后停在 IDLE 不再 listen ⇒ 越点越连不上。
                 # 已知组交给 persistent_reconnect=1 自动接受; 这里只负责兜底重挂 listen。
                 log "📥 收到 Invitation: sa=${_inv_sa:-?} persistent=${_inv_pg:-?}"
-                if [ -n "$_inv_pg" ] && [ -n "$_inv_sa" ]; then
+                if [ "$PERSIST_RECONNECT" = "1" ] && [ -n "$_inv_pg" ] && [ -n "$_inv_sa" ]; then
                     wpa p2p_connect "$_inv_sa" pbc persistent="$_inv_pg" >/dev/null 2>&1 \
                         || wpa p2p_listen >/dev/null 2>&1 || true
                 else
-                    log "   (未知持久组: 不动 supplicant, 等对端回落到全新协商)"
+                    # 2026-10-28: 默认**拒绝** Invitation (见 conf 里 persistent_reconnect 注释)。
+                    #   手机存下来的组在 ch8/5G 上, 接进去必然 AUTH 不被 ACK; 拒了它才回落
+                    #   全新协商, 走我们钉死的 ch1。p2p_reject 会回 Invitation Response=fail。
+                    log "   (PERSIST_RECONNECT=0 ⇒ 拒绝, 等对端回落到全新 GO 协商)"
+                    if [ -n "$_inv_sa" ]; then
+                        wpa p2p_reject "$_inv_sa" >/dev/null 2>&1 || true
+                    fi
                     wpa p2p_listen >/dev/null 2>&1 || true
                 fi ;;
             *P2P-GO-NEG-FAILURE*)
