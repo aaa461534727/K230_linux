@@ -11,7 +11,7 @@
 # 用法: k230-airplay [run]    (默认 run; systemd 直接调用)
 set -u
 
-NAME="${AIRPLAY_NAME:-K230-AirPlay}"
+NAME="${AIRPLAY_NAME:-K230-CAST}"
 ES_FIFO="${AIRPLAY_ES_FIFO:-/run/airplay.h264}"
 PLAYER_FIFO="${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}"
 PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
@@ -75,7 +75,17 @@ start_decoder() {
     # 不会留下一个抱着 /run/wfd-player.fifo 的僵尸解码器挡 Miracast。
     (
         while :; do
-            /usr/bin/v4l2_dec "$ES_FIFO" "$PLAYER_FIFO" -H -D -A \
+            # ★ 2026-10-29 (黑屏现场): 这里原来带 -A (autofit)。-A 会在解到第 12 帧时
+            #   **exec 重启自己** (learn_restart: 把已收码流写 /tmp/dec-replay.h264,
+            #   再带硬件裁剪/缩放参数重新 exec)。主人报的现象正是
+            #   「有图像出来了, 然后黑屏」, 日志紧跟:
+            #     [09:49:01] ⚠ 等 SPS 超时 30s (没拿到码流头)
+            #     [09:49:29] ⚠ 空缓冲 … 流没起来, 等 source
+            #   —— 重启后接不上 uxplay 正在写的管道, 一帧都出不来。
+            #   而且 AirPlay 这条路的几何适配本来就不靠 -A: 下游 drmplay 带
+            #   `-w 480 -h 800` 自己缩放补边 (Miracast 那条路一直这么干, 稳)。
+            #   要回来调画面占比时用 AIRPLAY_AUTOFIT=1 临时开。
+            /usr/bin/v4l2_dec "$ES_FIFO" "$PLAYER_FIFO" -H -D ${AIRPLAY_AUTOFIT:+-A} \
                 >>/var/log/miracast-dec.log 2>&1 </dev/null
             _rc=$?
             printf '[%s] 硬解退出 (rc=%d) → 0.5s 后重开管道等下一次投屏\n' \
@@ -87,6 +97,31 @@ start_decoder() {
     log "硬解已起 (pid $DEC_PID, 输入 $ES_FIFO)"
 }
 
+wait_port_free() {
+    # ★ 2026-10-28: 上一实例没退干净时立刻再起, uxplay 抢不到 7001 端口 ——
+    #   现场 18:31:54 / 18:32:06 / 18:32:21 连炸三次 rc=139(段错误), 都是紧跟在上一次
+    #   "Stopping RAOP Server..." 之后 3 秒内重启造成的。先等端口放掉, 再交给 systemd
+    #   的 RestartSec 节奏, 段错误就不出现了。
+    _i=0
+    while [ $_i -lt 24 ]; do
+        if ! ss -lnt 2>/dev/null | grep -q ':7001 '; then return 0; fi
+        _i=$((_i + 1))
+        sleep 0.5
+    done
+    log "⚠ 7001 端口 12 s 仍被占用 (疑似残留 uxplay), 照常启动"
+}
+
+status() {
+    printf '服务     : %s\n' "$(systemctl is-active k230-airplay 2>/dev/null)"
+    printf '名字     : %s\n' "$NAME"
+    printf 'uxplay   : %s\n' "$(pgrep -f 'uxplay -n' | tr '\n' ' ')"
+    printf 'rtsp端口 : %s\n' "$(ss -lnt 2>/dev/null | awk '/:7001 /{print "7001 LISTEN"; exit}')"
+    printf '解码器   : %s\n' "$(pgrep -f "v4l2_dec $ES_FIFO" | tr '\n' ' ')"
+    printf '播放器   : %s (geom: %s)\n' "$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo -)" "$(cat /run/wfd-uibc-geom 2>/dev/null || echo -)"
+    printf -- '--- 最近日志 ---\n'
+    tail -12 "$LOG" 2>/dev/null
+}
+
 cleanup() {
     # 先杀看护循环 (它一死就不会再 fork 新的解码器), 再杀它的**直接子进程**。
     # ⚠ 不能写 pkill -f "v4l2_dec $ES_FIFO": 重启时旧实例的 cleanup 会晚几秒跑,
@@ -94,6 +129,15 @@ cleanup() {
     if [ -n "${DEC_PID:-}" ]; then
         kill -9 "$DEC_PID" 2>/dev/null || true
         for _c in $(pgrep -P "$DEC_PID" 2>/dev/null); do kill -9 "$_c" 2>/dev/null || true; done
+    fi
+    # ★ 2026-10-28: 上面只杀「本实例记住的那棵树」。实测重编+重启后 /proc 里仍留着
+    #   上一实例的 v4l2_dec (现场 pid 708278 从 21:04 活到 21:44), 两个解码器同时读
+    #   同一个命名管道 ⇒ H.264 字节流被对半劈开, 谁都凑不出 SPS, 画面永远黑。
+    #   只有在「本进程仍是 k230-airplay 的 MainPID」时才按名字清扫: 若已不是, 说明
+    #   新实例起来了, 按名字杀会把它的解码器一起打死 (21:43:09 rc=137 老坑)。
+    _cur=$(systemctl show -p MainPID --value k230-airplay 2>/dev/null)
+    if [ "${_cur:-0}" = "$$" ]; then
+        for _p in $(pgrep -f "v4l2_dec $ES_FIFO" 2>/dev/null); do kill -9 "$_p" 2>/dev/null || true; done
     fi
     exec 9>&- 2>/dev/null || true
     rm -f "$ES_FIFO" 2>/dev/null || true
@@ -112,18 +156,57 @@ case "${1:-run}" in
         touch "$ES_BASE"
         log "启动 AirPlay: name=$NAME es=$ES_FIFO"
         # -n    服务名;  -nh 名字不加 @hostname
-        # -vdmp 视频直通到命名管道;  -s 只向手机要 720p30 (单核 + VPU 的舒服档)
+        # -vdmp 视频直通到命名管道;  -s 是**向客户端声明的最大镜像尺寸**,
+        #   必须和客户端实际会选的尺寸对得上, 否则 macOS 认了连接(显示
+        #   "K230-AirPlay 2560x1440 AirPlay")却不推流 —— 现场症状是 uxplay 打完
+        #   "raop_rtp_mirror starting mirroring" 就静止, UDP 每秒只有个位数包,
+        #   K230 侧 v4l2_dec 一直"等 source"。
+        #   2026-10-29 复测 (Mac 本机显示设置已切 1080p): 声明 1280x720@30 与
+        #   1920x1080@30 **都会立即推流**, 且 macOS 两种声明下都按 1280x720 开镜
+        #   (system_profiler 里 K230-AirPlay Resolution 恒为 1280 x 720) —— 镜像
+        #   分辨率由 Mac 决定, -s 只是"我们能收多大", 声明过大不会换来更高分辨率。
+        #   所以默认取 1280x720@30 (= 实际收到的), 避免声明的比收到的更大时
+        #   Mac 误以为能上 1080p 却按 720p 编码造成协商反复。
+        #   ⚠ 解码侧不写死分辨率: v4l2_dec 从 SPS 读, 换成 1080p 源自动跟随。
+        #   可用 AIRPLAY_RES 覆盖 (例如 1920x1080@30)。
         # -p 7000 固定端口 (仲裁器按 7000 的已建立连接判断"苹果连上了")
-        # 音频: 不再用 -a 关掉。UXPLAY_AUDIO_PIPE 让 UxPlay 把解码后的 PCM 写成
-        # S16LE 48k 2ch 丢进同一条管道, 由常驻 pcmplay 出声 (与 Miracast 共用出口)。
-        export UXPLAY_AUDIO_PIPE="${AIRPLAY_AUDIO_PIPE:-/run/wfd-audio.pcm}"
-        "$UXPLAY" -n "$NAME" -nh -p 7000 -s 1280x720@30 -vdmp "$ES_BASE" >>"$LOG" 2>&1
+        # 音频: 2026-10-28 实测**本板一个 GStreamer 插件都没装**
+        #   (avdec_aac / avdec_alac / audioconvert / audioresample / filesink 全部 NO),
+        #   UXPLAY_AUDIO_PIPE 那条 pipeline 根本 parse 不出来 ⇒ 客户端一连上,
+        #   音频渲染器初始化失败, 会话当场断 (表现为"点一下就闪回")。
+        #   所以默认**关音频** (-a): 先保证画面这条路通; 要出声得先 apt 装
+        #   gstreamer1.0-libav + gstreamer1.0-plugins-base, 单核板再评估。
+        #   想恢复音频: AIRPLAY_AUDIO=1 ./k230-airplay run
+        if [ "${AIRPLAY_AUDIO:-0}" = 1 ]; then
+            export UXPLAY_AUDIO_PIPE="${AIRPLAY_AUDIO_PIPE:-/run/wfd-audio.pcm}"
+            _AUDIO_OPT=""
+            log "音频: 开 (PCM → $UXPLAY_AUDIO_PIPE)"
+        else
+            unset UXPLAY_AUDIO_PIPE
+            _AUDIO_OPT="-a"
+            log "音频: 关 (-a; 板上无 GStreamer 解码插件)"
+        fi
+        wait_port_free
+        _t0=$(date +%s)
+        # ★ 2026-10-28: uxplay 的日志走 stdio, 重定向到文件后是**块缓冲** —— 它一崩
+        #   或卡住, 最后十几行全憋在用户态缓冲里, 现场只能看到「服务 active 但没画面」。
+        #   有 stdbuf 就按行刷新, 没有就算了 (不影响功能)。
+        UX_RUN=""
+        command -v stdbuf >/dev/null 2>&1 && UX_RUN="stdbuf -oL -eL"
+        $UX_RUN "$UXPLAY" -n "$NAME" -nh -p 7000 -s "${AIRPLAY_RES:-1280x720@30}" -vdmp "$ES_BASE" $_AUDIO_OPT >>"$LOG" 2>&1
         RC=$?
-        log "uxplay 退出 (rc=$RC)"
+        _t1=$(date +%s)
+        log "uxplay 退出 (rc=$RC, 运行 $((_t1 - _t0)) 秒)"
+        if [ $RC -ne 0 ]; then
+            log "⚠ 异常退出 rc=$RC — 139=段错误(多为上一实例未退净/端口冲突), 143=SIGTERM(正常停止)"
+        fi
         exit $RC
         ;;
+    status)
+        status
+        ;;
     *)
-        echo "用法: $0 [run]" >&2
+        echo "用法: $0 [run|status]" >&2
         exit 2
         ;;
 esac

@@ -156,7 +156,7 @@ LISTEN_CHANNEL="${WFD_LISTEN_CHANNEL:-$_def_ch}"
 #   0 (默认) = 拒绝对端 Invitation, 每次走全新 GO Negotiation
 #   1        = 老行为 (Windows 依赖它), 按已存持久组自动回 Invitation Response
 PERSIST_RECONNECT="${WFD_PERSISTENT_RECONNECT:-0}"
-DEVICE_NAME="${WFD_DEVICE_NAME:-K230-Miracast}"
+DEVICE_NAME="${WFD_DEVICE_NAME:-K230-CAST}"
 
 log()  { printf '[wfd-p2p] %s\n' "$*"; }
 die()  { printf '[wfd-p2p] ✗ %s\n' "$*" >&2; exit 1; }
