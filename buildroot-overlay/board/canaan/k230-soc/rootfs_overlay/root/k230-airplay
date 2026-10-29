@@ -18,6 +18,7 @@ PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
 PLAYER_OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800}"
 UXPLAY="${UXPLAY_BIN:-/usr/local/bin/uxplay}"
 LOG="${AIRPLAY_LOG:-/var/log/airplay.log}"
+ACTIVE_FILE="${AIRPLAY_ACTIVE_FILE:-/run/airplay-active}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
 
@@ -61,6 +62,55 @@ ensure_player() {
     return 0
 }
 
+watch_decoder() {
+    # ★ 2026-10-29 (现场黑屏): 同一 uxplay/解码器会跨多场会话复用 (uxplay 不退出就
+    #   只是会话结束)。第二场起偶发 **MVX 硬件解码看门狗超时** (dmesg 每 3 s 一条
+    #   "MVX session ... Watchdog timeout"), 解码器 60~80% CPU 空转、不读 ES 管道
+    #   ⇒ uxplay 写管道阻塞 ⇒ Mac 发送窗口被塞满 (Recv-Q 冲到 3.7 MB) 停发
+    #   ⇒ 屏全黑、音频照旧。此前只能整服务重启才能恢复。
+    #   两路判据, 命中就杀掉解码器, 让 start_decoder 的循环重开:
+    #     ① 内核 MVX Watchdog 计数增加 = 硬件解码器已挂 (最准, 无假阳性)
+    #     ② 客户端连着 (:7000 ESTAB) 但解码日志 12 s 不增长 = 软性卡死
+    _wd_last=$(dmesg 2>/dev/null | grep -c 'MVX session.*Watchdog timeout')
+    _wd_size=$(stat -c %s /var/log/miracast-dec.log 2>/dev/null || echo 0)
+    _wd_quiet=0
+    _wd_was=0
+    while :; do
+        sleep 2
+        _conn=0
+        ss -tn 2>/dev/null | grep -q 'ESTAB.*:7000 ' && _conn=1
+        # 会话存活标记: drmplay 见到它就无限期保持最后一帧 (静止桌面不刷黑)
+        if [ "$_conn" = 1 ]; then
+            [ -f "$ACTIVE_FILE" ] || : >"$ACTIVE_FILE"
+        elif [ -f "$ACTIVE_FILE" ]; then
+            rm -f "$ACTIVE_FILE"
+        fi
+        # 会话结束 (连过又断开): 整单元重启一次, 让 uxplay/解码器都从干净状态
+        # 等下一场 —— 跨会话复用同一个解码器正是 15:03「有声音没画面」的现场
+        # (第二场起 MVX 偶尔挂死 / QBUF 报 EIO, 只能重启才能恢复)。
+        if [ "$_wd_was" = 1 ] && [ "$_conn" = 0 ]; then
+            _wd_was=0
+            log "⏹ AirPlay 会话结束 → 2 s 后重启本单元 (解码器归零)"
+            ( sleep 2; ss -tn 2>/dev/null | grep -q 'ESTAB.*:7000 ' || systemctl --no-block restart k230-airplay.service ) &
+            continue
+        fi
+        [ "$_conn" = 1 ] && _wd_was=1
+        # ① 内核 MVX 看门狗计数增加 = 硬件解码器已挂 → 整单元重启 (只杀进程不够,
+        #   实测杀完重开的解码器会一直 QBUF EIO)
+        _wd_now=$(dmesg 2>/dev/null | grep -c 'MVX session.*Watchdog timeout')
+        if [ "$_wd_now" -gt "$_wd_last" ]; then
+            log "⚠ MVX 看门狗超时 +$((_wd_now - _wd_last)) → 重启本单元 (硬件解码器已挂)"
+            _wd_last=$_wd_now
+            systemctl --no-block restart k230-airplay.service
+            exit 0
+        fi
+        # ★ 2026-10-29 实测否决「日志不增长 = 卡死」这条判据: 解码器的日志是
+        #   stdio 块缓冲 (重定向到文件后 4 KB 才落一次), 健康的会话也会 20~30 s
+        #   一个字都不落盘 ⇒ 会把正常投屏误杀 (现场 15:37:39 就是这么断的)。
+        #   只保留上面的 MVX 看门狗判据 (内核日志, 精确, 无假阳性)。
+    done
+}
+
 start_decoder() {
     rm -f "$ES_FIFO"
     mkfifo "$ES_FIFO" 2>/dev/null || true
@@ -94,7 +144,9 @@ start_decoder() {
         done
     ) &
     DEC_PID=$!
-    log "硬解已起 (pid $DEC_PID, 输入 $ES_FIFO)"
+    watch_decoder &
+    WATCH_PID=$!
+    log "硬解已起 (pid $DEC_PID, 输入 $ES_FIFO, 看护 pid $WATCH_PID)"
 }
 
 wait_port_free() {
@@ -126,6 +178,9 @@ cleanup() {
     # 先杀看护循环 (它一死就不会再 fork 新的解码器), 再杀它的**直接子进程**。
     # ⚠ 不能写 pkill -f "v4l2_dec $ES_FIFO": 重启时旧实例的 cleanup 会晚几秒跑,
     #    按名字杀会把**新实例刚起的解码器**一起打死 (实测 21:43:09 rc=137 就是它)。
+    if [ -n "${WATCH_PID:-}" ]; then
+        kill -9 "$WATCH_PID" 2>/dev/null || true
+    fi
     if [ -n "${DEC_PID:-}" ]; then
         kill -9 "$DEC_PID" 2>/dev/null || true
         for _c in $(pgrep -P "$DEC_PID" 2>/dev/null); do kill -9 "$_c" 2>/dev/null || true; done
@@ -141,6 +196,7 @@ cleanup() {
     fi
     exec 9>&- 2>/dev/null || true
     rm -f "$ES_FIFO" 2>/dev/null || true
+    rm -f "$ACTIVE_FILE" 2>/dev/null || true
     log "airplay 结束"
 }
 trap cleanup EXIT INT TERM
@@ -170,14 +226,13 @@ case "${1:-run}" in
         #   ⚠ 解码侧不写死分辨率: v4l2_dec 从 SPS 读, 换成 1080p 源自动跟随。
         #   可用 AIRPLAY_RES 覆盖 (例如 1920x1080@30)。
         # -p 7000 固定端口 (仲裁器按 7000 的已建立连接判断"苹果连上了")
-        # 音频: 2026-10-28 实测**本板一个 GStreamer 插件都没装**
-        #   (avdec_aac / avdec_alac / audioconvert / audioresample / filesink 全部 NO),
-        #   UXPLAY_AUDIO_PIPE 那条 pipeline 根本 parse 不出来 ⇒ 客户端一连上,
-        #   音频渲染器初始化失败, 会话当场断 (表现为"点一下就闪回")。
-        #   所以默认**关音频** (-a): 先保证画面这条路通; 要出声得先 apt 装
-        #   gstreamer1.0-libav + gstreamer1.0-plugins-base, 单核板再评估。
-        #   想恢复音频: AIRPLAY_AUDIO=1 ./k230-airplay run
-        if [ "${AIRPLAY_AUDIO:-0}" = 1 ]; then
+        # 音频: 2026-10-29 打通 —— 板上已 apt 装 gstreamer1.0-plugins-base +
+        #   gstreamer1.0-libav (avdec_alac/audioconvert/audioresample/volume/filesink/
+        #   appsrc 齐活), UXPLAY_AUDIO_PIPE 那条 pipeline 能正常 parse, 把 AirPlay 的
+        #   ALAC 解成 S16LE/48k/2ch 写 /run/wfd-audio.pcm, 由常驻 pcmplay 出声
+        #   (与 Miracast 共用同一 ALSA 出口)。单核板 ALAC 软解 CPU 占用极低, 默认开。
+        #   关音频: AIRPLAY_AUDIO=0 ./k230-airplay run
+        if [ "${AIRPLAY_AUDIO:-1}" = 1 ]; then
             export UXPLAY_AUDIO_PIPE="${AIRPLAY_AUDIO_PIPE:-/run/wfd-audio.pcm}"
             _AUDIO_OPT=""
             log "音频: 开 (PCM → $UXPLAY_AUDIO_PIPE)"

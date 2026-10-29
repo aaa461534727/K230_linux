@@ -1,0 +1,12 @@
+[Unit]
+Description=K230 cast fallback watcher (auto switch to GO mode when client mode keeps failing)
+After=k230-miracast.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/k230-fallback.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

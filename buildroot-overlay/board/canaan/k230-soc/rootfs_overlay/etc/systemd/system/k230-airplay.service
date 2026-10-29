@@ -11,6 +11,12 @@ After=network.target local-fs.target
 Type=simple
 Environment=UXPLAY_VIDEO_PIPE=1
 Environment=AIRPLAY_NAME=K230-CAST
+# 音频: 2026-10-29 打通 —— 板上 apt 装 gstreamer1.0-plugins-base + gstreamer1.0-libav
+#   (avdec_alac/audioconvert/audioresample/volume/filesink/appsrc 齐活) 后, uxplay 的
+#   UXPLAY_AUDIO_PIPE 那条 pipeline 能正常 parse, 把 ALAC 解成 S16LE/48k/2ch 写
+#   /run/wfd-audio.pcm, 由常驻 pcmplay 出声 (与 Miracast 共用同一 ALSA 出口)。
+#   单核板实测 ALAC 软解只占极少 CPU (远低于视频硬解链路), 故默认开。
+Environment=AIRPLAY_AUDIO=1
 ExecStart=/root/k230-airplay run
 # 内核 netlink 事件/DRM 都要在本地文件系统起来之后; 起不来就重试两次, 别无限刷
 Restart=on-failure

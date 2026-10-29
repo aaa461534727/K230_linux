@@ -52,6 +52,16 @@ airplay_active() {
 
 unit_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
+# 2026-10-29: 兜底 GO 模式期间 (k230-fallback 写 /run/miracast-mode=go), 仲裁器
+# **不许再起 client 模式的 k230-miracast** —— 两者抢 wlan1/同一份 conf,
+# 一起就被对方 kill, 现场表现是 GO 组刚建好就被撤 (手机侧 GO_ENDING_SESSION)。
+maybe_start_miracast() {
+    if [ "$(cat /run/miracast-mode 2>/dev/null || echo client)" = "go" ]; then
+        return 0
+    fi
+    ensure start "$MIRACAST_UNIT" "Miracast"
+}
+
 ensure() {   # ensure <start|stop> <unit> <tag>
     _act=$1; _unit=$2; _tag=$3
     [ -z "$_unit" ] && return 0
@@ -100,7 +110,7 @@ while :; do
             miracast)
                 log "📱 安卓已连接 → 停 AirPlay 广播, 保留 Miracast"
                 ensure stop  "$AIRPLAY_UNIT"  "AirPlay"
-                ensure start "$MIRACAST_UNIT" "Miracast"
+                maybe_start_miracast
                 ;;
             airplay)
                 log "🍎 苹果已连接 → 停 Miracast GO (安卓搜不到), 保留 AirPlay"
@@ -111,7 +121,7 @@ while :; do
                 if [ -n "$MODE" ]; then
                     log "⏸ 双方都空闲 → 恢复两边广播"
                 fi
-                ensure start "$MIRACAST_UNIT" "Miracast"
+                maybe_start_miracast
                 ensure start "$AIRPLAY_UNIT"  "AirPlay"
                 ;;
         esac

@@ -1,0 +1,16 @@
+[Unit]
+Description=K230 Miracast GO-mode (fallback for peers whose AP-mode WPS is broken)
+After=network.target
+
+[Service]
+Type=simple
+Environment=WFD_FORCE=1
+Environment=WFD_GO_MODE=1
+Environment=WFD_DEVICE_NAME=K230-CAST
+ExecStartPre=/bin/rm -f /run/wfd-p2p.hold
+ExecStart=/bin/sh -c '/root/wfd-p2p.sh start; exec sleep infinity'
+Restart=no
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

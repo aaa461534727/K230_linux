@@ -89,7 +89,7 @@ P2P_LOG="${WFD_P2P_LOG:-/tmp/wfd-p2p.log}"
 BROADCAST_LOG="${WFD_BROADCAST_LOG:-/var/log/wfd-p2p.log}"
 SSID_POSTFIX="${WFD_SSID_POSTFIX:-K230}" # GO SSID = DIRECT-<2随机字符><postfix>
 # 2026-10-22: GO 走持久组 (id=9), SSID 写死, 默认与海奇一致 "DIRECT-"
-GO_SSID="${WFD_GO_SSID:-DIRECT-}"
+GO_SSID="${WFD_GO_SSID:-DIRECT-wrK230}"   # 2026-10-29: 原来默认就是 "DIRECT-" (空后缀) ⇒ 手机扫到也连不上 (1003)
 GO_IP="${WFD_GO_IP:-192.168.49.1}"       # GO 自身地址 (手机加入后才能访问 RTSP)
 # client 模式 (手机自己当 GO): 我们作为 P2P client 用**固定** .128
 #   依据 captures/p2p0.pcap: 能投屏的那一场里, 手机=192.168.49.1 (GO),
@@ -667,6 +667,17 @@ start_pbc_watcher() {
     #   GO Negotiation Request 会被回 Status=1 (INFO_CURRENTLY_UNAVAILABLE), 手机就放弃。
     #   ⇒ 让位: 收到 GO-Neg/PD 后立刻 p2p_group_remove + p2p_listen, 再由我们主动
     #     p2p_connect 让手机当 GO, 我们当 client; 15s 没结果就恢复 GO 组。
+    # ★ 2026-10-29 (GO 兜底): GO 模式下**不能**用「让位」watcher —— 它收到 PD/GO-Neg
+    #   就把我们自己的 GO 组删掉去当 client, 手机当场连不上 (实测脚本化 GO 点上去无 Station)。
+    #   GO 模式只需要一件事: 让 PBC 常驻就绪 (wps_pbc 只有 120 s 有效, 每 60 s 续一次),
+    #   手机点选我们时直接作为 client 关联进来。
+    if [ "${WFD_GO_MODE:-0}" = "1" ]; then
+        wpa wps_pbc >/dev/null 2>&1 || true
+        ( while :; do sleep 60; wpa wps_pbc >/dev/null 2>&1 || true; done ) &
+        echo $! > "$PBC_PIDFILE"
+        log "GO 模式: PBC 常驻 (每 60 s 续, 不启用让位逻辑) pid=$(cat "$PBC_PIDFILE" 2>/dev/null)"
+        return 0
+    fi
     w="$(dirname "$0")/wfd-pbc-watcher.sh"
     if [ -x "$w" ]; then
         "$w" > /tmp/wfd-yield.log 2>&1 &
