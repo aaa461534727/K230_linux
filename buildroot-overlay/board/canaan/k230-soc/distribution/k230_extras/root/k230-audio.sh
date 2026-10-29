@@ -21,10 +21,20 @@ sleep 0.2
 mkfifo "$FIFO" 2>/dev/null || true
 chmod 666 "$FIFO" 2>/dev/null || true
 
-# 音量: inno codec 的硬件音量先拉到 80% (播放链里没有软件音量了)
+# 音量 (2026-10-29 主人要求「手机整体音量≤10%, 办公室很小声」):
+#   ★静音的真正来源是手机端 —— Miracast 投屏时 STREAM_MUSIC 走 proxy 设备,
+#    投屏音量(遥控器/侧键)落在 proxy 上, 实测被压到 1/15 (≈6.7%, 即 ≤10%)。
+#    K230 抓到的就是已经被手机压过的 PCM, 板上再压就是「双重衰减」→ 几乎听不见。
+#   ⇒ 本机只做 **透传 (增益 100%)**, 不额外衰减; 安静上限完全由手机侧 10% 卡死。
+#   AUDIO_GAIN  软件增益百分比 (pcmplay -g), 默认 100 (透传; 真要更吵就 +g 即可)
+#   注: 板上无 amixer (inno codec mixer 调不了), 硬件音量那段是死代码, 不生效。
+HW_VOL="${AUDIO_HW_VOL:-100}"
+GAIN="${AUDIO_GAIN:-100}"
 if command -v amixer >/dev/null 2>&1; then
-    amixer -q sset "$(amixer scontrols 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/")" 80% 2>/dev/null || true
+    _ctl="$(amixer scontrols 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/")"
+    if [ -n "$_ctl" ]; then amixer -q sset "$_ctl" "${HW_VOL}%" 2>/dev/null || true; fi
+    log "音量: 硬件 ${HW_VOL}% / 软件增益 ${GAIN}%(透传; 静音由手机侧 10% 把关)"
 fi
 
 log "接管音频: $FIFO -> $DEV ${RATE}Hz ${CH}ch"
-exec /usr/bin/pcmplay -f "$FIFO" -d "$DEV" -r "$RATE" -c "$CH"
+exec /usr/bin/pcmplay -f "$FIFO" -d "$DEV" -r "$RATE" -c "$CH" -g "$GAIN"
