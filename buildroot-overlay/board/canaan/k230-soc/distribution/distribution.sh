@@ -115,7 +115,7 @@ get_image_last_name() {
         fi
     fi
 
-    echo "${canaan_site_name}_${distname}_${sdk_ver}_nncase_v${nncase_ver}_${commit_id}.img.gz"
+    echo "${canaan_site_name}_${distname}_${sdk_ver}_nncase_v${nncase_ver}_${commit_id}.img"
 }
 
 
@@ -463,19 +463,18 @@ distribution_rootfs_replace() {
         dd if=${distr_rootfs}.ext4  of=${dist_img_name} seek=${rootfs_off_sect} conv=notrunc
     }
 
-    # Compress and create symlink
-    cp "${dist_img_name}" "${dist_img_name}.bak"
+    # K230 本地补丁 (2026-11-03): 交付未经压缩的 .img, 不再产出 .img.gz
+    #   烧录直接 dd 原始镜像; 需要压缩包时手工 gzip 即可
     echo "Fix\n" | parted ---pretend-input-tty  "${dist_img_name}" print
-    print_blue "Compressing image (this may take a while)..."
-    gzip -f "${dist_img_name}"
+    rm -f "${dist_img_name}.bak"
 
     local final_name
     final_name=$(get_image_last_name "${distname}")
-    rm -f "${final_name}"
-    ln -s "${dist_img_name}.gz" "${final_name}"
+    rm -f "${final_name}" "${final_name}.gz"
+    ln -sf "$(basename "${dist_img_name}")" "${final_name}"
 
     print_blue "Build successful: ${BINARIES_DIR}/${final_name}"
-    chmod a+w "${distr_rootfs}.tar.gz" "${dist_img_name}.gz" "${final_name}"
+    chmod a+w "${distr_rootfs}.tar.gz" "${dist_img_name}" "${final_name}"
 
     # Cleanup
     rm -rf "${distr_rootfs}" "${distr_rootfs}.ext4"
