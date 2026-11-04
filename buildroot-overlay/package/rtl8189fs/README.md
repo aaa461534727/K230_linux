@@ -3,6 +3,13 @@
 `0100-k230-miracast.patch` 是 **4 处改动的合并补丁**, 由 buildroot package infra 在解包后
 自动 `patch -p1` 应用 (和上游 buildroot 自带的补丁一起, 本文件排在最后)。
 
+`0101-k230-quiet-probe-log.patch` 删掉 `OnProbeReq()` 里那行 probe 上报日志。
+**为什么之前 pr_debug 静音无效**: 本驱动的 `hal/phydm/phydm_debug.h` 在 `ODM_CE` 分支里
+`#undef pr_debug` + `#define pr_debug printk`, 把这个编译单元里的 `pr_debug` 全部还原成裸
+printk(走 default_message_loglevel=4) ⇒ 照样上串口。本板 `console=ttyS0,115200` 且单核,
+这条日志实测 6.9 行/秒, 每行在串口上阻塞 ~5 ms 并持 console_lock ⇒ SSH 登录/交互被拖慢。
+所以这里**直接删掉打印语句**, 而不是降级。
+
 | # | 文件 | 改动 |
 |---|---|---|
 | 1 | `os_dep/linux/ioctl_cfg80211.c` | `cfg80211_rtw_start_ap()` / `change_beacon()`: 让 GO 的 beacon / probe-resp 带上 supplicant 传来的 **P2P IE + WFD IE**, 并在 `change_beacon` 里吃 `beacon_ies` / `proberesp_ies` 的**动态** WPS IE (Selected Registrar=1 / DevPwId=PBC)。少了这个, 手机"发现得到但连不上" |

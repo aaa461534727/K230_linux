@@ -420,7 +420,14 @@ int32_t nonai_2d_cfg_csc_attr(uint32_t chn_num, struct nonai_2d_job *job)
     nonai_2d_set_src_ch1_addr(frame->v_frame.phys_addr[1], chn->stream_offset);
     nonai_2d_set_src_ch2_addr(frame->v_frame.phys_addr[2], chn->stream_offset);
 
-    calc_video_line_stride(chn->dst_fmt, frame->v_frame.width, dst_stride);
+    /* dst 的 stride 必须按 **输出** 宽度算。
+     * 原来这里写的是 frame->v_frame.width (frame = &job->in_frame), 即拿源宽度当目标步长:
+     * 源 NV12 1280x720 + 目标 AR24 480x800 时硬件收到 stride=1280*4=5120, 而目标缓冲只有
+     * 480*4=1920 的步长 / 480*800*4=1536000 B, 于是 720 行 x 5120 B 一路写到 3686400 B
+     * ⇒ 越过缓冲末尾 ~2.15 MB, DMA 落到任意物理页 (2026-11-04 实测: AR24 白像素
+     * ff 10 10 10 洒在无关堆上, 跨 ~24 MB, 把 /usr/bin/ai2dplay、python3.12、
+     * wpa_supplicant 都写坏过)。等宽等高的纯 CSC 用例碰不到这个 bug, 所以一直没暴露。 */
+    calc_video_line_stride(chn->dst_fmt, job->out_frame.v_frame.width, dst_stride);
     nonai_2d_set_dst_ch0_line_byte_stride(dst_stride[0], chn->stream_offset);
     nonai_2d_set_dst_ch1_line_byte_stride(dst_stride[1], chn->stream_offset);
     nonai_2d_set_dst_ch2_line_byte_stride(dst_stride[2], chn->stream_offset);
@@ -443,7 +450,7 @@ int32_t nonai_2d_cfg_csc_attr(uint32_t chn_num, struct nonai_2d_job *job)
         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch1_addr(addr=0x%llx)\n", chn_num, frame->v_frame.phys_addr[1]);
         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch2_addr(addr=0x%llx)\n", chn_num, frame->v_frame.phys_addr[2]);
         nonai_2d_dbg("nonai2d csc chn=%u calc_video_line_stride(dst_fmt=%u, width=%u) => stride=[%u,%u,%u]\n",
-            chn_num, chn->dst_fmt, frame->v_frame.width, dst_stride[0], dst_stride[1], dst_stride[2]);
+            chn_num, chn->dst_fmt, job->out_frame.v_frame.width, dst_stride[0], dst_stride[1], dst_stride[2]);
         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch0_line_byte_stride(stride=%u)\n", chn_num, dst_stride[0]);
         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch1_line_byte_stride(stride=%u)\n", chn_num, dst_stride[1]);
         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch2_line_byte_stride(stride=%u)\n", chn_num, dst_stride[2]);

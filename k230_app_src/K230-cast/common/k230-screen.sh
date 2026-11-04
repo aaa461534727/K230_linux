@@ -31,14 +31,18 @@ LOCK="${WFD_PLAYER_LOCK:-/run/wfd-player.lock}"
 # ★ 2026-11-03 主人定「不管手机什么尺寸都铺满」: 用 -S (stretch) 而不是 -f (cover)。
 #   cover 等比会把 337x714 的内容上下各裁 108 行 (21%), 状态栏/导航栏看不见;
 #   stretch 两轴各自缩到 480x800 ⇒ 一点内容不丢, 代价是轻微压扁 (主人明确接受)。
-# ai2dplay: 硬件 NV12→AR24 + 缩放(→480x800), 恒读 16B 帧头, 无需 -p/-S/-H
-OPTS="${WFD_PLAYER_OPTS:--w 480 -h 800}"
+# ⛔ 2026-11-04 **ai2dplay 停用, 回到 drmplay** (板上实测: AI2D M2M 会把 AR24 像素野写到
+#   系统 RAM 任意页 —— 另有进程 48 MB 堆里被打进 648720 字节 `ff 10 10 10` 图案, 跨 ~24 MB 范围;
+#   drmplay 同条件 0 字节被改。野生 DMA 还顺着页缓存把 /usr/bin/ai2dplay、/usr/bin/python3.12
+#   本身写坏过 ⇒ 继续用会随机毁根文件系统。详见 docs/PROGRESS.md 2026-11-04「AI2D 野写」条目)
+# drmplay: NV12→AR24 + 缩放都在 CPU 上 (VPU 侧已做 -s 硬降采样, 1:1 直贴时 CPU 只搬字节)
+OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800 -S}"
 LOG="${SCREEN_LOG:-/var/log/k230-screen.log}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
 
-if [ ! -x /usr/bin/ai2dplay ]; then
-    log "✗ /usr/bin/ai2dplay 不存在, 屏无法接管"
+if [ ! -x /usr/bin/drmplay ]; then
+    log "✗ /usr/bin/drmplay 不存在, 屏无法接管"
     # 不退出: 退出去只会被 systemd 反复拉起刷日志
     sleep 3600
     exit 1
@@ -96,4 +100,4 @@ export WFD_SHM="${WFD_SHM-/run/wfd-frame}"
 log "接管屏: $FIFO (pid $$, 空闲 800 ms 自动刷黑)"
 [ -n "${WFD_SHM:-}" ] && log "帧通道: 共享内存 ${WFD_SHM} (零拷贝)"
 # 前台运行, 让 systemd 管生命周期 (Restart=always 兜住意外退出)
-exec /usr/bin/ai2dplay $OPTS -F "$FIFO"
+exec /usr/bin/drmplay $OPTS -F "$FIFO"

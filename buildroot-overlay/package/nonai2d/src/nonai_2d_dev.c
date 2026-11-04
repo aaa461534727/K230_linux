@@ -1091,6 +1091,40 @@ static void device_run(void *prv)
         }
     }
 
+    /*
+     * 硬件没有目标尺寸寄存器: nonai_2d_set_src_size() 是唯一的几何信息,
+     * 所以 AI2D 只会输出 in_w x in_h 个像素 (它做 CSC, 不做缩放)。
+     * 若采集缓冲装不下这么多像素, 引擎会一路 DMA 到缓冲末尾之外 ——
+     * 2026-11-04 实测正是这样把 AR24 像素洒进系统 RAM, 毁过根文件系统。
+     * 这里直接把不可能完成的 job 判死, 让错误暴露在上层, 不再静默野写。
+     */
+    if (chn->cfg.nonai_2d_calc_mode == nonai_2d_calc_mode_csc) {
+        uint32_t bpp = (v4l2_ctx->out.fmt.depth + 7) >> 3;
+        u32 need = v4l2_ctx->in.height * v4l2_ctx->out.width * bpp;
+        u32 have = vb2_plane_size(&dst->vb2_buf, 0);
+
+        if (!bpp || v4l2_ctx->out.width < v4l2_ctx->in.width ||
+            v4l2_ctx->out.height < v4l2_ctx->in.height || have < need) {
+            /* 每帧都会走到这里, 限速打日志: 前 5 次 + 之后每 300 次一次, 免得把 dmesg 环形缓冲冲掉 */
+            static unsigned int drop_cnt;
+            if (drop_cnt < 5 || !(drop_cnt % 300))
+                v4l2_err(&drv_ctx->v4l2_dev,
+                    "nonai 2d: %ux%u -> %ux%u does not fit %u B capture buffer (need %u B); AI2D has no scaler, job dropped (count=%u)\n",
+                    v4l2_ctx->in.width, v4l2_ctx->in.height,
+                    v4l2_ctx->out.width, v4l2_ctx->out.height, have, need, drop_cnt + 1);
+            drop_cnt++;
+            spin_unlock_irqrestore(&drv_ctx->ctrl_lock, flags);
+            src = v4l2_m2m_src_buf_remove(v4l2_ctx->fh.m2m_ctx);
+            dst = v4l2_m2m_dst_buf_remove(v4l2_ctx->fh.m2m_ctx);
+            if (src)
+                v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+            if (dst)
+                v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
+            v4l2_m2m_job_finish(drv_ctx->m2m_dev, v4l2_ctx->fh.m2m_ctx);
+            return;
+        }
+    }
+
     nonai_2d_info("nonai 2d device_run in.addr=[0x%llx,0x%llx,0x%llx] out.addr=[0x%llx,0x%llx,0x%llx]\n",
             (unsigned long long)v4l2_ctx->in.addr[0],
             (unsigned long long)v4l2_ctx->in.addr[1],
