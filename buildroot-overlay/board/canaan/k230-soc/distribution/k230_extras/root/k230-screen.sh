@@ -28,13 +28,17 @@ set -u
 FIFO="${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}"
 PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
 LOCK="${WFD_PLAYER_LOCK:-/run/wfd-player.lock}"
-OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800}"
+# ★ 2026-11-03 主人定「不管手机什么尺寸都铺满」: 用 -S (stretch) 而不是 -f (cover)。
+#   cover 等比会把 337x714 的内容上下各裁 108 行 (21%), 状态栏/导航栏看不见;
+#   stretch 两轴各自缩到 480x800 ⇒ 一点内容不丢, 代价是轻微压扁 (主人明确接受)。
+# ai2dplay: 硬件 NV12→AR24 + 缩放(→480x800), 恒读 16B 帧头, 无需 -p/-S/-H
+OPTS="${WFD_PLAYER_OPTS:--w 480 -h 800}"
 LOG="${SCREEN_LOG:-/var/log/k230-screen.log}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
 
-if [ ! -x /usr/bin/drmplay ]; then
-    log "✗ /usr/bin/drmplay 不存在, 屏无法接管"
+if [ ! -x /usr/bin/ai2dplay ]; then
+    log "✗ /usr/bin/ai2dplay 不存在, 屏无法接管"
     # 不退出: 退出去只会被 systemd 反复拉起刷日志
     sleep 3600
     exit 1
@@ -69,6 +73,7 @@ fi
 
 # 先把老的玩家让出来 (它持 DRM master, 新的会 SETCRTC: Permission denied)
 pkill -9 -x drmplay 2>/dev/null || true
+pkill -9 -x ai2dplay 2>/dev/null || true
 sleep 0.3
 rm -f "$PIDFILE"
 # 只有这里允许重建管道, 且一定在「玩家已全部杀掉」之后 ⇒ 不会有人拿着旧 inode
@@ -79,6 +84,16 @@ chmod 666 "$FIFO" 2>/dev/null || true
 # ★ exec 不换 pid ⇒ 这个 pidfile 就是后面 drmplay 的 pid (体检靠它)
 echo $$ >"$PIDFILE"
 exec 9>&-
+# ★ 2026-11-03 零拷贝默认开 (无线三路一起受益, 板上 A/B 实测见下):
+#   1080p 源 (Miracast 真机) 同一段 12 s / 30 fps ES, 只改帧体通道:
+#     走管道: 管道延迟 avg 82.6~85.0 ms max 138 ms, 每帧CPU 14.50 ms
+#     WFD_SHM: 管道延迟 avg 19.4~21.2 ms max  49 ms, 每帧CPU 12.16 ms
+#   原因: 管道定容 2 MB = 720p 1.4 帧 / 1080p 0.9 帧, 帧体要拆成几十次 read(),
+#   单核上每趟都是一次上下文切换, 而且积压的帧只能排队 —— 延迟是纯排队, 不是算力。
+#   ⚠ 解码侧必须与这里一致: wfd-p2p.sh / k230-airplay / carlife 都 export 同一个值。
+#   回滚: 在对应 unit 里写 Environment=WFD_SHM= (空串 = 关闭), 两端会一起回到老路。
+export WFD_SHM="${WFD_SHM-/run/wfd-frame}"
 log "接管屏: $FIFO (pid $$, 空闲 800 ms 自动刷黑)"
+[ -n "${WFD_SHM:-}" ] && log "帧通道: 共享内存 ${WFD_SHM} (零拷贝)"
 # 前台运行, 让 systemd 管生命周期 (Restart=always 兜住意外退出)
-exec /usr/bin/drmplay $OPTS -F "$FIFO"
+exec /usr/bin/ai2dplay $OPTS -F "$FIFO"

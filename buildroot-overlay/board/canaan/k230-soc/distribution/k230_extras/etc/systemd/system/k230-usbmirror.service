@@ -1,0 +1,20 @@
+# /etc/systemd/system/k230-usbmirror.service
+# 安卓 USB 有线投屏 (adb -> screenrecord -> H.264 -> v4l2_dec -> drmplay)
+# 只在需要时手动 systemctl start; 默认不 enable (插着手机才会工作, 没手机是空转)
+[Unit]
+Description=K230 USB wired mirror (android adb screenrecord -> v4l2_dec)
+After=local-fs.target k230-screen.service
+Wants=k230-screen.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/usbmirror
+ExecStart=/bin/sh /root/usbmirror/run.sh --touch
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+

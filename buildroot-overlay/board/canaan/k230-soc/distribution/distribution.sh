@@ -171,12 +171,60 @@ k230_chroot_install() {
     return "${ret}"
 }
 
+# 在 chroot 内 native 源码编译 uxplay (AirPlay 服务端), 同板上 build-uxplay.sh
+#   cross 缺 gstreamer/plist dev, 故走镜像内 chroot 编译 (apt 拉依赖, 可复现)
+#   $1: rootfs
+k230_chroot_build_uxplay() {
+    local rootfs="$1"
+    local air="${K230_SDK_ROOT}/../../src/K230-cast/airplay"
+    local qemu="/usr/bin/qemu-riscv64-static"
+    [ -f "${air}/vendor/uxplay-master.tar.gz" ] || { print_yellow "K230 uxplay: 无 vendored 源码, 跳过"; return 0; }
+    command -v chroot >/dev/null 2>&1 && [ -x "${qemu}" ] || { print_yellow "K230 uxplay: 缺 chroot/qemu, 跳过"; return 0; }
+
+    print_blue "K230 uxplay: chroot 内源码编译 (qemu 较慢, 请耐心)..."
+    cp -f "${qemu}" "${rootfs}/usr/bin/qemu-riscv64-static"
+    local rc="${rootfs}/etc/resolv.conf" rc_link="" rc_backup=""
+    if [ -L "${rc}" ]; then rc_link="$(readlink "${rc}")"; rm -f "${rc}";
+    elif [ -f "${rc}" ]; then rc_backup="${rc}.k230bak"; cp -f "${rc}" "${rc_backup}"; fi
+    printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > "${rc}"
+    mkdir -p "${rootfs}/tmp/uxb"
+    cp -f "${air}/vendor/uxplay-master.tar.gz" "${rootfs}/tmp/uxb/"
+    cp -rf "${air}/patches" "${rootfs}/tmp/uxb/patches" 2>/dev/null || true
+    mount --bind /proc "${rootfs}/proc" 2>/dev/null || true
+    local ret=0
+    chroot "${rootfs}" /bin/bash -c '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq || true
+        apt-get install -y --no-install-recommends build-essential cmake pkg-config libplist-dev libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev
+        cd /tmp/uxb && tar xzf uxplay-master.tar.gz --strip-components=1
+        for p in patches/*.patch; do [ -f "$p" ] && patch -p1 <"$p"; done
+        mkdir -p build && cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DNO_X11_DEPS=ON -DNO_MARCH_NATIVE=ON
+        make -j2
+        install -m0755 uxplay /usr/local/bin/uxplay
+        cd / && rm -rf /tmp/uxb
+        rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+    ' || ret=$?
+    umount "${rootfs}/proc" 2>/dev/null || true
+    rm -f "${rootfs}/usr/bin/qemu-riscv64-static"
+    rm -rf "${rootfs}/tmp/uxb"
+    if [ -n "${rc_link}" ]; then ln -sfn "${rc_link}" "${rc}"; elif [ -n "${rc_backup}" ]; then mv -f "${rc_backup}" "${rc}"; else rm -f "${rc}"; fi
+    if [ "${ret}" -ne 0 ]; then print_red "K230 uxplay: 编译失败 (rc=${ret})"; exit 1; fi
+    print_blue "K230 uxplay: 完成"
+}
+
 k230_apply_extras() {
     local distname="$1"
     local rootfs="$2"
     local extras="${K230_SDK_ROOT}/buildroot-overlay/board/canaan/k230-soc/distribution/k230_extras"
 
     [ -d "${extras}" ] || return 0
+
+    # ★ 2026-11-04 本地补丁: 构建时从源码编译投屏栈 (SDK 里存源码, 不存预编译二进制)
+    K230_SDK_ROOT="${K230_SDK_ROOT}" BRW_BUILD_DIR="${BRW_BUILD_DIR}" \
+        "${K230_SDK_ROOT}/buildroot-overlay/board/canaan/k230-soc/distribution/k230_extras_build.sh" \
+        || { print_red "K230 extras: 源码编译失败"; exit 1; }
 
     print_blue "K230 extras: 覆盖 network / wpa_supplicant / setup_wifi.sh ..."
     cp -a "${extras}/." "${rootfs}/"
@@ -205,8 +253,19 @@ k230_apply_extras() {
 
     if [ "${distname}" = "ubuntu" ]; then
         k230_chroot_install "${rootfs}" \
-            "net-tools iproute2 dnsutils curl wget vim-tiny htop wireless-tools iw wpasupplicant" \
+            "net-tools iproute2 dnsutils curl wget vim-tiny htop wireless-tools iw wpasupplicant \
+             hostapd dnsmasq avahi-daemon avahi-utils bluez libusb-1.0-0 iptables nftables \
+             python3-netifaces gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+             gstreamer1.0-libav gstreamer1.0-x libgstreamer1.0-0 libplist-2.0-4 libdbus-1-3" \
             || { print_red "K230 extras: 额外软件包安装失败"; exit 1; }
+        # 补丁版 wpa_supplicant: 用 SDK 的 buildroot 从源码编译 (buildroot-overlay/package/wpa_supplicant + 2 个 K230 补丁)
+        local wpa_bin="${BRW_BUILD_DIR}/build/wpa_supplicant-2.11/wpa_supplicant/wpa_supplicant"
+        if [ -f "${wpa_bin}" ]; then
+            install -m 0755 "${wpa_bin}" "${rootfs}/usr/sbin/wpa_supplicant"
+            print_blue "K230 extras: 覆盖为 buildroot 源码编译的补丁版 wpa_supplicant"
+        else
+            print_red "K230 extras: 找不到 buildroot wpa_supplicant (先 make buildroot)"; exit 1
+        fi
     fi
 }
 

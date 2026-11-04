@@ -11,12 +11,35 @@
 # 用法: k230-airplay [run]    (默认 run; systemd 直接调用)
 set -u
 
+# 2026-10-31: 解码器二进制默认是黄金版 /usr/bin/v4l2_dec;
+# 苹果竖屏 crop 归一的新版放 /usr/local/bin/v4l2_dec, 由 drop-in 用 DEC_BIN 指过来。
+DEC_BIN="${DEC_BIN:-/usr/bin/v4l2_dec}"
+
+# ★ 2026-11-03 零拷贝 + 最低延迟投喂 (必须与 k230-screen.sh 的 WFD_SHM 一致):
+#   板上 1080p / 30 fps ES A/B, 只改这两项 ⇒ 管道延迟 82.6~85.0 ms → 19.4~21.2 ms,
+#   每帧CPU 14.50 → 12.16 ms。AirPlay 是 1280x720 源, 单帧 1.35 MB 同理要拆几十次
+#   read(), 同样吃在管道上。回滚: Environment=WFD_SHM= (关) / DEC_AU=0 (老投喂)。
+export WFD_SHM="${WFD_SHM-/run/wfd-frame}"
+export DEC_AU="${DEC_AU-2}"
+
+# ★ 2026-11-03 内容区自学习 (-L): 前 12 帧探出手画面在黑边帧里的真实边界, 由 VPU
+#   自己裁+缩到 480x800, drmplay 退化成 1:1 直贴 (板上 1080p 实测 转换 15.3 → 1.4 ms,
+#   每帧CPU 12.16 → 1.96 ms)。AirPlay 的 1280x720 帧里同样只有中间 ~405x720 是内容,
+#   原来全靠 CPU 缩。每会话重学一次, 学习期约 0.4 s (解码器带缓存原地重启)。
+#   关掉: WFD_DEC_LEARN=0。
+AIRPLAY_DEC_FIT="${AIRPLAY_DEC_FIT:-/run/wfd-decfit-airplay.txt}"
+
 NAME="${AIRPLAY_NAME:-K230-CAST}"
 ES_FIFO="${AIRPLAY_ES_FIFO:-/run/airplay.h264}"
 PLAYER_FIFO="${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}"
 PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
 PLAYER_OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800}"
 UXPLAY="${UXPLAY_BIN:-/usr/local/bin/uxplay}"
+# 2026-11-02: 端口可配 —— CarPlay 的 carplay-airplayd 固定占 tcp 7000, 两者要同时待命
+#   ⇒ 本机 AirPlay 镜像在 unit 里设 AIRPLAY_PORT=7100 (RTSP 口 = 7100+1 = 7101)。
+#   单独跑 (不装 CarPlay) 时保持默认 7000, 行为与以前完全一致。
+AIRPLAY_PORT="${AIRPLAY_PORT:-7000}"
+AIRPLAY_RTSP_PORT=$((AIRPLAY_PORT + 1))
 LOG="${AIRPLAY_LOG:-/var/log/airplay.log}"
 ACTIVE_FILE="${AIRPLAY_ACTIVE_FILE:-/run/airplay-active}"
 
@@ -62,6 +85,19 @@ ensure_player() {
     return 0
 }
 
+# 会话探测: uxplay 的 **RTSP 服务口** (= AIRPLAY_PORT + 1, unit 里 7100 ⇒ 7101)。
+# ★ 2026-11-02 现场定因 (主人报「AirPlay 连上后屏自己黑, 摸手机才亮」):
+#   旧写法 `ss -tn | grep "ESTAB.*:$AIRPLAY_PORT "` 有两个硬伤 ——
+#     ① `ss -tn` 输出**没有 State 列**, 行里根本没有 "ESTAB" 字样 ⇒ 恒为假;
+#     ② 判的是 7100 (uxplay -p 的基址), 而实际 listen/连接的是 7101
+#        (日志: using network ports UDP 7100 7101 7102 TCP 7100 7101 7102)。
+#   结果: /run/airplay-cast-active 从未创建 ⇒ drmplay 把静止画面当「其它源静默」
+#   ⇒ 2.4 s 刷黑, 手机一摸产生新帧又亮。
+conn_rtsp() {
+    ss -Htn state established 2>/dev/null | awk -v p=":$AIRPLAY_RTSP_PORT" \
+        '($3 ~ p"$") || ($4 ~ p"$") { f = 1 } END { exit !f }'
+}
+
 watch_decoder() {
     # ★ 2026-10-29 (现场黑屏): 同一 uxplay/解码器会跨多场会话复用 (uxplay 不退出就
     #   只是会话结束)。第二场起偶发 **MVX 硬件解码看门狗超时** (dmesg 每 3 s 一条
@@ -70,31 +106,45 @@ watch_decoder() {
     #   ⇒ 屏全黑、音频照旧。此前只能整服务重启才能恢复。
     #   两路判据, 命中就杀掉解码器, 让 start_decoder 的循环重开:
     #     ① 内核 MVX Watchdog 计数增加 = 硬件解码器已挂 (最准, 无假阳性)
-    #     ② 客户端连着 (:7000 ESTAB) 但解码日志 12 s 不增长 = 软性卡死
+    #     ② 客户端连着 (RTSP 口 ESTAB) 但解码日志 12 s 不增长 = 软性卡死
     _wd_last=$(dmesg 2>/dev/null | grep -c 'MVX session.*Watchdog timeout')
-    _wd_size=$(stat -c %s /var/log/miracast-dec.log 2>/dev/null || echo 0)
+    _wd_size=$(stat -c %s /var/log/airplay-dec.log 2>/dev/null || echo 0)
     _wd_quiet=0
     _wd_was=0
+    _gone=0
+    _tick=0
     while :; do
         sleep 2
+        _tick=$((_tick + 1))
         _conn=0
-        ss -tn 2>/dev/null | grep -q 'ESTAB.*:7000 ' && _conn=1
+        conn_rtsp && _conn=1
         # 会话存活标记: drmplay 见到它就无限期保持最后一帧 (静止桌面不刷黑)
+        # ★ 2026-11-02 去抖: 连续 2 拍 (≈4 s) 没有 RTSP 连接才算真断开。
+        #   以前一掉连接就立刻删标记 + 重启单元, WiFi 抖一下整场投屏就断了。
         if [ "$_conn" = 1 ]; then
+            _gone=0
             [ -f "$ACTIVE_FILE" ] || : >"$ACTIVE_FILE"
-        elif [ -f "$ACTIVE_FILE" ]; then
-            rm -f "$ACTIVE_FILE"
+            _wd_was=1
+        else
+            _gone=$((_gone + 1))
+            if [ "$_gone" -ge 2 ]; then
+                if [ -f "$ACTIVE_FILE" ]; then
+                    rm -f "$ACTIVE_FILE"
+                    log "🗑 删 $ACTIVE_FILE (RTSP 已连续 $_gone 拍无连接)"
+                fi
+                # 会话结束 (连过又断开): 整单元重启一次, 让 uxplay/解码器都从干净状态
+                # 等下一场 —— 跨会话复用同一个解码器正是 15:03「有声音没画面」的现场
+                # (第二场起 MVX 偶尔挂死 / QBUF 报 EIO, 只能重启才能恢复)。
+                if [ "$_wd_was" = 1 ]; then
+                    _wd_was=0
+                    log "⏹ AirPlay 会话结束 → 2 s 后重启本单元 (解码器归零)"
+                    ( sleep 2; conn_rtsp || systemctl --no-block restart k230-airplay.service ) &
+                fi
+            fi
         fi
-        # 会话结束 (连过又断开): 整单元重启一次, 让 uxplay/解码器都从干净状态
-        # 等下一场 —— 跨会话复用同一个解码器正是 15:03「有声音没画面」的现场
-        # (第二场起 MVX 偶尔挂死 / QBUF 报 EIO, 只能重启才能恢复)。
-        if [ "$_wd_was" = 1 ] && [ "$_conn" = 0 ]; then
-            _wd_was=0
-            log "⏹ AirPlay 会话结束 → 2 s 后重启本单元 (解码器归零)"
-            ( sleep 2; ss -tn 2>/dev/null | grep -q 'ESTAB.*:7000 ' || systemctl --no-block restart k230-airplay.service ) &
-            continue
-        fi
-        [ "$_conn" = 1 ] && _wd_was=1
+        # 体检: 每 2 分钟一行 (排「黑屏/不黑屏」时先看这个)
+        [ $((_tick % 60)) -eq 0 ] && \
+            log "[watch] rtsp=$_conn active=$([ -f "$ACTIVE_FILE" ] && echo 1 || echo 0) gone=$_gone"
         # ① 内核 MVX 看门狗计数增加 = 硬件解码器已挂 → 整单元重启 (只杀进程不够,
         #   实测杀完重开的解码器会一直 QBUF EIO)
         _wd_now=$(dmesg 2>/dev/null | grep -c 'MVX session.*Watchdog timeout')
@@ -135,8 +185,20 @@ start_decoder() {
             #   而且 AirPlay 这条路的几何适配本来就不靠 -A: 下游 drmplay 带
             #   `-w 480 -h 800` 自己缩放补边 (Miracast 那条路一直这么干, 稳)。
             #   要回来调画面占比时用 AIRPLAY_AUTOFIT=1 临时开。
-            /usr/bin/v4l2_dec "$ES_FIFO" "$PLAYER_FIFO" -H -D ${AIRPLAY_AUTOFIT:+-A} \
-                >>/var/log/miracast-dec.log 2>&1 </dev/null
+            # 2026-10-31: 解码器日志单独一份 —— 以前和 Miracast 那条共写
+            #   /var/log/miracast-dec.log, 两个进程的 "定型/重建" 行交错, 排障时分不清
+            #   是哪个源在重建 (iPhone 黑屏那一轮就被这点绕了很久)。
+            # 2026-10-31 (主人要求: 苹果的修法不许影响安卓黄金路径):
+            #   默认还是 /usr/bin/v4l2_dec (黄金版); 苹果要试带 crop 归一的新版时,
+            #   由 drop-in 指 DEC_BIN=/usr/local/bin/v4l2_dec (同名不同目录 ——
+            #   下面 watch_decoder 用 "v4l2_dec $ES_FIFO" 匹配命令行, 名字必须保留)。
+            _fitarg=""
+            if [ "${WFD_DEC_LEARN:-1}" = 1 ]; then
+                rm -f "$AIRPLAY_DEC_FIT"
+                _fitarg="-L $AIRPLAY_DEC_FIT"
+            fi
+            "$DEC_BIN" "$ES_FIFO" "$PLAYER_FIFO" -H -D ${AIRPLAY_AUTOFIT:+-A} ${_fitarg:-} \
+                >>/var/log/airplay-dec.log 2>&1 </dev/null
             _rc=$?
             printf '[%s] 硬解退出 (rc=%d) → 0.5s 后重开管道等下一次投屏\n' \
                 "$(date +%H:%M:%S)" "$_rc" >>"$LOG"
@@ -150,24 +212,24 @@ start_decoder() {
 }
 
 wait_port_free() {
-    # ★ 2026-10-28: 上一实例没退干净时立刻再起, uxplay 抢不到 7001 端口 ——
+    # ★ 2026-10-28: 上一实例没退干净时立刻再起, uxplay 抢不到 RTSP 端口 ——
     #   现场 18:31:54 / 18:32:06 / 18:32:21 连炸三次 rc=139(段错误), 都是紧跟在上一次
     #   "Stopping RAOP Server..." 之后 3 秒内重启造成的。先等端口放掉, 再交给 systemd
     #   的 RestartSec 节奏, 段错误就不出现了。
     _i=0
     while [ $_i -lt 24 ]; do
-        if ! ss -lnt 2>/dev/null | grep -q ':7001 '; then return 0; fi
+        if ! ss -lnt 2>/dev/null | grep -q ":$AIRPLAY_RTSP_PORT "; then return 0; fi
         _i=$((_i + 1))
         sleep 0.5
     done
-    log "⚠ 7001 端口 12 s 仍被占用 (疑似残留 uxplay), 照常启动"
+    log "⚠ $AIRPLAY_RTSP_PORT 端口 12 s 仍被占用 (疑似残留 uxplay), 照常启动"
 }
 
 status() {
     printf '服务     : %s\n' "$(systemctl is-active k230-airplay 2>/dev/null)"
     printf '名字     : %s\n' "$NAME"
     printf 'uxplay   : %s\n' "$(pgrep -f 'uxplay -n' | tr '\n' ' ')"
-    printf 'rtsp端口 : %s\n' "$(ss -lnt 2>/dev/null | awk '/:7001 /{print "7001 LISTEN"; exit}')"
+    printf 'rtsp端口 : %s\n' "$(ss -lnt 2>/dev/null | awk -v p=":$AIRPLAY_RTSP_PORT " 'index($0,p){print p "LISTEN"; exit}')"
     printf '解码器   : %s\n' "$(pgrep -f "v4l2_dec $ES_FIFO" | tr '\n' ' ')"
     printf '播放器   : %s (geom: %s)\n' "$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo -)" "$(cat /run/wfd-uibc-geom 2>/dev/null || echo -)"
     printf -- '--- 最近日志 ---\n'
@@ -225,7 +287,7 @@ case "${1:-run}" in
         #   Mac 误以为能上 1080p 却按 720p 编码造成协商反复。
         #   ⚠ 解码侧不写死分辨率: v4l2_dec 从 SPS 读, 换成 1080p 源自动跟随。
         #   可用 AIRPLAY_RES 覆盖 (例如 1920x1080@30)。
-        # -p 7000 固定端口 (仲裁器按 7000 的已建立连接判断"苹果连上了")
+        # -p $AIRPLAY_PORT (仲裁器按这个端口的已建立连接判断"苹果连上了")
         # 音频: 2026-10-29 打通 —— 板上已 apt 装 gstreamer1.0-plugins-base +
         #   gstreamer1.0-libav (avdec_alac/audioconvert/audioresample/volume/filesink/
         #   appsrc 齐活), UXPLAY_AUDIO_PIPE 那条 pipeline 能正常 parse, 把 AirPlay 的
@@ -248,7 +310,10 @@ case "${1:-run}" in
         #   有 stdbuf 就按行刷新, 没有就算了 (不影响功能)。
         UX_RUN=""
         command -v stdbuf >/dev/null 2>&1 && UX_RUN="stdbuf -oL -eL"
-        $UX_RUN "$UXPLAY" -n "$NAME" -nh -p 7000 -s "${AIRPLAY_RES:-1280x720@30}" -vdmp "$ES_BASE" $_AUDIO_OPT >>"$LOG" 2>&1
+        # 2026-10-31: 现场排障钩子 —— AIRPLAY_EXTRA 原样追加给 uxplay (例:
+        #   AIRPLAY_EXTRA="-d 2" 打开包级调试, "-fpsdata" 让客户端回传码率报告)
+        #   平时为空, 不影响默认参数。
+        $UX_RUN "$UXPLAY" -n "$NAME" -nh -p "$AIRPLAY_PORT" -s "${AIRPLAY_RES:-1280x720@30}" -vdmp "$ES_BASE" $_AUDIO_OPT ${AIRPLAY_EXTRA:-} >>"$LOG" 2>&1
         RC=$?
         _t1=$(date +%s)
         log "uxplay 退出 (rc=$RC, 运行 $((_t1 - _t0)) 秒)"

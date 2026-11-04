@@ -11,6 +11,17 @@ Wants=systemd-udevd.service
 
 [Service]
 Type=simple
+# 2026-10-28 连接稳定性 (K80 实测闭环, 见 docs/PROGRESS.md):
+#   WFD_FORCE_OPER_CH=1  钉死组信道 ch1 —— 不钉时 MTK 手机会把组起在 ch8/2447,
+#     我们的合法 AUTH 一帧都收不到 ⇒ 15 s 超时 "无法连接", 怎么点都不成。
+#   WFD_PERSISTENT_RECONNECT=0 (脚本默认) 拒绝对端 Invitation, 每次全新协商,
+#     否则手机用存下的旧组重连, 又把组带回 ch8。
+# 2026-11-02 (统一仲裁): wlan1 被 CarPlay/CarLife 的共享热点占成 AP,
+#   Miracast 改用 wlan0 做 P2P(STA 侧), 这样热点与投屏可以同时待命。
+#   实测 (2026-11-02): wlan0 起 P2P device 后 wlan1 的 hostapd/AP 不受影响。
+Environment=WFD_IFACE=wlan0
+Environment=WFD_FORCE_OPER_CH=1
+Environment=WFD_PERSISTENT_RECONNECT=0
 ExecStartPre=/bin/rm -f /run/wfd-p2p.hold
 ExecStart=/bin/sh /root/wfd-p2p.sh client
 ExecStop=/bin/sh /root/wfd-p2p.sh stop

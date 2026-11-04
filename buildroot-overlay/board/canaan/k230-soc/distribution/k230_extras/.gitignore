@@ -1,2 +1,22 @@
 # 构建机本地 WiFi 凭证 (SSID|PASS), 不入 git
 root/wifi.secret
+
+# ---- 编译产物: 由 distribution/k230_extras_build.sh 每次构建从 K230/src 源码生成, 不入 git ----
+usr/bin/ai2dplay
+usr/bin/drmdump
+usr/bin/drmplay
+usr/bin/k230ui
+usr/bin/k230-ui-backend
+usr/bin/k230ui-ctl
+usr/bin/pcmplay
+usr/bin/v4l2_dec
+usr/bin/wfd-sink
+usr/local/bin/uxplay
+usr/local/bin/carplay-airplayd
+usr/local/bin/carplay-arbiter
+usr/local/bin/carplay-hal
+usr/local/bin/carplay-media
+usr/local/bin/carplay-wireless
+root/carlife_sink
+root/carlife/carlife_sink
+root/usbmirror/usb_mirror

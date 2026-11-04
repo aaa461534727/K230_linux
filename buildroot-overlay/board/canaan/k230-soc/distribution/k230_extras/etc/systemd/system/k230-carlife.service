@@ -1,0 +1,16 @@
+[Unit]
+Description=K230 CarLife wired (USB AOA) sink
+After=network.target k230-screen.service
+
+[Service]
+Type=simple
+# 2026-11-03 零拷贝 + 最低延迟投喂, 与 k230-screen.sh 必须一致 (见 k230-carlife-wifi.service)
+Environment=WFD_SHM=/run/wfd-frame
+Environment=DEC_AU=2
+ExecStart=/root/carlife_sink --width 1280 --height 720 --fps 30
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

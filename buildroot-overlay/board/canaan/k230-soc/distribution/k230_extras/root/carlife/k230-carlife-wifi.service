@@ -1,0 +1,15 @@
+[Unit]
+Description=K230 CarLife wireless (WiFi/TCP) sink
+After=network.target k230-screen.service k230-carlife-ap.service
+Wants=k230-carlife-ap.service
+
+[Service]
+Type=simple
+# 2026-10-30 真机打通: 听 UDP 7999 的 "CarlifeHost" 广播, 再连手机 7240/8240/9240-9242/9340/9440
+ExecStart=/root/carlife/carlife_sink --wifi --verbose
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

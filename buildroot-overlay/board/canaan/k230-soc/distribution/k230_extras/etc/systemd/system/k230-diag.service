@@ -1,0 +1,13 @@
+[Unit]
+Description=K230 投屏现场采样器 (1 Hz: CPU/无线/丢包/省电)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/k230_diag2.py
+Restart=always
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

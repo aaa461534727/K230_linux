@@ -1,0 +1,29 @@
+# /etc/systemd/system/k230-shared-ap.service
+# 2026-11-02: CarPlay 与 CarLife 无线共用的热点, **开机只起一次**。
+#
+# 为什么必须独立且只起一次:
+#   本板 WiFi 是 8189fs (SDIO), 运行期对它做 ip link down/up + 重起 hostapd 会把内核
+#   挂死 (2026-11-02 两次整机失联, 只能断电恢复)。所以热点放在开机阶段一次性拉起,
+#   之后任何组件都**不要**再去动 wlan1; 真需要恢复时手动 restart 本服务 (并接受风险)。
+[Unit]
+Description=K230 shared AP for CarPlay/CarLife (wlan1, start once at boot)
+After=network.target
+Before=k230-source-arbiter.service carplay-wireless.service k230-carlife-wifi.service
+# 起不来也不反复重启: 反复 hostapd 会挂内核
+StartLimitBurst=1
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CARLIFE_AP_IF=wlan1
+Environment=CARLIFE_AP_SSID=K230-CARPLAY
+Environment=CARLIFE_AP_PSK=k230carplay
+# oneshot 里同步 systemctl start 别的单元会死锁 → 投屏端交给仲裁器起
+Environment=CARLIFE_AP_SKIP_SERVICE=1
+ExecStart=/bin/sh /root/carlife/carlife-ap.sh start
+ExecStop=/bin/sh /root/carlife/carlife-ap.sh stop
+TimeoutStartSec=60
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

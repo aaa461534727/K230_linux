@@ -431,21 +431,29 @@ stop_supplicant() {
 
     # 3) 清残留进程: 必须用 -x (精确匹配进程名),
     #    用 -f 会把自己 / 外层 shell 的命令行也匹配进去 (2026-10-21 把自己 kill 过)
+    # ★ 2026-11-02: **只清本网卡 ($IFACE) 上的 supplicant**。原来 pkill -9 -x 是全局的,
+    #   板上还有另一块 vif (wlan0/wlan1) 在跑 station 时会被一起杀掉 ⇒ 整机断网失联
+    #   (现场两次只能断电恢复)。用 /proc/<pid>/cmdline 精确判断 -i $IFACE。
+    _sp_pids() {
+        for _p in $(pgrep -x wpa_supplicant 2>/dev/null); do
+            tr '\0' ' ' <"/proc/$_p/cmdline" 2>/dev/null | grep -q -- "-i *$IFACE\( \|$\)" && echo "$_p"
+        done
+    }
     i=0
     while [ "$i" -lt 40 ]; do
-        pgrep -x wpa_supplicant >/dev/null 2>&1 || break
-        pkill -9 -x wpa_supplicant 2>/dev/null || true
+        [ -n "$(_sp_pids)" ] || break
+        for _p in $(_sp_pids); do kill -9 "$_p" 2>/dev/null || true; done
         i=$((i + 1)); sleep 0.25
     done
-    pgrep -x wpa_supplicant >/dev/null 2>&1 && die "wpa_supplicant 杀不掉 (pid $(pgrep -x wpa_supplicant | tr '\n' ' '))"
+    [ -n "$(_sp_pids)" ] && die "wpa_supplicant ($IFACE) 杀不掉 (pid $(_sp_pids | tr '\n' ' '))"
 
     # 4) 清 socket (包括 p2p-dev-*), 并确认真的没人监听了
     i=0
     while [ "$i" -lt 20 ]; do
         rm -f "$CTRL_DIR/$IFACE" "$CTRL_DIR/p2p-dev-$IFACE" 2>/dev/null || true
         wpa ping >/dev/null 2>&1 || return 0     # 没人应答 = 干净
-        page=$(pgrep -x wpa_supplicant | tr '\n' ' ' || true)
-        [ -n "$page" ] && pkill -9 -x wpa_supplicant 2>/dev/null || true
+        page=$(_sp_pids | tr '\n' ' ' || true)
+        [ -n "$page" ] && for _p in $page; do kill -9 "$_p" 2>/dev/null || true; done
         i=$((i + 1)); sleep 0.25
     done
     die "ctrl socket 一直有人应答, 清不掉"
@@ -471,7 +479,9 @@ start_supplicant() {
     done
     rm -f "$CTRL_DIR/$IFACE" "$CTRL_DIR/p2p-dev-$IFACE" 2>/dev/null || true
     : > "$P2P_LOG"
-    if ! wpa_supplicant -B -P "$PIDFILE" -i "$IFACE" -D nl80211 -c "$P2P_CONF" -f "$P2P_LOG" -dd -t; then
+    # ★ 2026-11-02: 去掉 -dd。实测待命态下 -dd 每秒往 /tmp 写 ~11 KB 调试日志
+    #   (30 s 2190 行), 单核板上白白吃掉 CPU; 排障需要时临时加回即可。
+    if ! wpa_supplicant -B -P "$PIDFILE" -i "$IFACE" -D nl80211 -c "$P2P_CONF" -f "$P2P_LOG" -t; then
         # 常见原因: 上一个实例在 AP 模式下被强杀, 驱动/vif 状态没释放
         # (日志里是 "ctrl_iface bind: Address already in use" 或 "Match already configured")
         # 把网卡拉下去再上来, 清一次 socket, 重试一次
@@ -481,7 +491,7 @@ start_supplicant() {
         sleep 1
         ip link set dev "$IFACE" up 2>/dev/null || true
         sleep 1
-        if ! wpa_supplicant -B -P "$PIDFILE" -i "$IFACE" -D nl80211 -c "$P2P_CONF" -f "$P2P_LOG" -dd -t; then
+        if ! wpa_supplicant -B -P "$PIDFILE" -i "$IFACE" -D nl80211 -c "$P2P_CONF" -f "$P2P_LOG" -t; then
             log "✗ wpa_supplicant 启动失败, 日志 $P2P_LOG"
             log "→ 自动恢复 station 模式, 免得上不了网"
             cmd_stop || true
@@ -913,7 +923,7 @@ start_player() {
     player_ok() {
         _pp=$(cat "$PLAYER_PIDFILE" 2>/dev/null || echo 0)
         if [ -z "$_pp" ] || [ "$_pp" = 0 ] || ! kill -0 "$_pp" 2>/dev/null; then
-            _pp=$(pgrep -f "drmplay .*-F $PLAYER_FIFO" 2>/dev/null | head -1)
+            _pp=$(pgrep -f "(drmplay|ai2dplay) .*-F $PLAYER_FIFO" 2>/dev/null | head -1)
         fi
         [ -n "$_pp" ] || return 1
         [ -p "$PLAYER_FIFO" ] || return 1
@@ -1082,7 +1092,36 @@ start_sink_client() {
             DEC_OPTS="$DEC_OPTS -s $WFD_DEC_SCALE"
         fi
     fi
-    log "🎛 解码器参数: v4l2_dec $DEC_OPTS (原始尺寸出图, 裁剪/缩放交 drmplay)"
+    # ★ 2026-11-03 零拷贝 + 最低延迟投喂 (与 k230-screen.sh 的 WFD_SHM 必须一致):
+    #   板上同一段 1080p / 30 fps ES A/B, 只改这两项:
+    #     现状          管道延迟 avg 82.6~85.0 ms max 138 ms, 每帧CPU 14.50 ms
+    #     SHM + DEC_AU=2 管道延迟 avg 19.4~21.2 ms max  49 ms, 每帧CPU 12.16 ms
+    #   -WFD_SHM  : 帧体走 /run/wfd-frame 两槽, 管道里只剩 16 B 帧头 + 4 B 槽号,
+    #               不再把 1.4~3.1 MB 的帧拆成几十次 read() (单核上每次都是一次切换)
+    #   DEC_AU=2  : 一拿到完整 AU 就投, 不攒满 64 KB chunk 再切 (少一层批处理延迟)
+    #   回滚: Environment=WFD_SHM= 关零拷贝; DEC_AU=0 回老投喂。
+    export WFD_SHM="${WFD_SHM-/run/wfd-frame}"
+    export DEC_AU="${DEC_AU-2}"
+    # ★ 2026-11-03 内容区自学习 (-L): 解码器前 12 帧探出手机画面在黑边帧里的
+    #   真实边界, 让 **VPU 自己裁+缩** 到 480x800, drmplay 变成 1:1 直贴。
+    #   板上同一段 1080p/30fps ES 实测 (WFD_SHM+DEC_AU=2 已开):
+    #     不裁剪: 内容 608x1080 → drmplay 缩放 450x800, 转换 15.3 ms, 每帧CPU 12.16 ms
+    #     自学习: 裁 648x1080 (含两侧黑边, 不丢像素) → 480x800, 转换 1.4 ms, 每帧CPU 1.96 ms
+    #   延迟同时 19.4 → 3.7 ms。这就是「海奇能流畅」的那一步: 缩放交给显示/解码硬件。
+    #   每个会话重学一次 (删掉旧文件), 换手机/换分辨率自动跟上; 学习期约 0.4 s,
+    #   期间解码器带缓存原地重启, 不丢帧。关掉: WFD_DEC_LEARN=0。
+    # ★ 2026-11-03 现场回滚 (-L 默认关): 本固件 MVE 固件对 DEC_DST_CROPPING 回 0 但随后报
+    #   "Unsupported option" ⇒ -c 被静默忽略、同一次调用里的 -s 却照常生效, 于是
+    #   「整帧 1280x720 横向压进 480 宽」, 手机内容只剩中间一条 (现场: "只有中间一小块")。
+    #   这条 2026-10-28 已定论过 (见上), 前一版又接回来, 属于回归。
+    #   正确分工: 解码器出**原始尺寸**, 裁黑边 + 铺满全交 drmplay (玩家侧带 -f)。
+    #   想再试硬件裁剪: WFD_DEC_LEARN=1 (仅在确认固件真支持时才值得)。
+    DEC_FIT=/run/wfd-decfit-miracast.txt
+    if [ "${WFD_DEC_LEARN:-0}" = 1 ]; then
+        rm -f "$DEC_FIT"
+        DEC_OPTS="$DEC_OPTS -L $DEC_FIT"
+    fi
+    log "🎛 解码器参数: v4l2_dec $DEC_OPTS (原始尺寸出图, 裁剪/缩放交 drmplay; WFD_SHM=${WFD_SHM:-关} DEC_AU=$DEC_AU)"
     if [ "$PLAYER_FIFO_MODE" = 1 ]; then
         DEC_OUT="$PLAYER_FIFO"
         PIPE_ONE='/usr/bin/wfd-sink '"$SINK_ARG"' -d /dev/stdout 2>>/var/log/miracast.log'"$TEE_SEG"' | /usr/bin/v4l2_dec /dev/stdin '"$DEC_OUT"' '"$DEC_OPTS"' 2>>/var/log/miracast-dec.log'
@@ -1381,7 +1420,7 @@ start_go_supervisor() {
             _miss=0
             # 管线三段必须齐全: 上屏进程单独死了 (抢 CRTC 失败 / 异常退出) 时
             # sink 还在监听、7236 也通, 但画面永远出不来 ⇒ 只能整条重起。
-            if pgrep -x "$_plr" >/dev/null 2>&1; then
+            if pgrep -x "$_plr" >/dev/null 2>&1 || pgrep -x ai2dplay >/dev/null 2>&1; then
                 _pdead=0
             else
                 _pdead=$((_pdead + 1))
