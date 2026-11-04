@@ -1,0 +1,21 @@
+[Unit]
+Description=K230 UI backend (screen arbitration between LVGL UI and casting)
+Documentation=file:/root/k230-ui/README.md
+After=local-fs.target systemd-udevd.service
+# 让 backend 先起来: 它启动第一件事就是跑 `k230-ui-mode.sh ui` 把主界面拉起来。
+# 所以 k230-ui.service **不需要** enable, 也不要在 Wants 里 —— 避免两边抢启动。
+Before=k230-ui.service k230-screen.service
+
+[Service]
+Type=simple
+# 目录 /run/k230-ui 由 backend 自己 mkdir, socket 权限 0666
+ExecStart=/usr/bin/k230-ui-backend
+Environment=K230UI_STATE=/run/k230-ui-mode.state
+Restart=always
+RestartSec=2
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

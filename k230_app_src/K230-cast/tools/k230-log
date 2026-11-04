@@ -1,0 +1,57 @@
+#!/bin/sh
+# k230-log —— 控制台日志开关 (串口刷屏治理)
+#
+# 背景: 8189fs (Realtek SDIO WiFi) 是厂商二进制模块, 里面 Canaan 加的 P2P 探针日志
+#   `K230P2P: probe req -> cfg80211 (ap=0 p2p_state=2)` 用**默认等级(4)**打 printk,
+#   环境里 WiFi 一直在扫, 一秒好几条, 把串口刷得没法看。
+#   模块自带的 /proc/net/rtl8189fs/log_level 编译时关了 (CONFIG_RTW_DEBUG is disabled),
+#   调不动; 又不能为了这点噪音去 reload WiFi 模块 (8189fs 运行期动就挂内核,
+#   见 docs/WORKLOG.md 2026-11-02 两次事故) ⇒ 只能从**控制台等级**下手。
+#
+# 做法: 调 kernel printk 的 console_loglevel (第 1 个字段)。
+#   ★ 只影响"往串口/控制台打不打", **dmesg 环形缓冲一条不少** ——
+#     要翻全量照旧 `dmesg | tail -100`; 要实时看全量就先 `k230-log on`。
+#
+# 用法:
+#   k230-log            看当前状态
+#   k230-log off        安静模式: 只有 EMERG(0) 上串口 —— panic/oops 仍然看得见
+#   k230-log warn       标准模式: WARNING(4) 及以上上串口 (内核出厂默认)
+#   k230-log on         调试模式: DEBUG(7) 及以上全打, 包括那条 P2P 刷屏
+#
+# 选择写进 /etc/sysctl.d/99-k230-log.conf ⇒ 开机由 systemd-sysctl 自动套用。
+set -u
+CONF=/etc/sysctl.d/99-k230-log.conf
+LVL_OFF=1
+LVL_WARN=4
+LVL_ON=7
+
+# /proc/sys/kernel/printk 是**制表符**分隔, cut -d" " 会整行返回 (曾导致状态显示"自定义")
+cur_level() { awk '{print $1}' /proc/sys/kernel/printk; }
+
+apply() {
+    level=$1
+    printf '%s 4 1 7' "$level" >/proc/sys/kernel/printk
+    printf 'kernel.printk = %s 4 1 7\n' "$level" >"$CONF"
+    echo "console_loglevel = $(cur_level)   (dmesg 仍保留全量; 已写入 $CONF)"
+}
+
+show() {
+    l=$(cur_level)
+    case "$l" in
+        1) m="off  —— 只放 EMERG, 那条 P2P 刷屏不再上串口" ;;
+        4) m="warn —— WARNING 及以上 (内核出厂默认)" ;;
+        7) m="on   —— DEBUG 及以上全打, 会刷屏" ;;
+        *) m="自定义" ;;
+    esac
+    echo "console_loglevel = $l → $m"
+    echo "printk 四元组   = $(cat /proc/sys/kernel/printk)"
+    [ -f "$CONF" ] && echo "开机记忆        = $(cat "$CONF")"
+}
+
+case "${1:-show}" in
+    off)  apply "$LVL_OFF" ;;
+    warn) apply "$LVL_WARN" ;;
+    on)   apply "$LVL_ON" ;;
+    show|"") show ;;
+    *) echo "用法: $0 [off|warn|on|show]" >&2; exit 2 ;;
+esac

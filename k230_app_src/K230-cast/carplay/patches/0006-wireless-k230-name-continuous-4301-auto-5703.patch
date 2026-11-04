@@ -1,0 +1,90 @@
+From: K230 CarPlay session 2026-11-01
+Subject: [PATCH 0006] 车机名改 K230 + 4301 持续重发 + 识别后主动推 0x5703
+
+真机证据 (2026-11-01 19:02~20:44, iPhone + 板端 journal + 180 s SYN 抓包):
+  1. 改名假设证伪: CarLink -> K230 + 忘记车辆/蓝牙 + 重配对后, 20:39:57 手机仍不收 4301
+     (MFi/iAP2/识别全过, 0x4300 -> 0x4301 回了 5 次)。
+  2. SYN 抓包 180 s **0 个 TCP SYN** 发往 192.168.50.1 => iOS 根本没发起连接,
+     排除端口抢占/AP 数据面/防火墙 (7000 已由 carplay-airplayd 独占, ping 通,
+     手机还在用我们的 NAT 上网)。
+  3. "4301 在手机上线前发完" 假设也证伪: 上限 3->120 次/3 s 后, 20:44 手机在 AP 上
+     (-46 dBm) 已收 13 次 4301, 仍零连接。
+  4. 剩余差异: 本轮手机是**用户手动加入** AP 的; 而 17:45 成功轮的前置条件是手机走过
+     "0x5703 -> iOS 自动加入" 流程。iOS 把手动加入的网络不当 CarPlay 网络用。
+     => 识别后 1.5 s 主动推一次 0x5703, 逼 iOS 重新自动加入; 同时 4301 持续重发
+     覆盖"手机上车后再收一份 4301"的窗口。
+
+文件:
+  - crates/wireless/src/main.rs     ACCESSORY_NAME CarLink -> K230 (BT EIR 广播名)
+  - src/iap2/driver.rs              0x1D01 识别名 CarLink -> K230 (两处)
+  - crates/wireless/src/bt_driver.rs 主动 4301 上限 3->120 / 间隔 5s->3s /
+                                    识别后主动推 0x5703 (CARPLAY_AUTO_5703=0 可关)
+
+diff --git a/rust/carplayd/crates/wireless/src/bt_driver.rs b/rust/carplayd/crates/wireless/src/bt_driver.rs
+index 6431e0e..3646a21 100644
+--- a/rust/carplayd/crates/wireless/src/bt_driver.rs
++++ b/rust/carplayd/crates/wireless/src/bt_driver.rs
+@@ -79,6 +79,13 @@ pub fn run(mut sock: File, name: &str, shutdown: &AtomicBool) {
+     // 收到 0x4300 之后才愿意接受 4301, 那段窗口我们没有证据, 多发几次覆盖掉。
+     let mut start_sends: u8 = 0;
+     let mut last_start_send: Option<Instant> = None;
++    // K230 2026-11-01: 识别后 1.5 s 主动推一次 0x5703 (WiFi 配置)。
++    // 理由: 手机"忽略过网络"后必须重新走"配件下发配置 → iOS 自动加入"流程;
++    // 手动加入的网络 iOS 不当成 CarPlay 网络用, 4301 来了也不连 7000 (20:39 实测)。
++    // CARPLAY_AUTO_5703=0 可关。
++    let auto_5703 = std::env::var("CARPLAY_AUTO_5703").map(|v| v != "0").unwrap_or(true);
++    let mut wifi_cfg_sent = false;
++    let mut buf = [0u8; 8192];
+ 
+     // A blocking read with a timeout gives the shutdown/budget checks a chance to run periodically,
+     // matching the wired driver's non-blocking-read + WouldBlock-retry idiom without needing a
+@@ -134,9 +141,12 @@ pub fn run(mut sock: File, name: &str, shutdown: &AtomicBool) {
+                         if send_wifi_configuration(&mut link, &mut sock, &abort) {
+                             log("已主动推送 0x5703 WiFi 配置 (识别后 1.5 s)");
+                         }
+-                        last_start_send.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(false)
++                        wifi_cfg_sent = true;
+                     }
+-                    if auto_4301 && start_sends < 3 && due {
++                    let due = if start_sends == 0 {
++                        t0.elapsed() >= Duration::from_secs(3)
++                    } else {
++                        last_start_send.map(|t| t.elapsed() >= Duration::from_secs(3)).unwrap_or(false)
+                     };
+                     // K230 2026-11-01: 上限 3 次 → 120 次。真机证据: 手机收 0x5703 后才去连 AP,
+                     // 上线时刻常晚于 3 次 4301 发完的时刻 (19:02:19 发 5703, 手机 19:02:5x 才上线,
+diff --git a/rust/carplayd/crates/wireless/src/main.rs b/rust/carplayd/crates/wireless/src/main.rs
+index 3835db8..5516695 100644
+--- a/rust/carplayd/crates/wireless/src/main.rs
++++ b/rust/carplayd/crates/wireless/src/main.rs
+@@ -28,7 +28,7 @@ use std::time::Duration;
+ const HCI_DEV: &str = "hci0";
+ const CONTROLLER_INDEX: u16 = 0;
+ const RFCOMM_CHANNEL: u8 = 1; // matches the reference project's default CARPLAY_RFCOMM_CHAN
+-const ACCESSORY_NAME: &str = "CarLink"; // matches the wired path's existing identity (iap2/message.rs)
++const ACCESSORY_NAME: &str = "K230"; // 主人 2026-11-01: 原商用名 CarLink 疑似撞 iOS 对第三方 dongle 的特殊路由
+ const ARBITER_SOCK: &str = "/run/carplay/arbiter.sock";
+ 
+ fn log(m: &str) {
+diff --git a/rust/carplayd/src/iap2/driver.rs b/rust/carplayd/src/iap2/driver.rs
+index 867d836..9dfff12 100644
+--- a/rust/carplayd/src/iap2/driver.rs
++++ b/rust/carplayd/src/iap2/driver.rs
+@@ -347,7 +347,7 @@ fn execute(action: Action, link: &mut Link, ep2: &mut File, declare_wired: bool)
+             // interface (#1) that carries CarPlay A/V, NOT this iAP2 vendor interface (#0) — see
+             // gadget.rs's function-order note.
+             let ib = message::build_ident_info(
+-                "CarLink",
++                "K230",
+                 message::TransportComponent::Usb { cp_iface: 1 },
+                 declare_wired,
+             );
+@@ -363,7 +363,7 @@ fn execute(action: Action, link: &mut Link, ep2: &mut File, declare_wired: bool)
+             // The state machine has already advanced to State::IdentRetried, so a second 0x1D03 yields
+             // Action::Abort automatically — the retry fires at most once.
+             let ib = message::build_ident_info_excluding(
+-                "CarLink",
++                "K230",
+                 message::TransportComponent::Usb { cp_iface: 1 },
+                 declare_wired,
+                 &excluded,

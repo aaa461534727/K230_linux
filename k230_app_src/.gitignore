@@ -1,0 +1,8 @@
+# 构建产物 (make 时生成, 不入库)
+**/build/
+**/target/
+**/build-board/
+**/build-sim/
+**/*.o
+**/*.a
+**/.git/

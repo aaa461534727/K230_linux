@@ -1,0 +1,17 @@
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -2867,4 +2867,13 @@
+ 	u8 survey_times = 3;
+-	u8 survey_times_for_one_ch = 6;
++	/*
++	 * K230: 上游把"单信道扫描"重复 6 遍, 一次目标 BSSID 扫描要 0.90 s。
++	 * 起初以为这 0.9 s 是坏的, 压到 1 遍 (0.188 s) —— 结果反而更糟:
++	 * 手机 GO 刚发完 GO-Neg-Confirmation, beacon 已经在空口上, 但组内部还没就绪;
++	 * 这 0.19 s 内扫到就立刻发 AUTH, 手机全部静默丢弃 (2026-10-23 16:51 / 17:17 两轮实测:
++	 * 89 个 AUTH 0 ACK), 且之后十几秒都不再放行。
++	 * 唯一成功的 16:42 那轮, 恰好第一次扫空 (0 BSSes) -> 等 0.25 s 重扫 -> +0.66 s 才关联 -> 一次成。
++	 * 所以这里不再抢快, 留约 0.75 s 给手机 GO 起组, 首帧 AUTH 才落进它愿意应答的窗口。
++	 */
++	u8 survey_times_for_one_ch = 5;
+ 	struct cfg80211_ssid *ssids = request->ssids;
+ 	int social_channel = 0, j = 0;

@@ -1,0 +1,34 @@
+--- orig.c	2026-10-22 02:26:56.827943893 -0700
++++ patched.c	2026-10-22 02:26:53.027820723 -0700
+@@ -5050,9 +5050,31 @@
+ 	RTW_INFO(FUNC_NDEV_FMT"\n", FUNC_NDEV_ARG(ndev));
+ 
+ #ifdef CONFIG_P2P
++	/* K230 2026-10-22: ★ 真正生效的路径 ★
++	 * kernel >= 4.1 起, supplicant 的 "Set beacon" 走 NL80211_CMD_SET_BEACON
++	 * → ops->change_beacon (不是 ops->set_beacon!), 所以补丁必须放这里。
++	 *
++	 * 背景 (抓包实证): WPS PBC 起来后 supplicant 打出
++	 *   "WPS: Selected registrar information changed" + "nl80211: Set beacon (beacon_set=1)"
++	 * 它把带 Selected Registrar / DevPwId=PBC 的 WPS IE 放在 **beacon_ies /
++	 * proberesp_ies** (额外 IE), 而原逻辑只取 head/tail ⇒ 额外 IE 被丢弃 ⇒
++	 * 空口 beacon 永远只有 55 B 的老 WPS IE (无 0x1041/0x1012) ⇒ 任何 WPS
++	 * enrollee (MIUI 手机 / 海奇板) 都判 "AP without active PBC Registrar"
++	 * 而拒绝入组。这里补齐额外 IE, 并强制重发一次 beacon。 */
++	pr_info("K230P2P: change_beacon bies=%zu pries=%zu\n",
++		info->beacon_ies_len, info->proberesp_ies_len);
++	rtw_k230_p2p_apply_extra_ies(ndev, info->beacon_ies,
++				     info->beacon_ies_len, 0x1);
++	rtw_k230_p2p_apply_extra_ies(ndev, info->proberesp_ies,
++				     info->proberesp_ies_len, 0x2);
++#endif
+ 
+ 	ret = rtw_add_beacon(adapter, info->head, info->head_len, info->tail, info->tail_len);
+ 
++#ifdef CONFIG_P2P
++	_update_beacon(adapter, 0xFF, NULL, _TRUE, "k230 change_beacon refresh");
++#endif
++
+ 	return ret;
+ }
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,19, 2))

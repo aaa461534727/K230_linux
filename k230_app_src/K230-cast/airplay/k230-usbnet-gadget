@@ -1,0 +1,186 @@
+#!/bin/sh
+# k230-usbnet-gadget —— 把 Type-C(usb0) 从 "IDE 调试口" 切换成 "iPhone 有线网络配件口"
+#
+# 目的: 不走 iPhone「个人热点」也能投 AirPlay ——
+#   板子当 USB device, 呈现 **CDC-NCM 以太网** 功能, iPhone 当 host 认成一张网卡,
+#   自己给自己和板子配 169.254 / DHCP 链路, AirPlay 就跑在这条线上。
+#   (iOS 支持标准 CDC-NCM/ECM 以太网设备; 这也是"海奇插上就投"同类路数)
+#
+# ⚠ 安全铁律 (2026-11-02 三次挂内核换来的):
+#   1) 动 role / 动 UDC 之前, **usb0 总线上绝不能有已枚举的 iPhone**;
+#   2) 必须先把 gadget 的 UDC 解绑并确认, 才允许切角色;
+#   3) 本板 Type-C 是唯一原供电口 —— 切之前**必须**已用 40Pin(pin2/4=5V, pin6=GND) 供电,
+#      否则一拔就打回原形(板子掉电重启)。
+#
+# 用法:
+#   k230-usbnet-gadget on    呈现 NCM 配件 (iPhone 可经 Type-C 连上来)
+#   k230-usbnet-gadget off   还原 gadget g1 (adb + mtp, IDE 调试口)
+#   k230-usbnet-gadget stat  只读体检
+set -u
+
+G=/sys/kernel/config/usb_gadget
+UDC_NAME=91500000.usb
+USB0_BUS=1                 # usb0 = bus1
+G1="$G/g1"
+NG="$G/k230net"
+LOG="${USB_NET_LOG:-/var/log/k230-usbnet.log}"
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# usb0 总线上有没有已枚举的设备 (除 root hub) —— 有就不许动 role
+usb0_has_device() {
+    for d in /sys/bus/usb/devices/*/; do
+        [ -f "$d/busnum" ] || continue
+        [ "$(cat "$d/busnum" 2>/dev/null)" = "$USB0_BUS" ] || continue
+        # root hub 的 devpath 是 "0"
+        [ "$(basename "$d")" = "usb${USB0_BUS}" ] && continue
+        return 0
+    done
+    return 1
+}
+
+do_cleanup_ng() {
+    [ -d "$NG" ] || return 0
+    if [ -n "$(cat "$NG/UDC" 2>/dev/null)" ]; then
+        echo "" >"$NG/UDC" 2>/dev/null
+        sleep 1
+    fi
+    for l in "$NG"/configs/*/*; do [ -L "$l" ] && rm -f "$l"; done
+    rmdir "$NG"/configs/*/strings/* 2>/dev/null
+    rmdir "$NG"/configs/* 2>/dev/null
+    rmdir "$NG"/functions/* 2>/dev/null
+    rmdir "$NG"/strings/* 2>/dev/null
+    rmdir "$NG" 2>/dev/null
+}
+
+do_off() {
+    # 先停 DHCP (否则 iPhone 侧 DHCP 会打空)
+    if [ -f /run/k230-usb-dnsmasq.pid ]; then
+        kill "$(cat /run/k230-usb-dnsmasq.pid)" 2>/dev/null
+        rm -f /run/k230-usb-dnsmasq.pid
+        log "已停 usb0 上的 dnsmasq"
+    fi
+    ip addr flush dev usb0 2>/dev/null
+    ip link set usb0 down 2>/dev/null
+    do_cleanup_ng && log "已移除 k230net gadget"
+    if [ -d "$G1" ] && [ -z "$(cat "$G1/UDC" 2>/dev/null)" ]; then
+        echo "$UDC_NAME" >"$G1/UDC" 2>/dev/null \
+            && log "g1 (adb+mtp) 已重新绑定 UDC" \
+            || log "⚠ g1 绑定失败 (adbd/mtpd 未就绪, 不影响投屏)"
+    fi
+}
+
+do_on() {
+    if usb0_has_device; then
+        log "✗ usb0(bus$USB0_BUS) 上还有已枚举设备 —— 绝不在这时候动 gadget/role, 先拔掉"
+        return 1
+    fi
+
+    modprobe libcomposite 2>/dev/null
+    modprobe usb_f_ncm 2>/dev/null || { log "✗ usb_f_ncm 加载失败"; return 1; }
+
+    # 1) 解绑 g1 并**确认**
+    if [ -n "$(cat "$G1/UDC" 2>/dev/null)" ]; then
+        echo "" >"$G1/UDC" 2>/dev/null
+        sleep 1
+        log "g1 UDC 已解绑"
+    fi
+
+    # 2) 清掉任何残留的 k230net
+    do_cleanup_ng
+
+    # 3) 建 NCM 配件 gadget
+    mkdir -p "$NG" && cd "$NG" || return 1
+    echo 0x1d6b > idVendor
+    echo 0x0104 > idProduct
+    echo 0x0200 > bcdUSB
+    echo 0xef   > bDeviceClass
+    echo 0x02   > bDeviceSubClass
+    echo 0x01   > bDeviceProtocol
+    mkdir -p strings/0x409
+    echo "K230USBETH0001" > strings/0x409/serialnumber
+    echo "Canaan"          > strings/0x409/manufacturer
+    echo "K230 Ethernet"   > strings/0x409/product
+    mkdir -p configs/c.1/strings/0x409
+    echo "NCM" > configs/c.1/strings/0x409/configuration
+    echo 250  > configs/c.1/MaxPower
+    mkdir -p functions/ncm.0
+    ln -sf functions/ncm.0 configs/c.1/
+
+    # 4) 绑 UDC
+    echo "$UDC_NAME" >UDC 2>/tmp/k230net_bind.err \
+        && log "✅ k230net (NCM) 已绑定 $UDC_NAME" \
+        || { log "✗ 绑定失败: $(cat /tmp/k230net_bind.err 2>/dev/null)"; return 1; }
+
+    sleep 2
+    log "UDC state = $(cat /sys/class/udc/$UDC_NAME/state 2>/dev/null)"
+    do_dhcp
+    ip -br addr | grep -E "usb|enx" || true
+}
+
+# 有线链路的 IP 层: 板子当 DHCP 服务器, iPhone(host 侧) 当客户端
+#   iOS 把 USB-NCM 配件看成一张以太网卡, 行为跟"USB-C 转网口"一样 —— 它是 DHCP 客户端,
+#   所以要**我们**发地址。用独立网段 192.168.66.0/24, 与 iPhone 热点(172.20.10.x)、
+#   共享 AP(192.168.50.x) 都不冲突。
+do_dhcp() {
+    UIF=usb0
+    UADDR=192.168.66.1/24
+    CONF=/run/k230-usb-dnsmasq.conf
+    PIDF=/run/k230-usb-dnsmasq.pid
+
+    ip link set "$UIF" up 2>/dev/null
+    ip addr replace "$UADDR" dev "$UIF" 2>/dev/null || { log "✗ 给 $UIF 配 $UADDR 失败"; return 1; }
+
+    if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+        log "dnsmasq 已在跑 (pid $(cat "$PIDF")), 跳过"
+        return 0
+    fi
+
+    cat >"$CONF" <<EOF
+interface=$UIF
+bind-dynamic
+except-interface=lo
+dhcp-range=192.168.66.10,192.168.66.40,255.255.255.0,12h
+dhcp-option=3,192.168.66.1
+dhcp-option=6,192.168.66.1
+# 2026-11-03: iOS 在 DHCPDISCOVER 里**明确要** option 121 (classless static route)。
+# 只给 option 3 时 iOS 拿完地址就把接口判成"无路由可用"从此静默 (现场: DHCPACK 后
+# RX 计数一动不动, ping/ARP 全 FAIL)。这里补上默认路由 + domain-name。
+dhcp-option=121,0.0.0.0/0,192.168.66.1
+dhcp-option=15,k230.lan
+dhcp-authoritative
+log-dhcp
+EOF
+
+    dnsmasq -C "$CONF" -x "$PIDF" --log-facility=/var/log/k230-usb-dnsmasq.log 2>&1
+    sleep 1
+    if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+        log "✅ dnsmasq 起在 $UIF ($UADDR, 池 192.168.66.10-40)"
+    else
+        log "⚠ dnsmasq 启动失败, 见 /var/log/k230-usb-dnsmasq.log"
+    fi
+}
+
+do_stat() {
+    echo "=== usb_role ==="
+    for f in /sys/class/usb_role/*/role; do echo "  $(dirname $f | xargs basename) = $(cat $f)"; done 2>/dev/null
+    echo "=== UDC ==="
+    for u in /sys/class/udc/*/; do echo "  $(basename $u) = $(cat $u/state 2>/dev/null)"; done
+    echo "=== gadget ==="
+    for g in "$G"/*/; do
+        [ -d "$g" ] || continue
+        echo "  $(basename $g): UDC=$(cat "$g/UDC" 2>/dev/null) funcs=$(ls "$g/functions" 2>/dev/null | tr '\n' ' ')"
+    done
+    echo "=== usb0 总线设备 ==="
+    usb0_has_device && echo "  有设备(禁止切换)" || echo "  空(可安全切换)"
+    echo "=== 网口 ==="
+    ip -br addr
+}
+
+case "${1:-stat}" in
+    on)   do_on ;;
+    dhcp) do_dhcp ;;
+    off)  do_off ;;
+    stat) do_stat ;;
+    *)    echo "用法: $0 on|off|stat" >&2; exit 2 ;;
+esac

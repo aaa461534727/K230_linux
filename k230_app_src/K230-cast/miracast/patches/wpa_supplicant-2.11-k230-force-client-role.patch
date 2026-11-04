@@ -1,0 +1,48 @@
+--- a/src/p2p/p2p_go_neg.c
++++ b/src/p2p/p2p_go_neg.c
+@@ -21,6 +21,27 @@
+ static int p2p_go_det(u8 own_intent, u8 peer_value)
+ {
+ 	u8 peer_intent = peer_value >> 1;
++
++	/*
++	 * K230P2P (2026-10-28): 明确拒绝当 GO。
++	 *
++	 * Why: 我们配的是 p2p_go_intent=0, 对端 (安卓) 也发 Intent 0。双方 intent
++	 * 相等时上游只能靠 tie-breaker 位裁决: p2p_go_det(0, peer) 返回
++	 * (peer_tie ? 0 : 1), 而 peer 的 tie 位是它每次协商随机生成的 ⇒ 同一个
++	 * 手机重连十次, 我们大约一半会被判成 GO。当 GO 就必然失败: 安卓 WFD
++	 * source 必须自己是 GO, 它发现被判为 client 后直接放弃, 15 s 后
++	 * P2P-GROUP-FORMATION-FAILURE (现场实测 2026-10-28 14:03:14,
++	 * "GO Intent: Intent 0 Tie breaker 0" → role=GO → formation failed)。
++	 *
++	 * 这是"时好时坏连不上"的真正根因 (与持久组无关; 持久组那处已单独修掉)。
++	 *
++	 * 改法: go_intent 0 一律判 client, 不看 tie 位; 配合下面 GO-Neg-Resp
++	 * 把 tie 位恒回 0, 对端按 p2p_go_det(0, 0x00)=1 判自己为 GO, 双方结论
++	 * 一致 (手机 GO / 我们 client), 与 13:56 那次能连上的组合完全相同。
++	 */
++	if (own_intent == 0)
++		return 0;
++
+ 	if (own_intent == peer_intent) {
+ 		if (own_intent == P2P_MAX_GO_INTENT)
+ 			return -1; /* both devices want to become GO */
+@@ -1174,8 +1195,15 @@
+ fail:
+ 	if (dev)
+ 		dev->status = status;
+-	resp = p2p_build_go_neg_resp(p2p, dev, msg.dialog_token, status,
+-				     !tie_breaker);
++	/*
++	 * K230P2P (2026-10-28): tie-breaker 位恒回 0。
++	 * 对端用"我们回的这个位"判它自己是 GO: p2p_go_det(0, 0x00) = 1。
++	 * 上游原本回 !tie_breaker, 会把裁定权交给对端的随机位, 见上面 p2p_go_det
++	 * 的说明。
++	 */
++	p2p_dbg(p2p, "K230P2P: peer tie-breaker=%d, reply tie-breaker=0 (force peer=GO)",
++		tie_breaker);
++	resp = p2p_build_go_neg_resp(p2p, dev, msg.dialog_token, status, 0);
+ 	p2p_parse_free(&msg);
+ 	if (resp == NULL)
+ 		return;

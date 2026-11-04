@@ -1,0 +1,239 @@
+diff --git a/rust/carplayd/crates/wireless/Cargo.toml b/rust/carplayd/crates/wireless/Cargo.toml
+index c97a76f..9ab68f0 100644
+--- a/rust/carplayd/crates/wireless/Cargo.toml
++++ b/rust/carplayd/crates/wireless/Cargo.toml
+@@ -15,3 +15,5 @@ env_logger = "0.11"
+ signal-hook = "0.3"
+ carplay-iap2-core = { path = "../iap2-core" }
+ carplay-metadata = { path = "../metadata" }
++x25519-dalek = { version = "2", features = ["static_secrets"] }
++rand_core = { version = "0.6", features = ["getrandom"] }
+diff --git a/rust/carplayd/crates/wireless/src/bt_driver.rs b/rust/carplayd/crates/wireless/src/bt_driver.rs
+index 4a8ac3e..df1adbf 100644
+--- a/rust/carplayd/crates/wireless/src/bt_driver.rs
++++ b/rust/carplayd/crates/wireless/src/bt_driver.rs
+@@ -71,6 +71,11 @@ pub fn run(mut sock: File, name: &str, shutdown: &AtomicBool) {
+     let mut st = State::Init;
+     let budget = Duration::from_secs(120); // pre-Identify handshake budget, matching the wired driver
+     let start = Instant::now();
++    // K230 PATCH (0005): 识别完成后 3 s 主动发 0x4301 (真机实测 iOS 在这条路上不会发 0x4300)。
++    // CARPLAY_AUTO_4301=0 可关掉, 退回"只等 0x4300"的 PlayPort 原生行为。
++    let auto_4301 = std::env::var("CARPLAY_AUTO_4301").map(|v| v != "0").unwrap_or(true);
++    let mut identified_at: Option<Instant> = None;
++    let mut start_sent = false;
+     let mut last_syn = Instant::now();
+     let mut buf = [0u8; 8192];
+ 
+@@ -114,6 +119,17 @@ pub fn run(mut sock: File, name: &str, shutdown: &AtomicBool) {
+                     let _ = write_interruptible(&mut sock, &syn, &abort);
+                     last_syn = Instant::now();
+                 }
++                if st >= State::Identified && identified_at.is_none() {
++                    identified_at = Some(Instant::now());
++                }
++                if let Some(t0) = identified_at {
++                    if auto_4301 && !start_sent && t0.elapsed() >= Duration::from_secs(3) {
++                        start_sent = send_carplay_start(&mut link, &mut sock, &abort);
++                        if start_sent {
++                            log("已主动发起 0x4301 (识别后 3 s, 不等 0x4300)");
++                        }
++                    }
++                }
+             }
+             Err(e) => {
+                 log(&format!("read error: {e}"));
+@@ -153,6 +169,38 @@ fn process(
+         return true;
+     }
+ 
++    // K230 PATCH (0003): 无线交接第一步 —— 手机发 0x5702 问"你的 AP 叫什么", 我们回 0x5703。
++    // PlayPort (Iap2WirelessControlClient) 就是这么配的; 它只在该报文到达时才回, 不主动发。
++    // 手机主动说"我可以上 CarPlay 了" —— 按 PlayPort 规则立刻回 0x4301 (9 组)
++    if msg_id == spec::MSG_CAR_PLAY_AVAILABILITY {
++        log("RX 0x4300 CarPlayAvailability -> 回 0x4301");
++        return !send_carplay_start(link, sock, abort);
++    }
++
++    if msg_id == spec::MSG_REQUEST_ACCESSORY_WI_FI_CONFIGURATION_INFORMATION {
++        log("RX 0x5702 RequestAccessoryWiFiConfigurationInformation -> 回 0x5703");
++        return !send_wifi_configuration(link, sock, abort);
++    }
++
++    // K230 PATCH (0004): 真机实测 iOS **不发 0x5702**, 而是发 0x4E0E DeviceTransportIdentifierNotification
++    // (带上手机的 BT MAC + USB transport id), 按 PlayPort 的规则这时要**重发 0x5703** (上限 2 次)。
++    // 这就是"手机已经把传输层交给配件了, 现在把你的 AP 告诉我"的信号。
++    if msg_id == spec::MSG_DEVICE_TRANSPORT_IDENTIFIER_NOTIFICATION {
++        use std::sync::atomic::AtomicU8;
++        static POST_TRANSPORT_SENT: AtomicU8 = AtomicU8::new(0);
++        let n = POST_TRANSPORT_SENT.fetch_add(1, Ordering::Relaxed);
++        log(&format!(
++            "RX 0x4E0E DeviceTransportIdentifierNotification (body {} B) -> 重发 0x5703 [{}]",
++            rx.payload.len().saturating_sub(6),
++            n + 1
++        ));
++        if n >= 2 {
++            log("0x4E0E 触发的 0x5703 已达上限 (2 次, PlayPort MAX_POST_TRANSPORT_WIFI_CONFIGURATION_SENDS)");
++            return false;
++        }
++        return !send_wifi_configuration(link, sock, abort);
++    }
++
+     // The set of post-Identify messages we expect from the device (all `Source::Device` in Apple's
+     // catalog): NowPlayingUpdate, RouteGuidanceUpdate, RouteGuidanceManeuverInformation,
+     // AuthenticationSucceeded, IdentificationAccepted, CarPlayAvailability. Anything else is logged.
+@@ -193,6 +241,155 @@ enum ExecResult {
+ 
+ /// Execute a state-machine action. Mirrors `driver.rs::execute`, minus the USB-only call-control
+ /// integration and metadata-server forwarding (out of scope for Phase A2 -- see docs/22).
++/// 0x5703 AccessoryWiFiConfigurationInformation —— 把本机 AP 的名字/密码/信道/加密方式交给手机。
++///
++/// 参数来自环境变量 (systemd 单元里配), 默认值与板上 `carlife-ap.sh` 的 AP 保持一致,
++/// 因为手机必须能真的连上这个 AP, 名字对不上就前功尽弃:
++///   CARPLAY_AP_SSID     默认 "K230-CARPLAY"
++///   CARPLAY_AP_PASS     默认 "k230carplay"
++///   CARPLAY_AP_CHANNEL  默认 6
++fn send_wifi_configuration(link: &mut Link, sock: &mut File, abort: &dyn Fn() -> bool) -> bool {
++    let env = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
++    let ssid = env("CARPLAY_AP_SSID", "K230-CARPLAY");
++    let pass = env("CARPLAY_AP_PASS", "k230carplay");
++    let channel: u8 = std::env::var("CARPLAY_AP_CHANNEL")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(6);
++
++    let cfg = crate::wifi_handoff::AccessoryWiFiConfig {
++        ssid: ssid.clone(),
++        passphrase: Some(pass),
++        // 2 = WPA2 Personal (板上 hostapd 用 wpa=2)
++        security_type: Some(crate::wifi_handoff::AccessoryWiFiSecurityType::Wpa2OrWpa3Personal),
++        channel: Some(channel),
++    };
++    let body = crate::wifi_handoff::build_accessory_wifi_configuration_information(&cfg);
++    let ok = write_interruptible(
++        sock,
++        &link.build_msg(1, spec::MSG_ACCESSORY_WI_FI_CONFIGURATION_INFORMATION, &body),
++        abort,
++    );
++    log(&format!(
++        "TX 0x5703 AccessoryWiFiConfigurationInformation (ssid={ssid} ch={channel}, {} B){}",
++        body.len(),
++        if ok { "" } else { " -- 写失败" }
++    ));
++    ok
++}
++
++/// 0x4301 CarPlayStartSession —— 让手机真正起 CarPlay 会话。
++///
++/// 参数布局逐条对齐 PlayPort `Iap2CarPlayMessages.startSession` (Kotlin):
++///   group 1 (wireless): 0=SSID(str) 1=passphrase(str) 2=channel(u8) 3=IP[](str) 4=securityType(u8)
++///   field 2: airPlayPort (u32 = 7000)
++///   field 3: deviceIdentifier (str, 本机 BT MAC)
++///   field 4: publicKey (str, **Curve25519 公钥的 64 字符 hex**, 不是 32 字节二进制)
++///   field 5: sourceVersion (str "366.0")
++///   field 6: sdkVersion (str)
++///   group 7: clusterAsset {0=assetId(str) 1=assetVersion(u32)}
++///   field 8: mutualAuth (u8 0/1)
++fn send_carplay_start(link: &mut Link, sock: &mut File, abort: &dyn Fn() -> bool) -> bool {
++    let env = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
++    let ssid = env("CARPLAY_AP_SSID", "K230-CARPLAY");
++    let pass = env("CARPLAY_AP_PASS", "k230carplay");
++    let channel: u8 = std::env::var("CARPLAY_AP_CHANNEL").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
++    let ip = env("CARPLAY_AP_IP", "192.168.50.1");
++    let port: u32 = std::env::var("CARPLAY_AIRPLAY_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(7000);
++
++    let dev_id = format!(
++        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
++        ACCESSORY_BT_MAC[0], ACCESSORY_BT_MAC[1], ACCESSORY_BT_MAC[2],
++        ACCESSORY_BT_MAC[3], ACCESSORY_BT_MAC[4], ACCESSORY_BT_MAC[5]
++    );
++    let pubkey = match airplay_public_key_hex() {
++        Some(k) => k,
++        None => {
++            log("✗ 生成/读取 AirPlay 长钥失败, 不发 0x4301");
++            return false;
++        }
++    };
++
++    // group 1 (wireless)
++    let g1_inner = {
++        let mut g = message::Tlv::new();
++        g.str(0, &ssid);
++        g.str(1, &pass);
++        g.u8v(2, channel);
++        g.str(3, &ip);
++        g.u8v(4, 2); // WPA2 Personal
++        g.0
++    };
++    let mut body: Vec<u8> = wrap_group(1, g1_inner);
++
++    let mut f = message::Tlv::new();
++    f.u32v(2, port);
++    f.str(3, &dev_id);
++    f.str(4, &pubkey);
++    f.str(5, &env("CARPLAY_SOURCE_VERSION", "366.0"));
++    f.str(6, &env("CARPLAY_SDK_VERSION", "366.0"));
++    body.extend_from_slice(&f.0);
++
++    let ca_inner = {
++        let mut g = message::Tlv::new();
++        g.str(0, "com.apple.carplay.asset");
++        g.u32v(1, 1);
++        g.0
++    };
++    body.extend_from_slice(&wrap_group(7, ca_inner));
++
++    let mut m = message::Tlv::new();
++    m.u8v(8, 1); // mutualAuth
++    body.extend_from_slice(&m.0);
++
++    let ok = write_interruptible(sock, &link.build_msg(1, spec::MSG_CAR_PLAY_START_SESSION, &body), abort);
++    log(&format!(
++        "TX 0x4301 CarPlayStartSession ({} B) ssid={ssid} ch={channel} ip={ip} port={port} dev={dev_id} pubkey={}…",
++        body.len(),
++        &pubkey[..16.min(pubkey.len())]
++    ));
++    ok
++}
++
++/// TLV 组: [len BE16][pid BE16][子 TLV...], len 含 4 字节头 (与 PlayPort 的 group() 同构)。
++fn wrap_group(pid: u16, inner: Vec<u8>) -> Vec<u8> {
++    let mut v = Vec::with_capacity(inner.len() + 4);
++    v.extend_from_slice(&((4 + inner.len()) as u16).to_be_bytes());
++    v.extend_from_slice(&pid.to_be_bytes());
++    v.extend_from_slice(&inner);
++    v
++}
++
++/// AirPlay 长钥 (Curve25519)。持久化在 /etc/carplay/airplay.key, 首次自动生成 —— 换钥会导致
++/// 已配对手机重配, 所以必须落盘而不是每次随机。
++fn airplay_public_key_hex() -> Option<String> {
++    use rand_core::OsRng;
++    use x25519_dalek::{PublicKey, StaticSecret};
++
++    let path = std::env::var("CARPLAY_AIRPLAY_KEY").unwrap_or_else(|_| "/etc/carplay/airplay.key".into());
++    let secret = match std::fs::read(&path) {
++        Ok(b) if b.len() == 32 => {
++            let mut a = [0u8; 32];
++            a.copy_from_slice(&b);
++            StaticSecret::from(a)
++        }
++        _ => {
++            let s = StaticSecret::random_from_rng(OsRng);
++            if let Some(dir) = std::path::Path::new(&path).parent() {
++                let _ = std::fs::create_dir_all(dir);
++            }
++            if std::fs::write(&path, s.to_bytes()).is_err() {
++                log(&format!("⚠ 无法写 {path}, 长钥只在本次进程内有效"));
++            } else {
++                log(&format!("生成长钥并落盘: {path}"));
++            }
++            s
++        }
++    };
++    let pk = PublicKey::from(&secret);
++    Some(pk.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
++}
++
+ fn execute(
+     action: Action,
+     link: &mut Link,

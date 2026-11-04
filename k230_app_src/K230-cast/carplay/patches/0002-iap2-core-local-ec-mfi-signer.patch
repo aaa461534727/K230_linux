@@ -1,0 +1,580 @@
+diff --git a/rust/carplayd/Cargo.lock b/rust/carplayd/Cargo.lock
+index 39efa4b..bd6a7b8 100644
+--- a/rust/carplayd/Cargo.lock
++++ b/rust/carplayd/Cargo.lock
+@@ -210,6 +210,18 @@ version = "1.5.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+ 
++[[package]]
++name = "base16ct"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
++
++[[package]]
++name = "base64ct"
++version = "1.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
++
+ [[package]]
+ name = "bitflags"
+ version = "1.3.2"
+@@ -222,6 +234,15 @@ version = "2.13.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+ 
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
+ [[package]]
+ name = "block2"
+ version = "0.6.2"
+@@ -310,6 +331,7 @@ name = "carplay-iap2-core"
+ version = "0.1.0"
+ dependencies = [
+  "carplay-metadata",
++ "p256",
+ ]
+ 
+ [[package]]
+@@ -422,6 +444,12 @@ dependencies = [
+  "crossbeam-utils",
+ ]
+ 
++[[package]]
++name = "const-oid"
++version = "0.9.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
++
+ [[package]]
+ name = "core-foundation"
+ version = "0.9.4"
+@@ -438,12 +466,43 @@ version = "0.8.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+ 
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
+ [[package]]
+ name = "crossbeam-utils"
+ version = "0.8.22"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+ 
++[[package]]
++name = "crypto-bigint"
++version = "0.5.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
++dependencies = [
++ "generic-array",
++ "rand_core",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "crypto-common"
++version = "0.1.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bfb12502f3fc46cca1bb51ac28df9d618d813cdc3d2f25b9fe775a34af26bb3"
++dependencies = [
++ "generic-array",
++ "typenum",
++]
++
+ [[package]]
+ name = "defmt"
+ version = "1.1.1"
+@@ -475,12 +534,34 @@ dependencies = [
+  "thiserror",
+ ]
+ 
++[[package]]
++name = "der"
++version = "0.7.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
++dependencies = [
++ "const-oid",
++ "zeroize",
++]
++
+ [[package]]
+ name = "deranged"
+ version = "0.5.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+ 
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer",
++ "const-oid",
++ "crypto-common",
++ "subtle",
++]
++
+ [[package]]
+ name = "dispatch2"
+ version = "0.3.1"
+@@ -491,12 +572,45 @@ dependencies = [
+  "objc2",
+ ]
+ 
++[[package]]
++name = "ecdsa"
++version = "0.16.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
++dependencies = [
++ "der",
++ "digest",
++ "elliptic-curve",
++ "rfc6979",
++ "signature",
++ "spki",
++]
++
+ [[package]]
+ name = "either"
+ version = "1.16.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+ 
++[[package]]
++name = "elliptic-curve"
++version = "0.13.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
++dependencies = [
++ "base16ct",
++ "crypto-bigint",
++ "digest",
++ "ff",
++ "generic-array",
++ "group",
++ "pkcs8",
++ "rand_core",
++ "sec1",
++ "subtle",
++ "zeroize",
++]
++
+ [[package]]
+ name = "endi"
+ version = "1.1.1"
+@@ -590,6 +704,16 @@ version = "2.4.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+ 
++[[package]]
++name = "ff"
++version = "0.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
++dependencies = [
++ "rand_core",
++ "subtle",
++]
++
+ [[package]]
+ name = "field-offset"
+ version = "0.3.6"
+@@ -744,6 +868,28 @@ dependencies = [
+  "system-deps",
+ ]
+ 
++[[package]]
++name = "generic-array"
++version = "0.14.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4bb6743198531e02858aeaea5398fcc883e71851fcbcb5a2f773e2fb6cb1edf2"
++dependencies = [
++ "typenum",
++ "version_check",
++ "zeroize",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "wasi",
++]
++
+ [[package]]
+ name = "getrandom"
+ version = "0.4.3"
+@@ -863,6 +1009,17 @@ dependencies = [
+  "system-deps",
+ ]
+ 
++[[package]]
++name = "group"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
++dependencies = [
++ "ff",
++ "rand_core",
++ "subtle",
++]
++
+ [[package]]
+ name = "gsk4"
+ version = "0.9.6"
+@@ -1123,6 +1280,15 @@ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+ 
++[[package]]
++name = "hmac"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
++dependencies = [
++ "digest",
++]
++
+ [[package]]
+ name = "indexmap"
+ version = "2.14.0"
+@@ -1429,6 +1595,18 @@ dependencies = [
+  "pin-project-lite",
+ ]
+ 
++[[package]]
++name = "p256"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
++dependencies = [
++ "ecdsa",
++ "elliptic-curve",
++ "primeorder",
++ "sha2",
++]
++
+ [[package]]
+ name = "pango"
+ version = "0.20.12"
+@@ -1488,6 +1666,16 @@ dependencies = [
+  "futures-io",
+ ]
+ 
++[[package]]
++name = "pkcs8"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
++dependencies = [
++ "der",
++ "spki",
++]
++
+ [[package]]
+ name = "pkg-config"
+ version = "0.3.33"
+@@ -1529,6 +1717,15 @@ version = "0.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
+ 
++[[package]]
++name = "primeorder"
++version = "0.13.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
++dependencies = [
++ "elliptic-curve",
++]
++
+ [[package]]
+ name = "proc-macro-crate"
+ version = "3.5.0"
+@@ -1562,6 +1759,15 @@ version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+ 
++[[package]]
++name = "rand_core"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++dependencies = [
++ "getrandom 0.2.17",
++]
++
+ [[package]]
+ name = "regex"
+ version = "1.12.4"
+@@ -1591,6 +1797,16 @@ version = "0.8.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+ 
++[[package]]
++name = "rfc6979"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
++dependencies = [
++ "hmac",
++ "subtle",
++]
++
+ [[package]]
+ name = "rustc_version"
+ version = "0.4.1"
+@@ -1632,6 +1848,20 @@ version = "1.0.23"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+ 
++[[package]]
++name = "sec1"
++version = "0.7.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
++dependencies = [
++ "base16ct",
++ "der",
++ "generic-array",
++ "pkcs8",
++ "subtle",
++ "zeroize",
++]
++
+ [[package]]
+ name = "semver"
+ version = "1.0.28"
+@@ -1701,6 +1931,17 @@ dependencies = [
+  "serde_core",
+ ]
+ 
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
++]
++
+ [[package]]
+ name = "shlex"
+ version = "2.0.1"
+@@ -1727,6 +1968,16 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "signature"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
++dependencies = [
++ "digest",
++ "rand_core",
++]
++
+ [[package]]
+ name = "slab"
+ version = "0.4.12"
+@@ -1749,6 +2000,22 @@ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "spki"
++version = "0.7.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
++dependencies = [
++ "base64ct",
++ "der",
++]
++
++[[package]]
++name = "subtle"
++version = "2.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
++
+ [[package]]
+ name = "syn"
+ version = "2.0.118"
+@@ -1797,7 +2064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+ dependencies = [
+  "fastrand",
+- "getrandom",
++ "getrandom 0.4.3",
+  "once_cell",
+  "rustix 1.1.4",
+  "windows-sys 0.61.2",
+@@ -1952,6 +2219,12 @@ dependencies = [
+  "once_cell",
+ ]
+ 
++[[package]]
++name = "typenum"
++version = "1.20.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
++
+ [[package]]
+ name = "uds_windows"
+ version = "1.2.1"
+@@ -1981,7 +2254,7 @@ version = "1.23.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+ dependencies = [
+- "getrandom",
++ "getrandom 0.4.3",
+  "js-sys",
+  "serde_core",
+  "wasm-bindgen",
+@@ -1993,6 +2266,12 @@ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
+ 
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
+ [[package]]
+ name = "wasi"
+ version = "0.11.1+wasi-snapshot-preview1"
+@@ -2389,6 +2668,12 @@ dependencies = [
+  "zvariant",
+ ]
+ 
++[[package]]
++name = "zeroize"
++version = "1.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
++
+ [[package]]
+ name = "zmij"
+ version = "1.0.21"
+diff --git a/rust/carplayd/crates/iap2-core/Cargo.toml b/rust/carplayd/crates/iap2-core/Cargo.toml
+index 620fd67..3923bd3 100644
+--- a/rust/carplayd/crates/iap2-core/Cargo.toml
++++ b/rust/carplayd/crates/iap2-core/Cargo.toml
+@@ -6,3 +6,4 @@ description = "Transport-agnostic iAP2 protocol core (link framing, auth/identif
+ 
+ [dependencies]
+ carplay-metadata = { path = "../metadata" }
++p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+diff --git a/rust/carplayd/crates/iap2-core/src/mfi.rs b/rust/carplayd/crates/iap2-core/src/mfi.rs
+index ab8622b..17a236a 100644
+--- a/rust/carplayd/crates/iap2-core/src/mfi.rs
++++ b/rust/carplayd/crates/iap2-core/src/mfi.rs
+@@ -51,15 +51,80 @@ pub fn oracle_ready() -> bool {
+ }
+ 
+ /// Fetch the accessory certificate (op `0x01`), retrying through transient chip failures.
++///
++/// K230 PATCH (0002): 先试**本地离线身份** (`CARPLAY_MFI_DIR` 或 `/etc/carplay/mfi`), 没有才回落 oracle。
+ pub fn cert() -> Option<Vec<u8>> {
++    if let Some(dir) = local::dir() {
++        match std::fs::read(dir.join(local::CERT_FILE)) {
++            Ok(c) => {
++                eprintln!("[mfi] 本地身份: 证书 {} B ({})", c.len(), dir.display());
++                return Some(c);
++            }
++            Err(e) => eprintln!("[mfi] 本地证书不可读 ({}): 回落 oracle", e),
++        }
++    }
+     retry(|| request(0x01, &[]))
+ }
+ 
+ /// Sign a challenge digest (op `0x02`), retrying through transient chip failures.
++///
++/// K230 PATCH (0002): 本地身份走 ECDSA P-256 (**NONEwithECDSA 语义**: 传进来的就是摘要, 不再哈希),
++/// 输出 **64 B 原始 r‖s**, 与 PlayPort `LocalMfiAuthenticationClient.signChallenge` 逐字节一致;
++/// 上游 oracle 假设的是 RSA-1024 的 128 B, 两者长度不同 —— iOS 按证书类型自行判断, 不用改报文结构。
+ pub fn sign(challenge: &[u8]) -> Option<Vec<u8>> {
++    if let Some(dir) = local::dir() {
++        match local::sign(&dir, challenge) {
++            Some(sig) => return Some(sig),
++            None => eprintln!("[mfi] 本地签名失败: 回落 oracle"),
++        }
++    }
+     retry(|| request(0x02, challenge))
+ }
+ 
++/// 本地离线 MFi 身份 (EC P-256 / PKCS#8)。
++///
++/// 与 PlayPort `LocalMfiAuthenticationClient` (Kotlin) 的三条硬性一致:
++///   · 证书 = `certificate.p7b` **整个 PKCS#7 DER 原样**返回 (不是抽出来的 X.509) —— PlayPort 的
++///     `readCertificate()` 就是 `certificate.copyOf()`;
++///   · 签名 = `Signature.getInstance("NONEwithECDSA")` 对**已给的摘要**签名, 不做二次哈希;
++///   · 输出 = DER 转 **raw r‖s (64 B)**, 不是 DER。
++mod local {
++    use p256::ecdsa::signature::hazmat::PrehashSigner;
++    use p256::ecdsa::{Signature, SigningKey};
++    use p256::pkcs8::DecodePrivateKey;
++    use std::path::{Path, PathBuf};
++
++    pub const DIR_ENV: &str = "CARPLAY_MFI_DIR";
++    pub const DEFAULT_DIR: &str = "/etc/carplay/mfi";
++    pub const CERT_FILE: &str = "certificate.p7b";
++    pub const KEY_FILE: &str = "identity.pk8";
++
++    /// 目录存在且两个文件都在才算"配置了本地身份"; 否则返回 None 让调用方回落 oracle。
++    pub fn dir() -> Option<PathBuf> {
++        let d = std::env::var_os(DIR_ENV)
++            .map(PathBuf::from)
++            .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
++        if d.join(CERT_FILE).is_file() && d.join(KEY_FILE).is_file() {
++            Some(d)
++        } else {
++            None
++        }
++    }
++
++    pub fn sign(dir: &Path, digest: &[u8]) -> Option<Vec<u8>> {
++        if digest.len() != 32 {
++            // PlayPort: require(challenge.size == 32) { "Local MFi v3 expects a 32-byte digest" }
++            eprintln!("[mfi] 挑战长度 {} ≠ 32 (本地身份只支持 32 B 摘要)", digest.len());
++            return None;
++        }
++        let der = std::fs::read(dir.join(KEY_FILE)).ok()?;
++        let key = SigningKey::from_pkcs8_der(&der).ok()?;
++        // PrehashSigner = NONEwithECDSA: 输入即摘要, 内部不再做 SHA-256
++        let sig: Signature = key.sign_prehash(digest).ok()?;
++        Some(sig.to_bytes().to_vec())
++    }
++}
++
+ fn retry(mut f: impl FnMut() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+     for _ in 0..RETRIES {
+         if let Some(v) = f() {

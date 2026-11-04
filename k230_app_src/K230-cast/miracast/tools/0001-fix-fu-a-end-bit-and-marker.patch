@@ -1,0 +1,39 @@
+--- a/src/wfd_rtp_video.c
++++ b/src/wfd_rtp_video.c
+@@ -111,9 +111,16 @@
+     int off = 1;  /* 跳过 NAL 头（FU indicator+header 代替） */
+     int nalu_type = nal[0] & 0x1F;
+ 
++    /* 每包最大可携带的 FU-A 载荷 */
++    const int max_payload = WFD_RTP_MTU + 64 - RTP_HDR_LEN - 2;
++
+     while (off < nal_len) {
+         int chunk = nal_len - off;
+         int first = (off == 1);
++        /* 先按上限截断, 再判是否最后一片 —— 否则 off+chunk 恒等于 nal_len,
++         * E 位会在每一片上都置位, 收端把每片都当成完整 NAL (流必坏)。 */
++        if (chunk > max_payload)
++            chunk = max_payload;
+         int last = (off + chunk >= nal_len);
+         int is_last_pkt = last;
+ 
+@@ -121,9 +128,6 @@
+         rtp_header_t *hdr = (rtp_header_t *)pkt;
+ 
+         int pkt_len = RTP_HDR_LEN + 2 + chunk;
+-        if (pkt_len > (int)sizeof(pkt))
+-            pkt_len = (int)sizeof(pkt);
+-        chunk = pkt_len - RTP_HDR_LEN - 2;
+ 
+         hdr->v_p_x_cc = 0x80;
+         hdr->m_pt = (uint8_t)(((marker && is_last_pkt) ? 0x80 : 0) | WFD_RTP_PT_VIDEO);
+@@ -185,7 +189,8 @@
+     const uint8_t *end = es + es_len;
+     const uint8_t *nal_start = NULL;
+     int nal_len = 0;
+-    int marker = 0;
++    /* RFC 6184: 一帧最后一个 NAL 的最后一个 RTP 包置 marker 位 */
++    int marker = 1;
+     int rc = 0;
+ 
+     /* 逐个 NAL 发送：Annex-B start code = 00 00 01 或 00 00 00 01 */

@@ -1,0 +1,12 @@
+--- uxplay-orig/uxplay.cpp	2026-10-25 11:27:07.000000000 -0700
++++ uxplay-src/uxplay.cpp	2026-10-26 05:56:22.955378361 -0700
+@@ -560,6 +560,9 @@
+         video_dumpfile = fopen (fn.c_str(),"w");
+         if (video_dumpfile == NULL) {
+             LOGE("could not open file %s for dumping h264 frames",fn.c_str());
++        } else {
++            /* K230 补丁: 写命名管道时必须无缓冲, 否则 4KB 攒批会让硬解多等一帧 */
++            setvbuf(video_dumpfile, NULL, _IONBF, 0);
+         }
+     }
+ 

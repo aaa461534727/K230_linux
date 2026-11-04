@@ -1,0 +1,16 @@
+[Unit]
+Description=K230 wired AirPlay bearer: iPhone USB Ethernet (ipheth) static link
+Documentation=file:///root/k230-usbnet
+# 2026-11-03: 有线 AirPlay 的承载层。iPhone 插 USB-A 口 + 打开「个人热点」后,
+#   ipheth 会给板子一个 enx<mac> 网口 (172.20.10.0/28), 打上静态 172.20.10.2。
+#   uxplay 本来就 bind 0.0.0.0, 无需改; avahi 自己在这个接口上广播。
+# 触发: udev 规则 99-k230-iphone-usbnet.rules (网口 add/change + iPhone usb add)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/k230-usbnet apply
+# 载波可能比网口晚出现 (用户先插线后开热点) —— 由 udev 的 change 事件再触发一次
+RemainAfterExit=no
+TimeoutStartSec=30

@@ -1,0 +1,7 @@
+build/
+third_party/
+tools/k1probe/target/
+tools/k1probe/Cargo.lock
+*.o
+*.yuv
+*.bgra

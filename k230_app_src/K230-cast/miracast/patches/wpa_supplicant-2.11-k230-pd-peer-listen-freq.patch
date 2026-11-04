@@ -1,0 +1,25 @@
+--- a/src/p2p/p2p_pd.c
++++ b/src/p2p/p2p_pd.c
+@@ -682,6 +682,22 @@
+ 		dev->info.wfd_subelems = wpabuf_dup(msg.wfd_subelems);
+ 	}
+ 
++	/*
++	 * K230 patch (2026-10-21): this Provision Discovery Request just arrived
++	 * on rx_freq, i.e. the peer is reachable on that channel right now.
++	 * p2p_add_device() is called above with scan_res=0, which never sets
++	 * dev->listen_freq, so p2p_invite() refuses with "Cannot invite unknown
++	 * P2P Device" even though the device entry exists.  A sink that already
++	 * runs a group (GO) has to invite the source into it, so record the RX
++	 * channel as the peer's listen / operating frequency.
++	 */
++	if (rx_freq > 0) {
++		if (dev->listen_freq <= 0)
++			dev->listen_freq = rx_freq;
++		if (dev->oper_freq <= 0)
++			dev->oper_freq = rx_freq;
++	}
++
+ 	p2p_update_peer_6ghz_capab(dev, &msg);
+ 
+ 	if (!msg.adv_id) {

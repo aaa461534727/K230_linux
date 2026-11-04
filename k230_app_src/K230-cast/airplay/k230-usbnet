@@ -1,0 +1,100 @@
+#!/bin/sh
+# k230-usbnet —— 有线 AirPlay 的**承载链路**: iPhone 个人热点 (USB 以太网) → ipheth → 静态 IP
+#
+# 背景 (2026-11-03 现场取证, 板 10.0.102.172):
+#   iPhone 插在 **USB-A (Host) 口** → 板子当主机, 枚举出 05ac:12a8。
+#   iPhone 默认暴露 4 套 USB 配置, 只有 **配置 4 "PTP + Apple Mobile Device + Apple USB Ethernet"**
+#   里有 AppleUSBEthernet 接口 (ff/fd/01) —— ipheth 只认这个。实测:
+#     echo 4 > /sys/bus/usb/devices/<port>/bConfigurationValue
+#   ⇒ 板子立刻多出网口 enx96bf2d58ce8a (driver=ipheth), 但 **NO-CARRIER**:
+#   载波要等 iPhone 打开「个人热点」才起来 (个人热点 = 这条 USB 以太网链路真正通电)。
+#   内核默认给 iPhone 选的是**配置 1 (PTP)**, 所以本脚本先把它切到 4, 再等网口。
+#
+# 为什么用静态 IP 不用 DHCP: 本板**没有** udhcpc / dhclient (实测 command not found)。
+#   iPhone 热点的网络固定 172.20.10.0/28, 网关 172.20.10.1 ⇒ 直接给自己 172.20.10.2/28。
+#   **不加默认路由**: 板子自己的上网/SSH 走 USB 网卡 (AX88179), 不能被手机顶掉。
+#
+# 链路起来之后 **不需要改 uxplay**: 它 bind 0.0.0.0:7100/7101,
+#   avahi 会自动在 172.20.10.2 上广播 _airplay._tcp ⇒ iPhone 在「屏幕镜像」里能看到 K230-CAST。
+#
+# 用法: k230-usbnet [apply]    (默认 apply; 由 udev → k230-usbnet.service 触发, 也可手跑)
+set -u
+
+ADDR="${USB_NET_ADDR:-172.20.10.2/28}"
+LOG="${USB_NET_LOG:-/var/log/k230-usbnet.log}"
+WAIT_TICKS="${USB_NET_WAIT_TICKS:-20}"   # 20 × 0.5 s = 10 s 等载波
+IF_WAIT_TICKS="${USB_NET_IF_WAIT_TICKS:-16}"   # 16 × 0.5 s = 8 s 等 ipheth 建网口
+
+log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
+
+# 1) 有没有 iPhone? 有就强制切到配置 4 (带 Apple USB Ethernet 的那套)
+iphone_dir() {
+    for d in /sys/bus/usb/devices/*/; do
+        [ -f "$d/idVendor" ] || continue
+        if [ "$(cat "$d/idVendor" 2>/dev/null)" = "05ac" ] && \
+           [ "$(cat "$d/idProduct" 2>/dev/null)" = "12a8" ]; then
+            echo "${d%/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+IPH=$(iphone_dir) || {
+    log "没有 iPhone (05ac:12a8) —— 未插 / 已拔出, 本拍无事可做"
+    exit 0
+}
+
+CFG=$(cat "$IPH/bConfigurationValue" 2>/dev/null)
+if [ "$CFG" != "4" ]; then
+    echo 4 >"$IPH/bConfigurationValue" 2>/dev/null \
+        && log "iPhone $IPH 配置 $CFG → 4 (PTP + Apple Mobile Device + Apple USB Ethernet)" \
+        || log "⚠ 切 iPhone 配置 4 失败 (当前 $CFG)"
+fi
+
+# 2) 按**驱动名**找网口 —— ipheth 的网口名是 enx<mac> 形式, 名字不可预测
+find_if() {
+    for d in /sys/class/net/*; do
+        [ -e "$d/device/driver" ] || continue
+        drv=$(basename "$(readlink -f "$d/device/driver")")
+        if [ "$drv" = "ipheth" ]; then
+            basename "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+IF=""
+i=0
+while [ "$i" -lt "$IF_WAIT_TICKS" ]; do
+    IF=$(find_if) && break
+    sleep 0.5
+    i=$((i + 1))
+done
+[ -n "$IF" ] || { log "iPhone 在, 但 ipheth 网口 ${IF_WAIT_TICKS}×0.5 s 内没出现 (ipheth.ko 没加载?)"; exit 0; }
+
+# 已经配好就别重复折腾 (重复 ip addr replace 会打断正在跑的 AirPlay)
+if ip -4 addr show dev "$IF" 2>/dev/null | grep -q "inet ${ADDR%/*}"; then
+    log "$IF 已是 $ADDR, 跳过"
+    exit 0
+fi
+
+ip link set "$IF" up 2>/dev/null
+
+i=0
+while [ "$i" -lt "$WAIT_TICKS" ]; do
+    [ "$(cat "/sys/class/net/$IF/carrier" 2>/dev/null)" = "1" ] && break
+    sleep 0.5
+    i=$((i + 1))
+done
+
+if [ "$(cat "/sys/class/net/$IF/carrier" 2>/dev/null)" != "1" ]; then
+    log "$IF 无载波 (${WAIT_TICKS}×0.5 s 超时) —— iPhone 的「个人热点」没开, 或开了没等够"
+    exit 0
+fi
+
+ip addr replace "$ADDR" dev "$IF" || { log "✗ 给 $IF 配 $ADDR 失败"; exit 1; }
+
+log "✅ 有线链路就绪: $IF = $ADDR (iPhone USB 以太网), uxplay 可直接在此接口广播 AirPlay"
+exit 0

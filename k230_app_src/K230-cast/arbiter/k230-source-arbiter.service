@@ -1,0 +1,19 @@
+# /etc/systemd/system/k230-source-arbiter.service
+# 2026-11-02: 取代 k230-cast.service (只管 Miracast XOR AirPlay 两路),
+#   现在统一管 CarPlay / AirPlay / Miracast / CarLife 无线 / CarLife 有线 五路。
+[Unit]
+Description=K230 source arbiter: CarPlay/AirPlay/Miracast/CarLife 全部待命, 同时只允许一个会话
+After=network.target bluetooth.target k230-screen.service
+Wants=k230-screen.service
+
+[Service]
+Type=simple
+Environment=CONF=/etc/k230-arbiter.conf
+ExecStart=/bin/sh /root/k230-source-arbiter.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

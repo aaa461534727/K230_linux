@@ -13,8 +13,8 @@ set -e
 
 K230_SDK_ROOT="${K230_SDK_ROOT:?need K230_SDK_ROOT}"
 BRW_BUILD_DIR="${BRW_BUILD_DIR:?need BRW_BUILD_DIR}"
-PROJ="$(cd "$K230_SDK_ROOT/../.." && pwd)"
-SRC="$PROJ/src"
+# 源码真相 = SDK 自带 k230_app_src (用户维护的干净源码); K230/src 只是 AI 工作快照
+SRC="$K230_SDK_ROOT/k230_app_src"
 EXTRAS="$K230_SDK_ROOT/buildroot-overlay/board/canaan/k230-soc/distribution/k230_extras"
 OUT="$BRW_BUILD_DIR"
 STAGING="$OUT/staging"

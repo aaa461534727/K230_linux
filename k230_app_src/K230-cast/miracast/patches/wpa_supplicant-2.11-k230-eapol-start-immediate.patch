@@ -1,0 +1,25 @@
+--- a/src/eapol_supp/eapol_supp_sm.c
++++ b/src/eapol_supp/eapol_supp_sm.c
+@@ -276,7 +276,21 @@
+ 		 * delay authentication. Use a short timeout to send the first
+ 		 * EAPOL-Start if Authenticator does not start authentication.
+ 		 */
+-		if (sm->conf.wps && !(sm->conf.wps & EAPOL_PEER_IS_WPS20_AP)) {
++		if (sm->conf.wps & EAPOL_LOCAL_WPS_IN_USE) {
++			/*
++			 * K230: 我们是 WPS enrollee (P2P client 加入手机 GO)。上游为
++			 * WPS 2.0 AP 留 2 s, 假设 AP 关联后会主动发 EAP-Request/
++			 * Identity; 但 REDMI K80 Ultra 当 GO 时不会主动发, 只等我们
++			 * 的 EAPOL-Start。手机从 GO Negotiation 起只给约 15 s,
++			 * 这 2 s 足以把整个 WPS 挤出窗口 (2026-10-23 实测差 0.10 s)。
++			 * enrollee 主动起握手的场景下立刻发没有副作用。
++			 */
++			wpa_printf(MSG_DEBUG, "EAPOL: K230 WPS enrollee, send "
++				   "EAPOL-Start immediately");
++			sm->startWhen = sm->startPeriod;
++			sm->startCount++;
++			send_start = 1;
++		} else if (sm->conf.wps && !(sm->conf.wps & EAPOL_PEER_IS_WPS20_AP)) {
+ 			/* Reduce latency on starting WPS negotiation. */
+ 			wpa_printf(MSG_DEBUG,
+ 				   "EAPOL: Using shorter startWhen for WPS");

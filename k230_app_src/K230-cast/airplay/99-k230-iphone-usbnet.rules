@@ -1,0 +1,5 @@
+# 2026-11-03: 有线 AirPlay —— iPhone 走 USB 以太网 (ipheth) 时把链路配起来
+# 1) ipheth 网口出现 / 载波变化 (carrier 0→1 会发 net change 事件)
+ACTION=="add|change", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="ipheth", TAG+="systemd", ENV{SYSTEMD_WANTS}+="k230-usbnet.service"
+# 2) iPhone 本身插入/重新枚举 (此时网口还没建, 脚本负责把配置切到 4)
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_VENDOR_ID}=="05ac", ENV{ID_MODEL_ID}=="12a8", TAG+="systemd", ENV{SYSTEMD_WANTS}+="k230-usbnet.service"

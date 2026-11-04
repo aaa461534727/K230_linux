@@ -1,0 +1,37 @@
+--- /tmp/rtw_mlme_ext.c.orig-20261021	2025-01-12 23:02:59.000000000 -0800
++++ /home/dengbaowen/freebuf/hclinux/K230/sdk/k230_linux_sdk/output/k230_canmv_01studio_defconfig/build/rtl8189fs-94cc959d56c1425fbca4f6e49e949cf58ec5dc8d/core/rtw_mlme_ext.c	2026-10-21 01:17:10.211444761 -0700
+@@ -8249,11 +8249,24 @@
+ #endif
+ 
+ #ifdef CONFIG_P2P
+-	if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO)
++	if ((rtw_p2p_chk_role(pwdinfo, P2P_ROLE_GO) || rtw_p2p_chk_role(pwdinfo, P2P_ROLE_DEVICE))
+ 	    /* IOT issue, When wifi_spec is not set, send probe_resp with P2P IE even if probe_req has no P2P IE */
+ 	    && (is_valid_p2p_probereq || !padapter->registrypriv.wifi_spec)) {
+ 		u32 len;
+ #ifdef CONFIG_IOCTL_CFG80211
++		/* K230 2026-10-21: P2P client/device 模式(手机当 GO)也必须能被手机发现。
++		 * 原逻辑只在 P2P_ROLE_GO 时附带 P2P/WFD IE, 而 Android 手机投屏时它是 GO、
++		 * 我们只是 P2P device/client ⇒ 探针响应里没有 P2P IE ⇒ 手机列表里根本看不到。
++		 * role=DEVICE 时改用驱动按角色自组装的 P2P IE (group cap 非 GO)。 */
++		if (rtw_p2p_chk_role(pwdinfo, P2P_ROLE_DEVICE)) {
++			static int _k230_dbg = 0;
++			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
++			if (_k230_dbg < 5) {
++				pr_info("K230P2P: probe resp P2P IE (role=DEVICE) len=%u\n", len);
++				_k230_dbg++;
++			}
++			goto k230_p2p_ie_done;
++		}
+ 		if (adapter_wdev_data(padapter)->p2p_enabled && pwdinfo->driver_interface == DRIVER_CFG80211) {
+ 			/* if pwdinfo->role == P2P_ROLE_DEVICE will call issue_probersp_p2p() */
+ 			len = pmlmepriv->p2p_go_probe_resp_ie_len;
+@@ -8264,7 +8277,7 @@
+ 		{
+ 			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
+ 		}
+-
++k230_p2p_ie_done:
+ 		pframe += len;
+ 		pattrib->pktlen += len;
+ 

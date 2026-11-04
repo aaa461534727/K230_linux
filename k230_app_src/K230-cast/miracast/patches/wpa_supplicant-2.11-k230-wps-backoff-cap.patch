@@ -1,0 +1,18 @@
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -8463,6 +8463,15 @@
+ 		timeout = 10000;
+ 		break;
+ 	}
++	/*
++	 * K230: WPS 组网 (P2P client 加手机 GO) 的预算只有约 16 s —— 手机从 GO
++	 * Negotiation 起 16 s 内没等到 client 关联就 GO_ENDING_SESSION/FORMATION_FAILED。
++	 * 上游退避到第 4/5 次时给 5 s / 10 s, 一次就把剩余窗口吃光, 而手机 GO 到底
++	 * 何时开始应答 AUTH 完全不确定 (实测 1.3 s 成功过, 13.1 s 也成功过, >16 s 就没了)。
++	 * 所以 WPS 场景把退避压到最多 1.5 s, 让尝试尽量密地铺满整个窗口。
++	 */
++	if (wpa_s->key_mgmt == WPA_KEY_MGMT_WPS && timeout > 1500)
++		timeout = 1500;
+ 
+ 	wpa_dbg(wpa_s, MSG_DEBUG,
+ 		"Consecutive connection failures: %d --> request scan in %d ms",

@@ -1,0 +1,24 @@
+[Unit]
+Description=K230 LVGL main UI (Miracast / AirPlay / CarLife / CarPlay launcher)
+# ★ 屏幕互斥: DRM master 只能有一个。k230-screen (drmplay) 在跑时本单元起不来,
+#   反过来本单元在跑时 k230-screen 也起不来 —— 由 systemd 的 Conflicts 兜底,
+#   正常切换仍走 k230-ui-backend -> k230-ui-mode.sh (先停对方再起自己)。
+Conflicts=k230-screen.service
+After=k230-screen.service local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/k230ui
+Environment=K230UI_SOCK=/run/k230-ui/backend.sock
+# 触摸屏: /dev/input/event0 (FT5306), evdev 由 SDK 的 liblvgl_linux.so 内部处理
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# ⚠ 不要 enable 本单元: 由 k230-ui-backend 通过模式脚本按需起停
+#   (enable 了会和 backend 抢启动顺序, 上电可能黑屏)
+WantedBy=multi-user.target

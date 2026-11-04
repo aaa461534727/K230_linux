@@ -1,0 +1,109 @@
+--- a/src/p2p/p2p_pd.c
++++ b/src/p2p/p2p_pd.c
+@@ -397,6 +397,69 @@
+ 						     p2p->p2ps_prov->adv_mac);
+ 
+ 		p2p_buf_update_ie_hdr(buf, len);
++	} else if (p2p->num_groups > 0) {
++		/*
++		 * K230 patch: this is a GO that already runs a group. Upstream
++		 * omits the P2P IE completely in this (legacy, non-P2PS) branch,
++		 * so the peer never learns which group to join and never gets an
++		 * Operating Channel -- Android (MIUI) then just retries the
++		 * Provision Discovery Request and times out.
++		 * Advertise Config Methods + Group ID (BSSID + SSID) + Operating
++		 * Channel so the peer can associate to the running group.
++		 */
++		u8 *len = p2p_buf_add_ie_hdr(buf);
++		struct p2p_group *g = p2p->groups[0];
++		size_t ssid_len = 0;
++		const u8 *ssid = p2p_group_get_ssid(g, &ssid_len);
++		u8 op_class = p2p->op_reg_class;
++		u8 op_chan = p2p->op_channel;
++		u8 group_capab = P2P_GROUP_CAPAB_GROUP_OWNER;
++
++		if (p2p->cfg->p2p_intra_bss)
++			group_capab |= P2P_GROUP_CAPAB_INTRA_BSS_DIST;
++
++		/* Same leading attributes a real GO sends (Capability + Device
++		 * Info), then Group ID / Operating Channel. */
++		p2p_buf_add_capability(buf, p2p->dev_capab &
++				       ~P2P_DEV_CAPAB_CLIENT_DISCOVERABILITY,
++				       group_capab);
++		p2p_buf_add_device_info(buf, p2p, NULL);
++
++		if (ssid && ssid_len) {
++			wpa_printf(MSG_DEBUG, "K230P2P: PD resp add Group ID iface="
++				   MACSTR " ssid_len=%u",
++				   MAC2STR(p2p_group_get_interface_addr(g)),
++				   (unsigned int) ssid_len);
++			p2p_buf_add_group_id(buf, p2p_group_get_interface_addr(g),
++					     ssid, ssid_len);
++		}
++
++		/* Operating channel: prefer the intended one, else derive it from
++		 * the running group's frequency (a peer needs the channel to join). */
++		if (!op_class || !op_chan) {
++			int freq = p2p_group_get_freq(g);
++
++			op_class = 0;
++			op_chan = 0;
++			if (freq > 0 &&
++			    p2p_freq_to_channel(freq, &op_class, &op_chan) < 0) {
++				op_class = 0;
++				op_chan = 0;
++			}
++		}
++		if (!op_class || !op_chan) {
++			op_class = p2p->cfg->op_reg_class;
++			op_chan = p2p->cfg->op_channel;
++		}
++		if (op_class && op_chan) {
++			wpa_printf(MSG_DEBUG, "K230P2P: PD resp add Operating "
++				   "Channel reg_class=%u chan=%u",
++				   op_class, op_chan);
++			p2p_buf_add_operating_channel(buf, p2p->cfg->country,
++						      op_class, op_chan);
++		}
++
++		p2p_buf_update_ie_hdr(buf, len);
+ 	}
+ 
+ 	/* WPS IE with Config Methods attribute */
+--- a/src/p2p/p2p_group.c
++++ b/src/p2p/p2p_group.c
+@@ -1071,6 +1071,24 @@
+ }
+ 
+ 
++/**
++ * p2p_group_get_ssid - Get the SSID of a running group
++ * @group: P2P group
++ * @len: Buffer for returning the SSID length
++ * Returns: Pointer to the SSID (valid as long as the group exists)
++ *
++ * K230 addition: needed to advertise P2P Group ID in a Provision Discovery
++ * Response so that a peer can join the group that is already running.
++ */
++const u8 * p2p_group_get_ssid(struct p2p_group *group, size_t *len)
++{
++	if (!group || !group->cfg || !len)
++		return NULL;
++	*len = group->cfg->ssid_len;
++	return group->cfg->ssid;
++}
++
++
+ const struct p2p_group_config * p2p_group_get_config(struct p2p_group *group)
+ {
+ 	return group->cfg;
+--- a/src/p2p/p2p_i.h
++++ b/src/p2p/p2p_i.h
+@@ -742,6 +742,7 @@
+ 			    int max_clients);
+ void p2p_group_buf_add_id(struct p2p_group *group, struct wpabuf *buf);
+ int p2p_group_get_freq(struct p2p_group *group);
++const u8 * p2p_group_get_ssid(struct p2p_group *group, size_t *len);
+ 
+ 
+ void p2p_buf_add_action_hdr(struct wpabuf *buf, u8 subtype, u8 dialog_token);
