@@ -22,3 +22,6 @@ __pycache__/
 
 # K230 2026-10-25: 驱动 ko 不入仓 —— 由 rtl8189fs 补丁在本机编译产出
 buildroot-overlay/**/lib/modules/*/updates/*.ko
+
+# K230 2026-11-04: 离线 deb 缓存 (78MB, 由 offline-debs 脚本下载生成, 不入仓)
+offline-debs/
