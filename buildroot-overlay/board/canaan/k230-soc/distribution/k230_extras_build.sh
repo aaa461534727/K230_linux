@@ -64,6 +64,37 @@ echo "=== [k230_extras_build] usbmirror ==="
     "$SRC"/K230-cast/usbmirror/rsa2048.c "$SRC"/K230-cast/usbmirror/touch.c \
     -I"$SRC/K230-cast/usbmirror" -I"$STAGING/usr/include/libusb-1.0" -L"$STAGING/usr/lib" -lusb-1.0 -lpthread
 
+# 6.4) wpa_supplicant (K230 补丁版, 从 SDK 的 buildroot 源码编)
+#   为什么在这里重编一道 (2026-11-04 板上实测的坑):
+#     buildroot 默认开了 BR2_PACKAGE_WPA_SUPPLICANT_WPA3 ⇒ CONFIG_DPP/DPP2/DPP3=y,
+#     其中 DPP3 的 HPKE 实现直接调 OpenSSL 3.2+ 的 OSSL_HPKE_* ⇒ 二进制会带
+#     "OPENSSL_3.2.0" 版本节点。而 Ubuntu rootfs 的 libssl3t64 只有 3.0.13,
+#     开机就死在 `version 'OPENSSL_3.2.0' not found` ⇒ supplicant 起不来 ⇒
+#     没有 P2P listen ⇒ **手机根本发现不了 K230** (本次"点 Miracast 没反应"的真因)。
+#   做法: 关掉 DPP 系列 (Miracast/WPS 用不到), 让二进制只依赖 OPENSSL_3.0.0,
+#     直接吃 rootfs 自带的 openssl, 不需要再往 rootfs 里塞私有 libssl/libcrypto。
+echo "=== [k230_extras_build] wpa_supplicant (DPP off) ==="
+WPA_DIR="$OUT/build/wpa_supplicant-2.11/wpa_supplicant"
+if [ -f "$WPA_DIR/.config" ]; then
+    sed -i -e 's/^CONFIG_DPP=y/#CONFIG_DPP=y/' \
+           -e 's/^CONFIG_DPP2=y/#CONFIG_DPP2=y/' \
+           -e 's/^CONFIG_DPP3=y/#CONFIG_DPP3=y/' "$WPA_DIR/.config"
+    grep -q '^#CONFIG_DPP3=y' "$WPA_DIR/.config" || { echo "✗ wpa .config 里没有 CONFIG_DPP3 可关"; exit 1; }
+    make -C "$WPA_DIR" clean >/dev/null 2>&1 || true
+    ( cd "$WPA_DIR" && \
+      env CFLAGS="--sysroot=$STAGING -O2 -I$STAGING/usr/include/libnl3" \
+          LDFLAGS="--sysroot=$STAGING -L$STAGING/usr/lib" \
+          LIBS="-lnl-3 -lm -lpthread" LIBS_c="-lnl-3 -lm -lpthread" LIBS_p="-lnl-3 -lm -lpthread" \
+          make -j"$(nproc)" CC="${CROSS}gcc" BINDIR=/usr/sbin >/dev/null )
+    # 自检: 只要还引用 3.2 符号, 板上就一定起不来
+    if readelf --dyn-syms -W "$WPA_DIR/wpa_supplicant" 2>/dev/null | grep -q 'OPENSSL_3\.2'; then
+        echo "✗ wpa_supplicant 仍依赖 OPENSSL_3.2 (rootfs 只有 3.0.13)"; exit 1
+    fi
+    echo "  ✓ wpa_supplicant 重编完成 (仅依赖 OPENSSL_3.0, DPP 已关)"
+else
+    echo "  ! 找不到 $WPA_DIR/.config (先 make buildroot), 跳过 — distribution.sh 会用 buildroot 原产物"
+fi
+
 # 6.5) uxplay (AirPlay 服务端) 交叉编译 (依赖 staging 的 gstreamer/sdp/video/app/plist/dbus/glib/openssl)
 echo "=== [k230_extras_build] uxplay (cross) ==="
 CXX="$CROSS""g++"

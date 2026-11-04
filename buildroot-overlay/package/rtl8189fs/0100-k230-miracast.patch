@@ -19,7 +19,7 @@
 +		|| ((GET_CFG80211_REPORT_MGMT(adapter_wdev_data(padapter), IEEE80211_STYPE_PROBE_REQ) == _TRUE)
 +		    && !rtw_p2p_chk_state(pwdinfo, P2P_STATE_NONE)))
  	) {
-+		pr_info("K230P2P: probe req -> cfg80211 (ap=%d p2p_state=%d)\n",
++		pr_debug("K230P2P: probe req -> cfg80211 (ap=%d p2p_state=%d)\n",
 +			MLME_IS_AP(padapter), rtw_p2p_state(pwdinfo));
  		rtw_cfg80211_rx_probe_request(padapter, precv_frame);
  		return _SUCCESS;
@@ -42,7 +42,7 @@
 +			static int _k230_dbg = 0;
 +			len = build_probe_resp_p2p_ie(pwdinfo, pframe);
 +			if (_k230_dbg < 5) {
-+				pr_info("K230P2P: probe resp P2P IE (role=DEVICE) len=%u\n", len);
++				pr_debug("K230P2P: probe resp P2P IE (role=DEVICE) len=%u\n", len);
 +				_k230_dbg++;
 +			}
 +			goto k230_p2p_ie_done;
