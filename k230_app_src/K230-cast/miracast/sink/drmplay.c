@@ -177,6 +177,215 @@ enum { NBUF_MAX = 3 };
 
 /* fourcc('A','R','2','4') —— ARGB8888; canaan-drm 支持, XRGB8888 不支持 */
 #define FORMAT_AR24 0x34325241u
+/* fourcc('N','V','1','2') */
+#define FORMAT_NV12 0x3231564eu
+
+/* ---------- 方案A (2026-11-04): NV12 直上 VO 视频层 ----------
+ * 为什么: 每帧 CPU 3.1 ms 全花在「旋转 + NV12→AR24」和写 1.43 MB 上, 而硬件都能做:
+ *   · VO 视频层原生收 NV12 (canaan_vo.c:709 video_plane_formats)
+ *   · VO 的 yuv2rgb 已开 (canaan_vo.c:561 VO_DISP_YUV2RGB_CTL=1)
+ *   · 转色后 CPU 还要写 1.43 MB/帧, 走视频层是 0 写
+ * 做法: dumb buffer (bpp=8, 高=屏高*3/2) 建 NV12 fb → memcpy 帧体 → atomic commit
+ *   到 video_3; 同时关掉 OSD4(primary) —— OSD 在视频层之上, 不关会把视频盖住。
+ * 边界(v1): 只在「NV12 + 不缩放 + 不旋转 + 满屏」启用, 其它情况原路返回,
+ *   黑边/旋转行为一个像素都不变。开关: WFD_VO=0 强制关, WFD_VO_DEBUG=1 打细节。 */
+#define DRM_IOW(nr, type) \
+    ((1u << 30) | (((uint32_t)sizeof(type) & 0x3ffu) << 16) | \
+     ((uint32_t)DRM_IOCTL_BASE << 8) | (nr))
+
+struct drm_mode_get_plane_res {
+    uint64_t plane_id_ptr;
+    uint32_t count_planes;
+};
+struct drm_mode_get_plane {
+    uint32_t plane_id;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t possible_crtcs;
+    uint32_t gamma_size;
+    uint32_t count_format_types;
+    uint64_t format_type_ptr;
+};
+struct drm_mode_obj_get_properties {
+    uint64_t props_ptr;
+    uint64_t prop_values_ptr;
+    uint32_t count_props;
+    uint32_t obj_id;
+    uint32_t obj_type;
+};
+struct drm_mode_get_property {
+    uint64_t values_ptr;
+    uint64_t enum_blob_ptr;
+    uint32_t prop_id;
+    uint32_t flags;
+    char name[32];
+    uint32_t count_values;
+    uint32_t count_enum_blobs;
+};
+struct drm_mode_atomic {
+    uint32_t flags;
+    uint32_t count_objs;
+    uint64_t objs_ptr;
+    uint64_t count_props_ptr;
+    uint64_t props_ptr;
+    uint64_t prop_values_ptr;
+    uint64_t reserved;
+    uint64_t user_data;
+};
+struct drm_set_client_cap {
+    uint64_t capability;
+    uint64_t value;
+};
+
+#define DRM_IOCTL_MODE_GETPROPERTY       DRM_IOWR(0xAA, struct drm_mode_get_property)
+#define DRM_IOCTL_MODE_GETPLANERESOURCES DRM_IOWR(0xB5, struct drm_mode_get_plane_res)
+#define DRM_IOCTL_MODE_GETPLANE          DRM_IOWR(0xB6, struct drm_mode_get_plane)
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES DRM_IOWR(0xB9, struct drm_mode_obj_get_properties)
+#define DRM_IOCTL_MODE_ATOMIC            DRM_IOWR(0xBC, struct drm_mode_atomic)
+#define DRM_IOCTL_SET_CLIENT_CAP         DRM_IOW(0x0d, struct drm_set_client_cap)
+
+#define DRM_MODE_OBJECT_PLANE     0xeeeeeeeeu
+#define DRM_MODE_ATOMIC_NONBLOCK  0x0200u
+#define DRM_CLIENT_CAP_ATOMIC     3
+#define DRM_PLANE_TYPE_PRIMARY    1
+#define DRM_PLANE_TYPE_OVERLAY    0
+
+struct vo_nv12 {
+    int ok;             /* 平面+fb 都建成了 */
+    int on;             /* 视频层当前在显示 (OSD4 已关) */
+    int force_off;      /* WFD_VO=0 */
+    int rot_ok;         /* WFD_VO_ROT=0 时禁掉「旋转也走视频层」, 退回旧 CPU 路径 */
+    uint32_t crtc;
+    int W, H;
+    int nbuf;
+    uint32_t ovl, prim;              /* 平面 id: video_3 / OSD4 */
+    uint32_t o_fb, o_crtc, o_srcx, o_srcy, o_srcw, o_srch;
+    uint32_t o_crtcx, o_crtcy, o_crtcw, o_crtch;
+    uint32_t p_fb, p_crtc;
+    uint32_t fb[NBUF_MAX];
+    uint32_t handle[NBUF_MAX];
+    uint8_t *map[NBUF_MAX];
+    uint32_t pitch;
+    int g_w, g_h, g_x, g_y;          /* 上次贴上去的几何 (变了就重刷黑边) */
+    int logged;                      /* 第一次真正走视频层时打一行 */
+    int logged2;                     /* 第一次走「缩放后直上视频层」时打一行 */
+};
+
+/* 把一帧 NV12 按 1:1 贴到视频层 (可带黑边), 返回 0 成功 / -1 这个几何不支持。
+ * 只做「逐行拷贝 + 换几何时刷一次黑」: 不转色 (VO 的 yuv2rgb 做), 不缩放。
+ * 黑边必须自己刷 —— OSD4 (primary) 在视频层之上, 出视频时必须关掉它,
+ * 而 VO 背景色来自 DT 的 0xffffff (白), 不刷黑就漏白边。 */
+static int vo_blit_nv12(struct vo_nv12 *v, int nxt, const uint8_t *buf,
+                        int sw, int sh, int ox, int oy)
+{
+    const int W = v->W, H = v->H;
+    uint8_t *m;
+    const uint8_t *srcY, *srcUV;
+    uint8_t *dstUV;
+    size_t plane = (size_t)W * H;
+
+    if (sw <= 0 || sh <= 0 || sw > W || sh > H)
+        return -1;
+    if (ox < 0 || oy < 0 || ox + sw > W || oy + sh > H)
+        return -1;
+    /* NV12 的 UV 平面按 2x2 采样: 偏移取偶数 (最多挪 1 像素, 肉眼不可见) */
+    ox &= ~1;
+    oy &= ~1;
+    if (ox + sw > W || oy + sh > H)
+        return -1;
+
+    if (v->g_w != sw || v->g_h != sh || v->g_x != ox || v->g_y != oy) {
+        /* 几何变了 (换会话/换方向): 三块缓冲都刷成限范围黑 (Y=16 / UV=128),
+         * 否则上一段内容的残影会从黑边里漏出来 */
+        for (int b = 0; b < v->nbuf; b++) {
+            memset(v->map[b], 16, plane);
+            memset(v->map[b] + plane, 128, plane / 2);
+        }
+        v->g_w = sw; v->g_h = sh; v->g_x = ox; v->g_y = oy;
+    }
+
+    m = v->map[nxt];
+    srcY = buf;
+    for (int y = 0; y < sh; y++)
+        memcpy(m + (size_t)(oy + y) * W + ox, srcY + (size_t)y * sw, (size_t)sw);
+    srcUV = buf + (size_t)sw * sh;
+    dstUV = m + plane;
+    for (int y = 0; y < sh / 2; y++)
+        memcpy(dstUV + (size_t)(oy / 2 + y) * W + ox,
+               srcUV + (size_t)y * sw, (size_t)sw);
+    return 0;
+}
+
+/* 缩放后直上视频层 (2026-11-04): CPU 只做 **NV12→NV12 缩放**, 转色交 VO 的 yuv2rgb。
+ *
+ * 为什么需要: Miracast 真机的源永远是横档 (1280x720 → 竖屏内容裁出 409x720),
+ * 屏是 480x800 ⇒ 必然要放大 1.17x/1.11x, 永远不满足「1:1 直贴」。
+ * 旧路把「NV12→AR24 转色 + 最近邻缩放」一起做, 每帧 12 ms;
+ * 这里只保留缩放 (输出 1.5 B/px, 旧路输出 4 B/px), 转色白送给 VO 硬件。
+ *
+ * 采样算法与旧路完全一致 (最近邻 + xmap 查表), 画质不变。
+ * 返回 0 = 已贴好; -1 = 这个几何不支持 (调用方自动回旧路)。 */
+static int vo_blit_nv12_scaled(struct vo_nv12 *v, int nxt, const uint8_t *buf,
+                               int sw, int sh, int cx, int cy, int cw, int ch,
+                               int ox, int oy, int dw, int dh)
+{
+    static int *sxmap = NULL;
+    static int sxcap = 0;
+    const int W = v->W, H = v->H;
+    const size_t plane = (size_t)W * H;
+
+    dw &= ~1; dh &= ~1;                       /* NV12 的 UV 按 2x2 组, 必须偶数 */
+    if (dw <= 0 || dh <= 0 || cw <= 0 || ch <= 0)
+        return -1;
+    if (cx < 0 || cy < 0 || cx + cw > sw || cy + ch > sh || sw <= 0 || sh <= 0)
+        return -1;
+    ox &= ~1; oy &= ~1;
+    if (ox < 0 || oy < 0 || ox + dw > W || oy + dh > H)
+        return -1;
+
+    if (v->g_w != dw || v->g_h != dh || v->g_x != ox || v->g_y != oy) {
+        /* 几何变了: 三块缓冲都刷限范围黑 (Y=16 / UV=128), 免得残影从黑边漏出来 */
+        for (int b = 0; b < v->nbuf; b++) {
+            memset(v->map[b], 16, plane);
+            memset(v->map[b] + plane, 128, plane / 2);
+        }
+        v->g_w = dw; v->g_h = dh; v->g_x = ox; v->g_y = oy;
+    }
+
+    if (dw > sxcap) {
+        int *nm = realloc(sxmap, (size_t)dw * sizeof(int));
+        if (!nm)
+            return -1;
+        sxmap = nm; sxcap = dw;
+    }
+    for (int dx = 0; dx < dw; dx++)
+        sxmap[dx] = cx + (int)((long)dx * cw / dw);
+
+    uint8_t *m = v->map[nxt];
+    const uint8_t *yp = buf;
+    const uint8_t *uvp = buf + (size_t)sw * sh;
+
+    /* Y 平面: 逐目标行取源行, 逐点查表搬字节 */
+    for (int dy = 0; dy < dh; dy++) {
+        int sry = cy + (int)((long)dy * ch / dh);
+        const uint8_t *srow = yp + (size_t)sry * sw;
+        uint8_t *drow = m + (size_t)(oy + dy) * W + ox;
+        for (int dx = 0; dx < dw; dx++)
+            drow[dx] = srow[sxmap[dx]];
+    }
+    /* UV 平面: 每 2x2 目标块共享一对 UV (源行号 / 2, 源列对齐到偶数) */
+    for (int dy = 0; dy < dh / 2; dy++) {
+        int sry = cy + (int)((long)(dy * 2) * ch / dh);
+        const uint8_t *srow = uvp + (size_t)(sry / 2) * sw;
+        uint8_t *drow = m + plane + (size_t)(oy / 2 + dy) * W + ox;
+        for (int dx = 0; dx < dw; dx += 2) {
+            int sx = sxmap[dx] & ~1;
+            drow[dx] = srow[sx];
+            drow[dx + 1] = srow[sx + 1];
+        }
+    }
+    return 0;
+}
 
 /* 日志统一带墙钟 (2026-10-26 加): play.log 以前没有时间戳 ⇒ K80 黑屏那一轮
  * 无法与 RTSP / dec 日志对齐到秒。现在三条日志同一条时间轴, 出错能一眼对轮次。 */
@@ -202,6 +411,275 @@ static void plog_err(const char *fmt, ...)
 
 #define LOG(fmt, ...) plog_info(fmt, ##__VA_ARGS__)
 #define ERR(fmt, ...) plog_err(fmt, ##__VA_ARGS__)
+
+/* ============ 方案A 的 DRM 辅助 (裸 ioctl, 不依赖 libdrm) ============ */
+static int g_verbose;
+
+/* 取对象的某个属性 id; 找到时 *out_val 带回当前值 */
+static uint32_t vo_prop_get(int fd, uint32_t obj, uint32_t type,
+                            const char *want, uint64_t *out_val)
+{
+    struct drm_mode_obj_get_properties gp;
+    uint32_t *ids = NULL;
+    uint64_t *vals = NULL;
+    uint32_t found = 0;
+
+    memset(&gp, 0, sizeof(gp));
+    gp.obj_id = obj;
+    gp.obj_type = type;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0)
+        return 0;
+    if (gp.count_props == 0 || gp.count_props > 256)
+        return 0;
+    ids = calloc(gp.count_props, sizeof(*ids));
+    vals = calloc(gp.count_props, sizeof(*vals));
+    if (!ids || !vals) { free(ids); free(vals); return 0; }
+    gp.props_ptr = (uint64_t)(uintptr_t)ids;
+    gp.prop_values_ptr = (uint64_t)(uintptr_t)vals;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0) {
+        free(ids); free(vals);
+        return 0;
+    }
+    for (uint32_t i = 0; i < gp.count_props; i++) {
+        struct drm_mode_get_property p;
+        memset(&p, 0, sizeof(p));
+        p.prop_id = ids[i];
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &p) < 0)
+            continue;
+        if (strcmp(p.name, want) == 0) {
+            found = ids[i];
+            if (out_val) *out_val = vals[i];
+            break;
+        }
+    }
+    free(ids); free(vals);
+    return found;
+}
+
+/* 找 video_3 (overlay + 支持 NV12) 和 OSD4 (primary) */
+static int vo_probe_planes(int fd, struct vo_nv12 *v)
+{
+    struct drm_mode_get_plane_res pr;
+    uint32_t *ids = NULL;
+    int ret = -1;
+
+    memset(&pr, 0, sizeof(pr));
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0) {
+        ERR("GETPLANERESOURCES: %s", strerror(errno));
+        return -1;
+    }
+    if (pr.count_planes == 0 || pr.count_planes > 64)
+        return -1;
+    ids = calloc(pr.count_planes, sizeof(*ids));
+    if (!ids) return -1;
+    pr.plane_id_ptr = (uint64_t)(uintptr_t)ids;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0) {
+        ERR("GETPLANERESOURCES(2): %s", strerror(errno));
+        free(ids);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < pr.count_planes; i++) {
+        struct drm_mode_get_plane pl;
+        uint32_t *fm;
+        uint64_t ptype = 0xff;
+        int has_nv12 = 0;
+
+        memset(&pl, 0, sizeof(pl));
+        pl.plane_id = ids[i];
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &pl) < 0)
+            continue;
+        fm = calloc(pl.count_format_types ? pl.count_format_types : 1, sizeof(*fm));
+        if (!fm) break;
+        pl.format_type_ptr = (uint64_t)(uintptr_t)fm;
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &pl) == 0) {
+            for (uint32_t k = 0; k < pl.count_format_types; k++)
+                if (fm[k] == FORMAT_NV12) { has_nv12 = 1; break; }
+        }
+        free(fm);
+        if (!vo_prop_get(fd, pl.plane_id, DRM_MODE_OBJECT_PLANE, "type", &ptype))
+            continue;
+        if (g_verbose)
+            LOG("plane %u: type=%llu nv12=%d crtc=%u fb=%u", pl.plane_id,
+                (unsigned long long)ptype, has_nv12, pl.crtc_id, pl.fb_id);
+        if (ptype == DRM_PLANE_TYPE_PRIMARY && !v->prim) {
+            v->prim = pl.plane_id;
+        } else if (ptype == DRM_PLANE_TYPE_OVERLAY && has_nv12 && !v->ovl) {
+            v->ovl = pl.plane_id;
+        }
+    }
+    free(ids);
+
+    if (!v->ovl || !v->prim)
+        return -1;
+
+    v->o_fb   = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
+    v->o_crtc = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
+    v->o_srcx = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "SRC_X", NULL);
+    v->o_srcy = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "SRC_Y", NULL);
+    v->o_srcw = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "SRC_W", NULL);
+    v->o_srch = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "SRC_H", NULL);
+    v->o_crtcx = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "CRTC_X", NULL);
+    v->o_crtcy = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "CRTC_Y", NULL);
+    v->o_crtcw = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "CRTC_W", NULL);
+    v->o_crtch = vo_prop_get(fd, v->ovl, DRM_MODE_OBJECT_PLANE, "CRTC_H", NULL);
+    v->p_fb   = vo_prop_get(fd, v->prim, DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
+    v->p_crtc = vo_prop_get(fd, v->prim, DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
+
+    if (!v->o_fb || !v->o_crtc || !v->o_srcx || !v->o_srcy || !v->o_srcw ||
+        !v->o_srch || !v->o_crtcx || !v->o_crtcy || !v->o_crtcw || !v->o_crtch ||
+        !v->p_fb || !v->p_crtc) {
+        return -1;
+    }
+    ret = 0;
+    return ret;
+}
+
+/* 建 nbuf 块 NV12 dumb buffer 并 AddFB2 (单 handle + offset 1 = pitch*H) */
+static int vo_make_fbs(int fd, struct vo_nv12 *v, int W, int H, int nbuf)
+{
+    for (int b = 0; b < nbuf; b++) {
+        struct drm_mode_create_dumb cd;
+        struct drm_mode_map_dumb md;
+        struct drm_mode_fb_cmd2 fb;
+        uint8_t *m;
+
+        memset(&cd, 0, sizeof(cd));
+        cd.width = (uint32_t)W;
+        cd.height = (uint32_t)H * 3 / 2;
+        cd.bpp = 8;
+        cd.flags = 0;
+        if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+            ERR("CREATE_DUMB(NV12 %dx%d): %s", W, H, strerror(errno));
+            return -1;
+        }
+        if ((int)cd.pitch != W) {
+            ERR("NV12 pitch %u != 宽 %d ⇒ 放弃硬件上屏", cd.pitch, W);
+            return -1;
+        }
+        memset(&fb, 0, sizeof(fb));
+        fb.width = (uint32_t)W;
+        fb.height = (uint32_t)H;
+        fb.pixel_format = FORMAT_NV12;
+        fb.handles[0] = cd.handle;
+        fb.handles[1] = cd.handle;
+        fb.pitches[0] = cd.pitch;
+        fb.pitches[1] = cd.pitch;
+        fb.offsets[0] = 0;
+        fb.offsets[1] = cd.pitch * (uint32_t)H;
+        if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
+            ERR("ADDFB2(NV12): %s", strerror(errno));
+            return -1;
+        }
+        memset(&md, 0, sizeof(md));
+        md.handle = cd.handle;
+        if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+            ERR("MAP_DUMB(NV12): %s", strerror(errno));
+            return -1;
+        }
+        m = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)md.offset);
+        if (m == MAP_FAILED) {
+            ERR("mmap(NV12): %s", strerror(errno));
+            return -1;
+        }
+        v->fb[b] = fb.fb_id;
+        v->handle[b] = cd.handle;
+        v->map[b] = m;
+    }
+    v->pitch = (uint32_t)W;
+    return 0;
+}
+
+/* show=1: 视频层出 NV12, OSD4 关; show=0: 视频层关, OSD4 出 prim_fb */
+static int vo_commit(int fd, struct vo_nv12 *v, int show,
+                     uint32_t ovl_fb, uint32_t prim_fb, int want_event)
+{
+    uint32_t objs[2] = { v->ovl, v->prim };
+    uint32_t counts[2] = { 10, 2 };
+    uint32_t props[12];
+    uint64_t vals[12];
+    struct drm_mode_atomic at;
+    int n = 0;
+
+    props[n] = v->o_fb;    vals[n++] = ovl_fb;
+    props[n] = v->o_crtc;  vals[n++] = show ? v->crtc : 0;
+    props[n] = v->o_srcx;  vals[n++] = 0;
+    props[n] = v->o_srcy;  vals[n++] = 0;
+    props[n] = v->o_srcw;  vals[n++] = (uint64_t)v->W << 16;
+    props[n] = v->o_srch;  vals[n++] = (uint64_t)v->H << 16;
+    props[n] = v->o_crtcx; vals[n++] = 0;
+    props[n] = v->o_crtcy; vals[n++] = 0;
+    props[n] = v->o_crtcw; vals[n++] = (uint64_t)v->W;
+    props[n] = v->o_crtch; vals[n++] = (uint64_t)v->H;
+    /* OSD4 在视频层之上: 出视频时必须把它关掉 (CRTC_ID=0) */
+    props[n] = v->p_fb;    vals[n++] = prim_fb;
+    props[n] = v->p_crtc;  vals[n++] = prim_fb ? v->crtc : 0;
+
+    memset(&at, 0, sizeof(at));
+    at.flags = want_event ? (DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK) : 0;
+    at.count_objs = 2;
+    at.objs_ptr = (uint64_t)(uintptr_t)objs;
+    at.count_props_ptr = (uint64_t)(uintptr_t)counts;
+    at.props_ptr = (uint64_t)(uintptr_t)props;
+    at.prop_values_ptr = (uint64_t)(uintptr_t)vals;
+    if (ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &at) < 0) {
+        ERR("MODE_ATOMIC(show=%d): %s", show, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void vo_init(int fd, struct vo_nv12 *v, uint32_t crtc, int W, int H,
+                    int nbuf, uint32_t prim_fb)
+{
+    struct drm_set_client_cap cap;
+    int rc;
+
+    memset(v, 0, sizeof(*v));
+    v->crtc = crtc;
+    v->W = W;
+    v->H = H;
+    v->nbuf = nbuf;
+    {
+        const char *e = getenv("WFD_VO");
+        if (e && e[0] == '0') { v->force_off = 1; }
+        /* 2026-11-04: 旋转帧也走视频层 (转置在 CPU 已按块做完, 见 rot90_cw_nv12)。
+         * WFD_VO_ROT=0 可单独退回「旋转帧走旧 CPU 路径」, 用于 A/B 或出问题时止损。 */
+        e = getenv("WFD_VO_ROT");
+        v->rot_ok = !(e && e[0] == '0');
+    }
+    if (v->force_off) {
+        LOG("⚠ WFD_VO=0: 强制走【已弃用】CPU 转 NV12→AR24 (只用于 A/B 对照)");
+        return;
+    }
+    cap.capability = DRM_CLIENT_CAP_ATOMIC;
+    cap.value = 1;
+    if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) < 0) {
+        LOG("⚠ VO 不可用: 无 atomic 能力 (%s) → 退回【已弃用】CPU 路 (应急)", strerror(errno));
+        return;
+    }
+    cap.capability = 2;   /* DRM_CLIENT_CAP_UNIVERSAL_PLANES */
+    ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
+
+    if (vo_probe_planes(fd, v) < 0) {
+        LOG("⚠ VO 不可用: 找不到 (overlay+NV12 / primary) 平面 → 退回【已弃用】CPU 路 (应急)");
+        return;
+    }
+    if (vo_make_fbs(fd, v, W, H, nbuf) < 0) {
+        LOG("⚠ VO 不可用: NV12 fb 建不出来 → 退回【已弃用】CPU 路 (应急)");
+        return;
+    }
+    /* 空跑一次: 关视频层 + 出黑 OSD4, 验证 atomic 通 */
+    rc = vo_commit(fd, v, 0, 0, prim_fb, 0);
+    if (rc < 0) {
+        LOG("⚠ VO 不可用: atomic commit 不通 → 退回【已弃用】CPU 路 (应急)");
+        return;
+    }
+    v->ok = 1;
+    LOG("✅ 方案A 就绪: video_3=%u(NV12) OSD4=%u 已关, %d 块 NV12 fb (pitch %u) — CPU 不再碰像素",
+        v->ovl, v->prim, nbuf, v->pitch);
+}
+
 
 /* ---------- 卡住等待一帧的间隔 (调试用): 通过环境变量控制 ---------- */
 static int g_verbose;
@@ -462,6 +940,46 @@ static void rot90_cw_pair(const uint8_t *src8, uint8_t *dst8, int w, int h)
                 for (int i = th - 1; i >= 0; i--)
                     *d++ = t[i][j];
             }
+        }
+    }
+}
+
+/* BGRA/RGBA → NV12 (BT.601 limited range)。2026-11-04 主人定「只维护新路」后加:
+ * 现在显示只有一条路 —— NV12 上 VO 视频层 (硬件转色)。老的 `-p bgra/rgba` 源
+ * (ffmpeg / 旧脚本) 必须先在这里变成 NV12, 才能进同一条路。
+ * 真机四条投屏链 (Miracast/AirPlay/CarPlay/CarLife/USB) 都是 v4l2_dec 出 NV12,
+ * 所以这一步在板上实际不会跑, 只是把「非 NV12」这个例外也收进新路。
+ * UV 取 2x2 平均 (标准 4:2:0), 奇数宽/高时忽略最后一行/列。 */
+static void bgra_to_nv12(uint8_t *dst, const uint8_t *src, int w, int h, int rgba)
+{
+    uint8_t *yp = dst;
+    uint8_t *uvp = dst + (size_t)w * h;
+    for (int r = 0; r < h; r++) {
+        const uint8_t *s = src + (size_t)r * w * 4;
+        uint8_t *d = yp + (size_t)r * w;
+        for (int c = 0; c < w; c++, s += 4) {
+            int b = s[0], g = s[1], rr = s[2];
+            if (rgba) { int t = b; b = rr; rr = t; }   /* rgba: 低字节是 R */
+            d[c] = (uint8_t)(((66 * rr + 129 * g + 25 * b + 128) >> 8) + 16);
+        }
+    }
+    int wc = w & ~1, hc = h & ~1;
+    for (int r = 0; r < hc / 2; r++) {
+        const uint8_t *s0 = src + (size_t)(r * 2) * w * 4;
+        const uint8_t *s1 = s0 + (size_t)w * 4;
+        uint8_t *du = uvp + (size_t)r * w;
+        for (int c = 0; c < wc / 2; c++) {
+            const uint8_t *p[4] = { s0 + c * 8, s0 + c * 8 + 4,
+                                    s1 + c * 8, s1 + c * 8 + 4 };
+            int b = 0, g = 0, rr = 0;
+            for (int k = 0; k < 4; k++) {
+                int bb = p[k][0], gg = p[k][1], r2 = p[k][2];
+                if (rgba) { int t = bb; bb = r2; r2 = t; }
+                b += bb; g += gg; rr += r2;
+            }
+            b = (b + 2) >> 2; g = (g + 2) >> 2; rr = (rr + 2) >> 2;
+            du[c * 2]     = (uint8_t)(((-38 * rr - 74 * g + 112 * b + 128) >> 8) + 128);
+            du[c * 2 + 1] = (uint8_t)(((112 * rr - 94 * g - 18 * b + 128) >> 8) + 128);
         }
     }
 }
@@ -1181,6 +1699,11 @@ int main(int argc, char **argv)
         LOG("🎞 多缓冲 + PAGE_FLIP 已启用: %d 块轮转, 异步提交 (屏只会扫到完整帧)", nbuf);
     int cur = 0;   /* 当前**正在显示**的那块 */
 
+    /* 方案A: NV12 直上视频层 (建不成/不通就自动退回 CPU 路径) */
+    struct vo_nv12 vo;
+    int vo_path = 0;
+    vo_init(fd, &vo, crtc, W, H, nbuf, fb_id[0]);
+
     if (blank_only) {
         /* -B: 缓冲区建出来时已 memset(0)=全黑, 这里常驻即可。
          * 用途: 空闲/开机时占住 CRTC, 否则平面被拆掉后面板会扫到未定义内容
@@ -1234,6 +1757,9 @@ int main(int argc, char **argv)
     double t_last_frame = 0;   /* 上一帧帧头时刻 (ms), 用来识别「换源」那段静默 */
     uint8_t *rotbuf = NULL;    /* 转置目标 (只用 heap, 不走共享内存) */
     size_t rot_cap = 0;
+    uint8_t *convbuf = NULL;   /* 非 NV12 源 → NV12 的转换目标 (2026-11-04) */
+    size_t conv_cap = 0;
+    int src_fmt = in_fmt;      /* 源格式 (固定); in_fmt 首帧转换后统一成 2=NV12 */
     size_t frame = (in_fmt == 2) ? (size_t)sw * sh * 3 / 2 : (size_t)sw * sh * 4;
 
     int cx = 0, cy = 0, cw = sw, ch = sh;   /* 源裁剪矩形, 默认整帧 */
@@ -1542,6 +2068,28 @@ int main(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &tb);
         t_read += (tb.tv_sec - ta.tv_sec) * 1e6 + (tb.tv_nsec - ta.tv_nsec) / 1e3;
 
+        /* ---- 统一到 NV12 (2026-11-04, 主人: 只维护新路) ----
+         * 显示侧只剩一条路: NV12 → VO 视频层 (硬件转色)。非 NV12 源 (bgra/rgba,
+         * 只有老的 ffmpeg 直喂场景) 在这里转一次; 硬件解码器本来就出 NV12 ⇒ 不跑。 */
+        if (src_fmt != 2) {
+            size_t need = (size_t)sw_raw * sh_raw * 3 / 2;
+            if (need > conv_cap) {
+                uint8_t *nc = realloc(convbuf, need);
+                if (!nc) { ERR("NV12 转换缓冲分配失败 (%zu B)", need); goto done; }
+                convbuf = nc;
+                conv_cap = need;
+            }
+            bgra_to_nv12(convbuf, buf, sw_raw, sh_raw, src_fmt == 1);
+            buf = convbuf;
+            in_fmt = 2;
+            static int conv_logged;
+            if (!conv_logged) {
+                conv_logged = 1;
+                LOG("输入 %s → NV12 (CPU 转一次, 之后只走 VO 视频层)",
+                    src_fmt == 1 ? "RGBA" : "BGRA");
+            }
+        }
+
         /* ---- 朝向判定 + 横屏整帧转置 (2026-10-29) ----
          * 判定用**内容 bbox** 而不是容器尺寸: 手机投屏常把竖屏画面塞进 1920x1080,
          * 只看容器会把手机也转过去。判一次就锁定 (换分辨率时重判)。 */
@@ -1709,6 +2257,45 @@ int main(int argc, char **argv)
 
         clock_gettime(CLOCK_MONOTONIC, &ta);
         t_crop += (ta.tv_sec - tb.tv_sec) * 1e6 + (ta.tv_nsec - tb.tv_nsec) / 1e3;
+
+        /* ---- NV12 直上 VO 视频层 (CPU 一个像素都不碰: 不转色, 不缩放) ----
+         * 条件: NV12 + 1:1 (内容区 = 整帧, 不缩放)。黑边自己刷 ——
+         * OSD4 (primary) 必须关掉, 它在视频层之上, 而 VO 背景是白色。
+         * 2026-11-04: 不再排除旋转 —— 旋转帧在上面的 rot_deg 分支里已经用
+         * rot90_cw_nv12() 分块转置进 rotbuf 并把 sw/sh 换过, 到这里 buf 就是
+         * 「已转好」的 NV12, 与不旋转帧没有区别 (CarLife 832x480 / AirPlay
+         * 横屏内容都是这条路, 以前被 !rot_deg 挡在视频层外面)。 */
+        vo_path = 0;
+        if (vo.ok && in_fmt == 2 && !scaled && (!rot_deg || vo.rot_ok) &&
+            cw == sw && ch == sh && dw == sw && dh == sh) {
+            if (vo_blit_nv12(&vo, nxt, buf, sw, sh, ox, oy) == 0) {
+                vo_path = 1;
+                if (!vo.logged) {
+                    vo.logged = 1;
+                    LOG("🎬 视频层直出: NV12 %dx%d 贴到 %dx%d @ %d,%d (转色/裁剪交 VO, CPU 只搬字节)",
+                        sw, sh, W, H, ox & ~1, oy & ~1);
+                }
+            }
+        }
+        /* ---- 需要缩放时: CPU 只缩 NV12, 转色仍交 VO (2026-11-04) ----
+         * 真机 Miracast 是 1280x720 源裁出 409x720 → 放大到 480x800, 永远不 1:1。
+         * 旧路在这条路上每帧 ~12 ms (转色+缩放全 CPU); 这里省掉转色, 输出位宽也砍掉 62%。
+         * 旋转帧同样走这里 (buf 已是转好的 NV12, 见上文)。 */
+        if (!vo_path && vo.ok && in_fmt == 2 && (!rot_deg || vo.rot_ok) && scaled &&
+            dw > 0 && dh > 0 && ox >= 0 && oy >= 0) {
+            if (vo_blit_nv12_scaled(&vo, nxt, buf, sw, sh, cx, cy, cw, ch,
+                                    ox, oy, dw, dh) == 0) {
+                vo_path = 1;
+                if (!vo.logged2) {
+                    vo.logged2 = 1;
+                    LOG("🎬 视频层缩放出图: NV12 %dx%d @%d,%d → %dx%d @%d,%d (VO 硬件转色, CPU 只缩放)",
+                        cw, ch, cx, cy, dw, dh, ox & ~1, oy & ~1);
+                }
+            }
+        }
+        if (vo_path)
+            goto draw_done;
+
         if (!scaled && in_fmt != 2) {
             /* 1:1 快速路径 */
             if (in_fmt == 0) {
@@ -1907,7 +2494,25 @@ draw_done:
         /* 画完才 flip: 屏上一帧永远是完整画面 (单缓冲时什么都不做)。
          * 异步提交 (只花 ~0.05 ms), 屏在下一个 vblank 自己换; 绝不能在这里等事件,
          * 一等就是 16 ms, 整圈立刻超过 60 fps 的预算 ⇒ 掉帧。 */
-        if (flip_ok) {
+        if (vo.ok) {
+            /* 方案A: 走 atomic (视频层或 OSD4 二选一), 照样带 flip 事件 ⇒ 显示节拍统计不变 */
+            struct timespec tf0, tf1;
+            uint32_t pfb = vo_path ? 0 : fb_id[nxt];
+            clock_gettime(CLOCK_MONOTONIC, &tf0);
+            if (vo_commit(fd, &vo, vo_path, vo_path ? vo.fb[nxt] : 0, pfb, 1) == 0) {
+                cur = nxt;
+                flip_pending = 1;
+                n_flip++;
+                vo.on = vo_path;
+                idle_black = 0;
+            } else {
+                n_flip_fail++;
+                vo.ok = 0;      /* 出错就彻底退回 CPU 路径, 别每帧刷错 */
+            }
+            clock_gettime(CLOCK_MONOTONIC, &tf1);
+            t_flip += (double)(tf1.tv_sec - tf0.tv_sec) * 1e6 +
+                      (double)(tf1.tv_nsec - tf0.tv_nsec) / 1e3;
+        } else if (flip_ok) {
             struct timespec tf0, tf1;
             clock_gettime(CLOCK_MONOTONIC, &tf0);
             if (do_page_flip(fd, crtc, fb_id[nxt], -1) == 0) {
@@ -2000,7 +2605,13 @@ idle:
                     for (int _x = 0; _x < W; _x++) _q[_x] = 0xFF000000u;
                 }
             }
-            if (flip_ok) {
+            if (vo.ok) {
+                int _b = (cur + 1) % nbuf;
+                if (vo_commit(fd, &vo, 0, 0, fb_id[_b], 0) == 0) {
+                    cur = _b;
+                    vo.on = 0;
+                }
+            } else if (flip_ok) {
                 int _b = (cur + 1) % nbuf;
                 if (do_page_flip(fd, crtc, fb_id[_b], 100) == 0)
                     cur = _b;

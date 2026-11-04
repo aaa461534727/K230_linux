@@ -1,0 +1,104 @@
+diff --git buildroot-overlay/package/nonai2d/src/nonai_2d.c buildroot-overlay/package/nonai2d/src/nonai_2d.c
+index a1d2ccc..e7fde4f 100644
+--- buildroot-overlay/package/nonai2d/src/nonai_2d.c
++++ buildroot-overlay/package/nonai2d/src/nonai_2d.c
+@@ -415,17 +415,24 @@ int32_t nonai_2d_cfg_csc_attr(uint32_t chn_num, struct nonai_2d_job *job)
+     nonai_2d_set_src_ch0_line_byte_stride(src_stride[0], chn->stream_offset);
+     nonai_2d_set_src_ch1_line_byte_stride(src_stride[1], chn->stream_offset);
+     nonai_2d_set_src_ch2_line_byte_stride(src_stride[2], chn->stream_offset);
+ 
+     nonai_2d_set_src_ch0_addr(frame->v_frame.phys_addr[0], chn->stream_offset);
+     nonai_2d_set_src_ch1_addr(frame->v_frame.phys_addr[1], chn->stream_offset);
+     nonai_2d_set_src_ch2_addr(frame->v_frame.phys_addr[2], chn->stream_offset);
+ 
+-    calc_video_line_stride(chn->dst_fmt, frame->v_frame.width, dst_stride);
++    /* dst 的 stride 必须按 **输出** 宽度算。
++     * 原来这里写的是 frame->v_frame.width (frame = &job->in_frame), 即拿源宽度当目标步长:
++     * 源 NV12 1280x720 + 目标 AR24 480x800 时硬件收到 stride=1280*4=5120, 而目标缓冲只有
++     * 480*4=1920 的步长 / 480*800*4=1536000 B, 于是 720 行 x 5120 B 一路写到 3686400 B
++     * ⇒ 越过缓冲末尾 ~2.15 MB, DMA 落到任意物理页 (2026-11-04 实测: AR24 白像素
++     * ff 10 10 10 洒在无关堆上, 跨 ~24 MB, 把 /usr/bin/ai2dplay、python3.12、
++     * wpa_supplicant 都写坏过)。等宽等高的纯 CSC 用例碰不到这个 bug, 所以一直没暴露。 */
++    calc_video_line_stride(chn->dst_fmt, job->out_frame.v_frame.width, dst_stride);
+     nonai_2d_set_dst_ch0_line_byte_stride(dst_stride[0], chn->stream_offset);
+     nonai_2d_set_dst_ch1_line_byte_stride(dst_stride[1], chn->stream_offset);
+     nonai_2d_set_dst_ch2_line_byte_stride(dst_stride[2], chn->stream_offset);
+ 
+     nonai_2d_set_dst_ch0_addr(job->out_frame.v_frame.phys_addr[0], chn->stream_offset);
+     nonai_2d_set_dst_ch1_addr(job->out_frame.v_frame.phys_addr[1], chn->stream_offset);
+     nonai_2d_set_dst_ch2_addr(job->out_frame.v_frame.phys_addr[2], chn->stream_offset);
+ 
+@@ -438,17 +445,17 @@ int32_t nonai_2d_cfg_csc_attr(uint32_t chn_num, struct nonai_2d_job *job)
+             chn_num, video_fmt, frame->v_frame.width, src_stride[0], src_stride[1], src_stride[2]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch0_line_byte_stride(stride=%u)\n", chn_num, src_stride[0]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch1_line_byte_stride(stride=%u)\n", chn_num, src_stride[1]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch2_line_byte_stride(stride=%u)\n", chn_num, src_stride[2]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch0_addr(addr=0x%llx)\n", chn_num, frame->v_frame.phys_addr[0]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch1_addr(addr=0x%llx)\n", chn_num, frame->v_frame.phys_addr[1]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_src_ch2_addr(addr=0x%llx)\n", chn_num, frame->v_frame.phys_addr[2]);
+         nonai_2d_dbg("nonai2d csc chn=%u calc_video_line_stride(dst_fmt=%u, width=%u) => stride=[%u,%u,%u]\n",
+-            chn_num, chn->dst_fmt, frame->v_frame.width, dst_stride[0], dst_stride[1], dst_stride[2]);
++            chn_num, chn->dst_fmt, job->out_frame.v_frame.width, dst_stride[0], dst_stride[1], dst_stride[2]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch0_line_byte_stride(stride=%u)\n", chn_num, dst_stride[0]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch1_line_byte_stride(stride=%u)\n", chn_num, dst_stride[1]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch2_line_byte_stride(stride=%u)\n", chn_num, dst_stride[2]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch0_addr(addr=0x%llx)\n", chn_num, job->out_frame.v_frame.phys_addr[0]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch1_addr(addr=0x%llx)\n", chn_num, job->out_frame.v_frame.phys_addr[1]);
+         nonai_2d_dbg("nonai2d csc chn=%u nonai_2d_set_dst_ch2_addr(addr=0x%llx)\n", chn_num, job->out_frame.v_frame.phys_addr[2]);
+     }
+ 
+diff --git buildroot-overlay/package/nonai2d/src/nonai_2d_dev.c buildroot-overlay/package/nonai2d/src/nonai_2d_dev.c
+index 5b4c6d3..abcdb24 100644
+--- buildroot-overlay/package/nonai2d/src/nonai_2d_dev.c
++++ buildroot-overlay/package/nonai2d/src/nonai_2d_dev.c
+@@ -1086,16 +1086,50 @@ static void device_run(void *prv)
+                 (unsigned long long)v4l2_ctx->out.addr[0],
+                 (unsigned long long)v4l2_ctx->out.addr[1],
+                 (unsigned long long)v4l2_ctx->out.addr[2]);
+             spin_unlock_irqrestore(&drv_ctx->ctrl_lock, flags);
+             return;
+         }
+     }
+ 
++    /*
++     * 硬件没有目标尺寸寄存器: nonai_2d_set_src_size() 是唯一的几何信息,
++     * 所以 AI2D 只会输出 in_w x in_h 个像素 (它做 CSC, 不做缩放)。
++     * 若采集缓冲装不下这么多像素, 引擎会一路 DMA 到缓冲末尾之外 ——
++     * 2026-11-04 实测正是这样把 AR24 像素洒进系统 RAM, 毁过根文件系统。
++     * 这里直接把不可能完成的 job 判死, 让错误暴露在上层, 不再静默野写。
++     */
++    if (chn->cfg.nonai_2d_calc_mode == nonai_2d_calc_mode_csc) {
++        uint32_t bpp = (v4l2_ctx->out.fmt.depth + 7) >> 3;
++        u32 need = v4l2_ctx->in.height * v4l2_ctx->out.width * bpp;
++        u32 have = vb2_plane_size(&dst->vb2_buf, 0);
++
++        if (!bpp || v4l2_ctx->out.width < v4l2_ctx->in.width ||
++            v4l2_ctx->out.height < v4l2_ctx->in.height || have < need) {
++            /* 每帧都会走到这里, 限速打日志: 前 5 次 + 之后每 300 次一次, 免得把 dmesg 环形缓冲冲掉 */
++            static unsigned int drop_cnt;
++            if (drop_cnt < 5 || !(drop_cnt % 300))
++                v4l2_err(&drv_ctx->v4l2_dev,
++                    "nonai 2d: %ux%u -> %ux%u does not fit %u B capture buffer (need %u B); AI2D has no scaler, job dropped (count=%u)\n",
++                    v4l2_ctx->in.width, v4l2_ctx->in.height,
++                    v4l2_ctx->out.width, v4l2_ctx->out.height, have, need, drop_cnt + 1);
++            drop_cnt++;
++            spin_unlock_irqrestore(&drv_ctx->ctrl_lock, flags);
++            src = v4l2_m2m_src_buf_remove(v4l2_ctx->fh.m2m_ctx);
++            dst = v4l2_m2m_dst_buf_remove(v4l2_ctx->fh.m2m_ctx);
++            if (src)
++                v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
++            if (dst)
++                v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
++            v4l2_m2m_job_finish(drv_ctx->m2m_dev, v4l2_ctx->fh.m2m_ctx);
++            return;
++        }
++    }
++
+     nonai_2d_info("nonai 2d device_run in.addr=[0x%llx,0x%llx,0x%llx] out.addr=[0x%llx,0x%llx,0x%llx]\n",
+             (unsigned long long)v4l2_ctx->in.addr[0],
+             (unsigned long long)v4l2_ctx->in.addr[1],
+             (unsigned long long)v4l2_ctx->in.addr[2],
+             (unsigned long long)v4l2_ctx->out.addr[0],
+             (unsigned long long)v4l2_ctx->out.addr[1],
+             (unsigned long long)v4l2_ctx->out.addr[2]);
+ 

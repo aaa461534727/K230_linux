@@ -235,25 +235,32 @@ CPU 侧还能跑到 285 fps。剩下的限制只在手机 `screenrecord` 给多�
 
 ### 关于「用 VDEC → VO Scaler → 屏」这条建议
 
-方向对一半, 但**这块板上没有 VO**:
+方向对一半: **VO 有, VO 的缩放器没有** (2026-11-04 板上核实并实测):
 
 | 模块 | 本板是否存在 | 说明 |
 |---|---|---|
 | VPU / VDEC | ✅ `/dev/video0` (name=`mvx`) | H.264/HEVC 硬解, 且**自带下采样** (`-s`) —— 就是本次用的缩放器 |
 | AI2D | ✅ `/dev/video4` (`canaan-non-ai-2d`), 用户态 `/dev/k230-ai2d` | 通用 2D 缩放, 但**只吃 RGB888**; 解码器出的是 NV12, 得先转色 ⇒ 比 VPU 下采样贵 |
 | VGLite | ✅ `/dev/vg_lite` | 2D GPU (填充/混合), 不做 YUV 缩放 |
-| VO (Video Output, 带图层缩放) | ❌ **没有** `/dev/vo*`, 也没有 `canaan-vo` | 那是 CanMV RT-Smart 那套 `DisplayConfig`/`media` 框架的接口, 本板 Linux 侧没编进去 |
-| DRM | ✅ `/dev/dri/card0` (ARGB8888 dumb buffer) | 本板的上屏方式, 只能整帧写 |
+| VO **视频层** | ✅ **有** —— 没有 `/dev/vo*` 字符设备, 但 `canaan-vo` 以 DRM 平面形式暴露 (`video_1/2/3` + `OSD4~7`: `plane[31]`=video_3) | `video_3` **原生收 NV12** 且 VO 的 yuv2rgb 已开 ⇒ 1:1 内容可以整帧贴上去, **转色不再占 CPU** (2026-11-04 实测: 转换 14.2→0.2 ms, 每帧CPU 14.18→1.33 ms, 详见 `docs/PROGRESS.md` 当日 VO 条) |
+| VO 的**图层缩放** | ❌ **没有** | `canaan_vo_update_video()` 的 ACT_SIZE/XCTL 全用**源**宽高, 换 src/crtc 尺寸 `SETPLANE` 直接 `ENOSPC` ⇒ 缩放仍必须交解码器 `-s` |
+| DRM | ✅ `/dev/dri/card0` (ARGB8888 dumb buffer) | legacy 上屏方式 (`SETCRTC`+`PAGE_FLIP`), 只能整帧写 |
 
-所以正确的映射是:
+所以正确的映射是 (**两条路, 按内容几何选**):
 
 ```
 手机 screenrecord (H.264) → USB bulk → 板:VPU 硬解 + 硬件下采样 (一次搞定)
-   → 共享内存两槽 (零拷贝) → drmplay: 1:1 NV12→ARGB → DRM → 屏
+   → 共享内存两槽 (零拷贝) → drmplay:
+        ① 1:1 内容 (不缩放不旋转) → NV12 直接贴 VO video_3 (CPU 0 转色)
+        ② 需要缩放/旋转       → CPU 转 NV12→AR24 → legacy SETCRTC/PAGE_FLIP
 ```
 
-不需要 AI2D, 也不需要 VO。**缩放交给解码器**是最省的: 它本来就要把 YUV 写出来,
+不需要 AI2D。**缩放交给解码器**是最省的: 它本来就要把 YUV 写出来,
 顺手按 `-s` 写小一号即可, 不额外多一趟内存带宽。
+
+> `run.sh` 默认请求 **448x800** 码流 ⇒ 到 drmplay 就是「1:1 + 左右各 16 px 黑边」,
+> 正好走 ① 视频层直出: 板上实测 `转换 13.3→0.2 ms` / `每帧CPU 13.29→1.26 ms` /
+> drmplay 单核占用 `76%→7%` (`WFD_VO=0` 可强制退回旧路)。
 
 ## 开关一览 (run.sh 里已默认打开)
 

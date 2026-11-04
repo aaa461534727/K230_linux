@@ -156,3 +156,109 @@ make ARCH=riscv CROSS_COMPILE=<sdk>/host/bin/riscv64-unknown-linux-gnu- \
 **回滚**: 板上 `cp /root/8189fs.ko.bak-20261023b /lib/modules/6.6.36/updates/8189fs.ko && rmmod 8189fs && modprobe 8189fs`
 (那份是 `survey_times=1` 的旧版, md5 `5339a786a928c243ca27708094718905`); 源码 `patch -R -p1 <` 本补丁。
 带本补丁的 ko md5 = `44917f9637745e7030c92fdfba2ccb03`。
+
+---
+
+# 6. AI2D 驱动 (nonai2d) — dst stride 与越界保护
+
+> 与 WiFi 无关，同目录存放是因为都是「K230 内核/驱动层的补丁」。
+> 补丁文件: `nonai2d-k230-dst-stride-oob-guard.patch` (目标:
+> `buildroot-overlay/package/nonai2d/src/nonai_2d.c` + `nonai_2d_dev.c`)
+
+## 6.1 事故症状
+
+用 AI2D (`/dev/video4`) 做 NV12→AR24 上屏后，**系统内存被随机写入**：
+
+- 一块 48 MB 无关堆被写 648720 字节，内容恒为 `ff 10 10 10` (= AR24 白色)
+- 污染跨 ~24 MB，写坏过 `/usr/bin/ai2dplay`、`/usr/bin/python3.12`、`/usr/sbin/wpa_supplicant`
+- 后果: systemd 瘫、SSH 连不上、黑屏
+
+A/B 对照证明与上屏无关: **只跑 AI2D M2M、连 DRM 都不打开，脏数据照样出现**。
+
+## 6.2 根因 (两条)
+
+**① dst stride 用了源宽度** — `nonai_2d.c` `nonai_2d_cfg_csc_attr()`:
+
+```c
+frame = &job->in_frame;
+calc_video_line_stride(chn->dst_fmt, frame->v_frame.width, dst_stride);   /* 源宽度 */
+```
+
+给硬件的目标行距 = **源宽度 × dst 字节/像素**。1280x720 NV12 → 480x800 AR24 时:
+
+| 项 | 值 |
+|---|---|
+| 采集缓冲 | 480×800×4 = 1536000 B |
+| 应为 stride / 总量 | 1920 / 1382400 B |
+| 实际 stride / 总量 | **5120** / **3686400 B** |
+| 越界 | **2150400 B** |
+
+等宽等高的纯 CSC 用例碰不到 (源宽 = 目标宽)，所以一直没暴露。
+
+**② AI2D 没有缩放器** — `nonai_2d_reg.h` 里不存在 dst 宽高寄存器，只有
+`nonai_2d_set_src_size()`。硬件永远输出 `in_w × in_h` 个像素。
+⇒ **AI2D 只做 CSC，不做缩放**，这是硬限制，改驱动也没用。
+
+> 连带订正: 2026-11-03 记的「120 帧 1280x720 → 480x800 全硬件转 ≈60fps」是假象 ——
+> 多出来的像素当时正被写进系统内存。
+
+## 6.3 改了什么
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `nonai_2d.c` | dst stride 改用 `job->out_frame.v_frame.width` |
+| 2 | `nonai_2d_dev.c` `device_run()` | `need = in_h × out_w × bpp` 与 `vb2_plane_size(dst,0)` 比；装不下或 out 比 in 小 ⇒ 不启动 DMA，`VB2_BUF_STATE_ERROR` + `v4l2_m2m_job_finish` |
+| 3 | `nonai_2d_dev.c` | 拒绝日志限速 (前 5 次 + 每 300 次一条) |
+
+## 6.4 验证
+
+**stride 直接证据** (320x240→480x240，两版都不会越界，可安全对照):
+
+| 驱动 | 采集缓冲最高写入偏移 | 说明 |
+|---|---|---|
+| 旧 | 307199 | = 240 × 1280，行距被写成源宽 |
+| 新 | 460159 | = 458880 + 320，行距正确 |
+
+**回归** (48 MB 堆填 0x5A 哨兵，只开 `/dev/video4`):
+
+| 用例 | 帧数 | ok/err | 哨兵堆被改 |
+|---|---|---|---|
+| 1280x720 → 480x800 (原 bug 形状) | 2000 | 0 / 2000 | 0 字节 |
+| 480x800 → 480x800 | 1000 | 1000 / 0 | 0 字节 |
+| 1280x720 → 1280x720 | 120 | 120 / 0 | 0 字节 |
+
+**改好后 AI2D 的实际吞吐** (QBUF→DQBUF 往返):
+
+| 输入→输出 | 单帧 | 上限 |
+|---|---|---|
+| 480x800 → 480x800 | 1.16 ms | 861 fps |
+| 420x720 → 420x720 | 0.95 ms | 1051 fps |
+| 1280x720 → 1280x720 | 2.74 ms | 365 fps |
+
+## 6.5 应用
+
+```sh
+cd K230/sdk/k230_linux_sdk
+patch -p0 --dry-run < ../../src/K230-cast/miracast/driver/nonai2d-k230-dst-stride-oob-guard.patch
+make nonai2d-dirclean nonai2d CONF=k230_canmv_01studio_defconfig
+# 产物: output/k230_canmv_01studio_defconfig/target/lib/modules/6.6.36/updates/nonai2d.ko
+```
+
+模块可热换，**不必重烧固件**:
+
+```sh
+scp nonai2d.ko root@<板>:/lib/modules/6.6.36/updates/
+ssh root@<板> 'rmmod nonai2d && insmod /lib/modules/6.6.36/updates/nonai2d.ko'
+```
+
+## 6.6 修好后 AI2D 能干什么 / 不能干什么
+
+| 能 | 说明 |
+|---|---|
+| **NV12/YUV → ARGB 转色** | BT.601/709 系数、饱和、clamp 全在硬件，0.95~2.74 ms/帧 |
+| **裁黑边** | 靠源基址偏移 + `src_size` 只声明子区域；硬件支持，**驱动尚未封装** |
+| OSD 叠加 / 画边框 / alpha 混合 | 驱动有这三种 mode |
+
+| 不能 | 原因 |
+|---|---|
+| **缩放** | 没有 dst 尺寸寄存器，硬限制 |
