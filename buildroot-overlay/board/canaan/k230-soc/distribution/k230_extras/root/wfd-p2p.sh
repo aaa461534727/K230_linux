@@ -76,6 +76,20 @@ STATION_IFACE="${WFD_STATION_IFACE:-wlan0}"
 #   要 1080p30:              WFD_CEA=0x80 sh wfd-p2p.sh start
 #   要 720p 双档:            WFD_CEA=0x60 sh wfd-p2p.sh start
 WFD_LOWLAT="${WFD_LOWLAT:-0}"; export WFD_LOWLAT
+# ★ 2026-11-04 自适应帧率档 (按手机学, 不写死机型; 说明见 K230/src/K230-cast/miracast/tools/wfd-autotune):
+#   WFD_CEA=auto  ⇒ 每台手机第一次给 0x20 (720p30 安全档), 会话结束采样入库,
+#                    有需要就下次用 0x60 试一次 720p60, 再按实测锁 0x40 或退回 0x20。
+#                    **sink 只会看到合法 hex** —— 这里先把 auto 换成兜底档, 免得
+#                    wfd_sink.c 的 strtoul("auto")=0 变成"什么都不广告"。
+#   WFD_CEA=0x20/0x40/0x60/0x80 ⇒ 老行为, 写死一档 (auto 以外的值一概不动)。
+CEA_AUTO=0
+if [ "${WFD_CEA:-}" = "auto" ]; then
+    CEA_AUTO=1
+    WFD_CEA="${WFD_CEA_AUTO_FALLBACK:-0x20}"
+fi
+[ -n "${WFD_CEA:-}" ] && export WFD_CEA
+AUTOTUNE="${WFD_AUTOTUNE_BIN:-/usr/bin/wfd-autotune}"
+PEER_FILE="${WFD_PEER_FILE:-/run/wfd-peer}"   # 第 1 行=对端 key(go_dev_addr 优先), 第 2 行=SSID
 PIDFILE="${WFD_PIDFILE:-/run/wfd-p2p.pid}"
 # 2026-10-26 自启与调试的隔离阀: 有本文件时自启**空跑退出**, 不会去抢 wlan1 / 7236。
 #   · stop 子命令默认置位 (调试时停一次就不会被 systemd 再拉起来)
@@ -1133,10 +1147,34 @@ start_sink_client() {
         PLAYER_BIN="'"$PLAYER_BIN"'"
         PLAYER_OPTS="'"$PLAYER_OPTS"'"
         SINK_ARG="'"$SINK_ARG"'"
+        AUTOTUNE="'"$AUTOTUNE"'"
+        CEA_AUTO="'"$CEA_AUTO"'"
+        PEER_FILE="'"$PEER_FILE"'"
         i=0
+        _logged_peer="__none__"
         while :; do
+            # ★ 2026-11-04 自适应帧率档: 每轮管线启动前按「当前对端」选档。
+            #   WFD 的帧率由 M3 的 CEA 位图定死, 只在本进程启动时读环境变量 ⇒
+            #   会话中途改不了, 只能「本次测量, 下次生效」。
+            _peer=$(sed -n 1p "$PEER_FILE" 2>/dev/null)
+            _pname=$(sed -n 2p "$PEER_FILE" 2>/dev/null)
+            if [ "$CEA_AUTO" = "1" ] && [ -x "$AUTOTUNE" ]; then
+                _c=$("$AUTOTUNE" select --peer "$_peer" 2>/dev/null) || _c=""
+                case "$_c" in 0x20|0x40|0x60) WFD_CEA="$_c"; export WFD_CEA ;; esac
+                if [ "$_peer" != "$_logged_peer" ]; then
+                    _logged_peer="$_peer"
+                    echo "[$(date +%H:%M:%S)] 🎚 autotune: peer=${_peer:-未知手机} → WFD_CEA=$WFD_CEA" \
+                        >>/var/log/miracast.log
+                fi
+            fi
+            _off=$(stat -c %s /var/log/miracast.log 2>/dev/null || echo 0)
             '"$PIPE_ONE"'
             _rc=$?
+            # 会话结束 → 把这次采样交给 autotune 决策 (后台跑, 不挡管线重连)
+            if [ "$CEA_AUTO" = "1" ] && [ -x "$AUTOTUNE" ] && [ -n "$_peer" ]; then
+                "$AUTOTUNE" record --peer "$_peer" --name "$_pname" --cea "$WFD_CEA" \
+                    --log /var/log/miracast.log --offset "$_off" --quiet >/dev/null 2>&1 &
+            fi
             # GPU 播放器起不来 (没 /dev/vg_lite / map 失败等) 立刻回落 CPU, 不让主人看到黑屏
             if [ "$_rc" -ne 0 ] && [ "$PLAYER_BIN" = /usr/bin/vgplay ]; then
                 echo "$(date) vgplay 退出码 $_rc → 回落 CPU 缩放 (drmplay)" >>/var/log/miracast-play.log
@@ -1213,6 +1251,13 @@ start_client_watcher() {
                 _gif=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="P2P-GROUP-STARTED"){print $(i+1); exit}}')
                 _role=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="P2P-GROUP-STARTED"){print $(i+2); exit}}')
                 log "✅ 组已建立: iface=$_gif role=$_role"
+                # ★ 2026-11-04 自适应帧率档: 记下对端身份 (go_dev_addr 优先, 退回组 SSID)。
+                #   wfd-autotune 用它把"这台手机在 60fps 档行不行"记成一条档案,
+                #   下次同一台手机连回来 (sink 重启时读 /run/wfd-peer) 直接命中。
+                _ssid=$(printf '%s\n' "$line" | sed -n 's/.*ssid="\([^"]*\)".*/\1/p')
+                _gda=$(printf '%s\n' "$line" | sed -n 's/.*go_dev_addr=\([0-9a-fA-F:][0-9a-fA-F:]*\).*/\1/p')
+                { printf '%s\n%s\n' "${_gda:-$_ssid}" "$_ssid"; } > "$PEER_FILE" 2>/dev/null || true
+                log "   对端标识 (autotune): key=${_gda:-$_ssid} ssid=${_ssid:-?}"
                 if [ "$_role" = "client" ]; then
                     prepare_client_net "$_gif"
                     log "   wfd-sink 主动连 rtsp://$SINK_GO_IP:$SINK_GO_PORT (GO=手机或 PC, 由上面判定)"
@@ -1463,6 +1508,15 @@ cmd_client() {
     # K230 2026-10-24: 开机自启已改为本脚本(client)本身, 不再停 miracast.service (否则自杀)
     ip addr flush dev "$IFACE" 2>/dev/null || true
     rm -f /tmp/wfd-p2p.done /tmp/wfd-p2p.failed
+    # ★ 2026-11-04 修复「client 模式被系统 supplicant 抢网卡」:
+    #   cmd_client 原来**直接** start_supplicant, 没走 stop_supplicant() 里的
+    #   「mask + stop 系统 wpa_supplicant@<iface>」那一段 (那段只在 cmd_start 里) ⇒
+    #   只要系统单元在跑 (例: 先跑过 `wfd-p2p.sh stop`, 它会 unmask+start 回来),
+    #   板上就有两个 wpa_supplicant 抢同一个 wlan0, P2P 关联后被自踢:
+    #     wlan0: No network configuration found for the current AP
+    #     wlan0: CTRL-EVENT-DISCONNECTED ... reason=3 locally_generated=1
+    #   现场表现 = 手机列表里能看到 K230-CAST, 但点一次失败一次, 永远连不上。
+    stop_supplicant
     start_supplicant
 
     # 建组/重新关联都会把 power_save 重置回 on, 所以整个会话期每 5 s 复核一次
@@ -1538,18 +1592,30 @@ cmd_stop() {
     stop_dhcpd
     wpa p2p_group_remove "$IFACE" >/dev/null 2>&1 || true
     stop_supplicant
-    if [ -f /tmp/wfd-p2p-backup.conf ]; then
-        for c in "/etc/wpa_supplicant/wpa_supplicant-$IFACE.conf" \
-                 "/etc/wpa_supplicant/wpa_supplicant.conf"; do
-            if [ -f "$c" ]; then cp -a /tmp/wfd-p2p-backup.conf "$c"; log "已恢复 $c"; break; fi
-        done
+    # ★ 2026-11-04 主人定: 「我的 WiFi 只用于投屏, 不是这些」⇒ **默认不把 station(sta) 那一路放回来**。
+    #   原来这里无条件 `unmask --runtime + systemctl start wpa_supplicant@wlan0`,
+    #   于是「停一次服务」就把系统 supplicant 拉回来; 下次 client 模式启动时它先占住 wlan0,
+    #   再被 cmd_client 起自己的 ⇒ 两个 wpa_supplicant 抢同一块网卡,
+    #   现场表现 = 手机列表看得到 K230-CAST, 但点一次失败一次
+    #   (`wlan0: No network configuration found for the current AP` +
+    #    `CTRL-EVENT-DISCONNECTED ... reason=3 locally_generated=1`)。
+    #   现在默认: station conf 不恢复、单元不启动 (板端两单元也已永久 mask)。
+    #   真要把 wlan0 当普通 WiFi 用 (连 AP 上网/调试) 时, 显式 `WFD_RESTORE_STA=1`。
+    if [ "${WFD_RESTORE_STA:-0}" = "1" ]; then
+        if [ -f /tmp/wfd-p2p-backup.conf ]; then
+            for c in "/etc/wpa_supplicant/wpa_supplicant-$IFACE.conf" \
+                     "/etc/wpa_supplicant/wpa_supplicant.conf"; do
+                if [ -f "$c" ]; then cp -a /tmp/wfd-p2p-backup.conf "$c"; log "已恢复 $c"; break; fi
+            done
+        fi
+        # 只在 GO 用的是 station 网卡 (回退模式) 时才恢复 systemd 的 station supplicant
+        if [ "$IFACE" = "$STATION_IFACE" ]; then
+            systemctl unmask --runtime "wpa_supplicant@$IFACE" wpa_supplicant 2>/dev/null || true
+            systemctl start "wpa_supplicant@$IFACE" 2>/dev/null || systemctl start wpa_supplicant 2>/dev/null || true
+            sleep 3
+        fi
     fi
-    # 只在 GO 用的是 station 网卡 (回退模式) 时才恢复 systemd 的 station supplicant
-    if [ "$IFACE" = "$STATION_IFACE" ]; then
-        systemctl unmask --runtime "wpa_supplicant@$IFACE" wpa_supplicant 2>/dev/null || true
-        systemctl start "wpa_supplicant@$IFACE" 2>/dev/null || systemctl start wpa_supplicant 2>/dev/null || true
-        sleep 3
-    else
+    if [ "$IFACE" != "$STATION_IFACE" ]; then
         # 独立 P2P 网卡: 把 GO 地址摘掉就行, wlan0 全程没被动过
         ip addr del "$GO_IP/24" dev "$IFACE" 2>/dev/null || true
         ip link set dev "$IFACE" down 2>/dev/null || true

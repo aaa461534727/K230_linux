@@ -3,6 +3,7 @@ Description=CarPlay AirPlay server (pair-setup/pair-verify/auth-setup, TCP 7000)
 After=network.target
 
 [Service]
+Type=simple
 Environment=CARPLAY_SRP_PASS=3939
 ExecStart=/usr/local/bin/carplay-airplayd
 Restart=always

@@ -4,6 +4,7 @@ After=carplay-arbiter.service bluetooth.target
 Wants=carplay-arbiter.service
 
 [Service]
+Type=simple
 Environment=CARPLAY_AP_SSID=K230-CARPLAY
 Environment=CARPLAY_AP_PASS=k230carplay
 Environment=CARPLAY_AP_CHANNEL=6

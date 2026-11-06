@@ -35,7 +35,9 @@ LOCK="${WFD_PLAYER_LOCK:-/run/wfd-player.lock}"
 #   系统 RAM 任意页 —— 另有进程 48 MB 堆里被打进 648720 字节 `ff 10 10 10` 图案, 跨 ~24 MB 范围;
 #   drmplay 同条件 0 字节被改。野生 DMA 还顺着页缓存把 /usr/bin/ai2dplay、/usr/bin/python3.12
 #   本身写坏过 ⇒ 继续用会随机毁根文件系统。详见 docs/PROGRESS.md 2026-11-04「AI2D 野写」条目)
-# drmplay: NV12→AR24 + 缩放都在 CPU 上 (VPU 侧已做 -s 硬降采样, 1:1 直贴时 CPU 只搬字节)
+# drmplay (2026-11-04 起**只有一条显示路**): NV12 上 VO 视频层, 转色由 VO 硬件做;
+#   CPU 只做「NV12→NV12 缩放」和「旋转帧的分块转置」, 非 NV12 源先转一次 NV12。
+#   旧 CPU 转色路 (NV12→AR24) 已弃用, 只在 VO 初始化失败 / WFD_VO=0 时兜底。
 OPTS="${WFD_PLAYER_OPTS:--H -p nv12 -w 480 -h 800 -S}"
 LOG="${SCREEN_LOG:-/var/log/k230-screen.log}"
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=K230 蓝牙配对 agent (自动接受 Just Works, 让手机能连上 K230-CAST)
+Documentation=file:///root/K230-cast/airplay/README.md
+# bluetoothd 必须在跑 (agent 是注册到它的 AgentManager1 上的)
+After=bluetooth.service
+Wants=bluetooth.service
+ConditionPathExists=/sys/class/bluetooth/hci0
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/k230-bt-agent
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

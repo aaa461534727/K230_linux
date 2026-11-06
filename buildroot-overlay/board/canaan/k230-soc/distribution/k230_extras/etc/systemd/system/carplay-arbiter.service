@@ -1,8 +1,9 @@
 [Unit]
-Description=CarPlay transport arbiter (stub)
+Description=CarPlay transport arbiter (K230 只有无线, 一律批准)
 After=bluetooth.target network.target
 
 [Service]
+Type=simple
 ExecStart=/usr/local/bin/carplay-arbiter
 Restart=always
 RestartSec=3

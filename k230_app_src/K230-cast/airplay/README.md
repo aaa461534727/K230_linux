@@ -20,6 +20,9 @@
 |---|---|
 | `k230-airplay` | 启动脚本: 起硬解看护 + uxplay; `AIRPLAY_AUDIO` 默认 1 (开音频) |
 | `k230-airplay.service` | systemd 单元 (`Environment=UXPLAY_VIDEO_PIPE=1` / `AIRPLAY_AUDIO=1`) |
+| `k230-bt-hid` | 蓝牙反控主程序 (经典 HID 设备端: 触摸/键盘 → 手机; 源码真相在本目录, SDK 侧 `k230_app_src/K230-cast/airplay/` 同步, 构建时由 `k230_extras_build.sh` 装进 `/usr/bin`) |
+| `k230-bt-hid-logic-test` | 触摸手势 → HID 报告的离线逻辑自测 (16 项) |
+| `k230-bt-hid-int-test.py` | 中断通道 accept / GET_REPORT 离线回归 (PASS 4/4, 不需要手机) |
 | `build-uxplay.sh` | 板端 native 编译 uxplay (vendored 源码 + 打 patches/) |
 | `patches/` | 0001 视频管道 / 0002 落盘不缓冲 / 0003 音频管道 |
 | `vendor/uxplay-master.tar.gz` | 上游 pristine 源码 (可复现) |

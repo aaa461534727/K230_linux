@@ -1,0 +1,25 @@
+# /etc/systemd/system/k230-bt-hid.path — hci0 一出现就把反控服务拉起来
+#
+# 为什么需要它 (2026-11-05 现场):
+#   k230-bt-hid.service 带 `ConditionPathExists=/sys/class/bluetooth/hci0`,
+#   systemd **只在"尝试启动的那一刻"** 判条件。实测这一轮: 开机时 USB 蓝牙棒
+#   (0a12:0001 CSR clone) 没枚举出 hci0 ⇒ 服务被 skip (enabled 却 inactive),
+#   之后无论 hci0 什么时候出现, **没人再去启动它** ⇒ 手机连得上蓝牙却拿不到
+#   反控通道 (现场症状: 蓝牙里能看到 K230-CAST, 但指针不动)。
+#   path 单元只在条件由假变真时触发一次, 正好补这个缺口; 开机时若 hci0 已在,
+#   它也会立刻触发一次 (等价于原来的直接启动)。
+#
+# 排查用:
+#   systemctl status k230-bt-hid.path
+#   journalctl -u k230-bt-hid.path -u k230-bt-hid -n 40 --no-pager
+
+[Unit]
+Description=K230 HID 反控: 等 hci0 出现后自动启动 k230-bt-hid
+Documentation=file:///root/K230-cast/airplay/README.md
+
+[Path]
+PathExists=/sys/class/bluetooth/hci0
+Unit=k230-bt-hid.service
+
+[Install]
+WantedBy=multi-user.target

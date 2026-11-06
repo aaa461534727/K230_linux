@@ -1,0 +1,15 @@
+[Unit]
+Description=Miracast sink: P2P client (wfd-p2p.sh client) 自动建组 + wfd-sink 收流硬解上屏
+After=network.target
+
+[Service]
+Type=simple
+# K230 2026-10-24: 开机进入 P2P client 模式 (手机当 GO, K230 拨手机 RTSP :7236)
+# 建组后脚本自动配 IP + 起 wfd-sink | v4l2_dec | drmplay; 拆组后自动复位
+ExecStart=/bin/sh /root/wfd-p2p.sh client
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

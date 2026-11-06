@@ -6,6 +6,11 @@ Wants=k230-carlife-ap.service
 [Service]
 Type=simple
 # 2026-10-30 真机打通: 听 UDP 7999 的 "CarlifeHost" 广播, 再连手机 7240/8240/9240-9242/9340/9440
+# 2026-11-03 零拷贝 + 最低延迟投喂 (carlife_sink fork 出来的 v4l2_dec 继承这两个环境变量;
+#   必须与 k230-screen.sh 的 WFD_SHM 一致, 一端开一端不开会解析错帧头)。
+#   板上 1080p/30fps A/B: 管道延迟 82.6~85.0 ms → 19.4~21.2 ms, 每帧CPU 14.50 → 12.16 ms。
+Environment=WFD_SHM=/run/wfd-frame
+Environment=DEC_AU=2
 ExecStart=/root/carlife/carlife_sink --wifi --verbose
 Restart=always
 RestartSec=3

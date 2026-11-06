@@ -1,0 +1,29 @@
+[Unit]
+Description=K230 HID 反控 (板子当蓝牙鼠标/键盘, 给手机反向控制: 经典 BR/EDR)
+Documentation=file:///root/K230-cast/airplay/README.md
+# 蓝牙没起来就起不来: bluetoothd 负责 SDP / profile 注册, 必须先在跑。
+After=bluetooth.service systemd-modules-load.service
+Wants=bluetooth.service
+# btusb 由 /etc/modules-load.d/btusb.conf 开机加载; dongle 不在就没有 hci0,
+# 这时别无限重启刷日志, 直接跳过 (插上 dongle 后 systemctl start 即可)。
+ConditionPathExists=/sys/class/bluetooth/hci0
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 触摸手感参数: 现场觉得太慢/太快就改这里 (或写 drop-in 覆盖)
+Environment=K230_BT_HID_SENS=2.2
+Environment=K230_BT_HID_NAME=K230-CAST
+# --transport classic: 本板这支 dongle 的 LE 广播引擎是坏的 (内核报
+# "Unbranded CSR clone detected"), 只有经典通道能通; 细节见 docs/QUIRKS.md §8。
+# 换成能正常广播的 dongle 后改成 --transport ble 才能给 iOS 用 (iOS 只吃 BLE HOGP)。
+# 闸门 unit = Miracast 会话在跑时把触摸让给它的 UIBC, 只有 AirPlay/空闲时才走蓝牙,
+# 避免安卓投屏时"手指一动, UIBC 和 BT HID 各发一次"造成双击。
+ExecStart=/usr/bin/k230-bt-hid run --gate unit --transport classic
+Restart=on-failure
+RestartSec=5
+# 退出码 3 = 蓝牙不可用 (无 hci0 / bluetoothd 没跑), 值得重启等它就绪
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

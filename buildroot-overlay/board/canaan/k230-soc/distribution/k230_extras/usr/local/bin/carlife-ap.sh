@@ -54,8 +54,9 @@ nat_on() {
 case "${1:-start}" in
 start)
     echo "[ap] 停 Miracast (同一颗网卡) + 清 P2P"
-    systemctl stop k230-miracast 2>/dev/null
-    systemctl stop k230-cast 2>/dev/null
+    # 被 oneshot 单元调用时同步 stop 会死锁 ⇒ 加 timeout 兜底 (最坏 10 s 后放弃)
+    timeout 10 systemctl stop k230-miracast 2>/dev/null
+    timeout 10 systemctl stop k230-cast 2>/dev/null
     pkill -f wfd-p2p.sh 2>/dev/null
     pkill -f k230-fallback.py 2>/dev/null
     pkill -x hostapd 2>/dev/null
@@ -63,7 +64,11 @@ start)
     pkill -x dhcpd 2>/dev/null
     # STA 模式残留 (上次 sta 用过的 wpa_supplicant / dhcpcd lease) 必须清掉,
     # 否则它会把网卡又拽回 managed, hostapd 报 AP-ENABLED 但实际连不上。
-    pkill -x wpa_supplicant 2>/dev/null
+    # ★ 2026-11-02: **只清本网卡上的 supplicant**。原来是 pkill -x wpa_supplicant (全局),
+    #   会把 wlan0 连路由器的那个一起杀掉 (板卡就再也回不来, 现场两次失联);
+    #   本板 wlan0/wlan1 是同一颗 8189fs 的两个 vif, 但进程可以各管一个。
+    pkill -f "wpa_supplicant.*-i *\${IFACE}\b" 2>/dev/null
+    pkill -f "wpa_supplicant.*-i *\${IFACE} " 2>/dev/null
     dhcpcd -k "$IFACE" >/dev/null 2>&1 || true
     sleep 2
     ip addr flush dev "$IFACE" 2>/dev/null
@@ -130,12 +135,18 @@ EOF
     nat_on
 
     # 屏幕只有一块: 无线会话和 USB 会话不能同时跑 (各起一个 v4l2_dec 抢播放器)
-    systemctl stop k230-carlife 2>/dev/null
-    systemctl restart k230-carlife-wifi 2>/dev/null
-    if systemctl is-active k230-carlife-wifi >/dev/null 2>&1; then
-        echo "[ap] 无线 CarLife 服务已起 (k230-carlife-wifi)"
+    # ★ 2026-11-02: 本脚本现在会被 k230-shared-ap.service (Type=oneshot) 调用。
+    #   **oneshot 的 ExecStart 里绝不能同步 systemctl start/restart 别的单元** ——
+    #   systemd 事务排队会死锁到自己超时, 超时后 TERM 连带杀掉刚起好的 hostapd
+    #   (现场 17:36:26: hostapd 已 AP-ENABLED, 却因 start 超时被全部回收)。
+    #   所以: ① 由仲裁器负责起投屏端时设 CARLIFE_AP_SKIP_SERVICE=1;
+    #        ② 否则一律用 --no-block (只排队, 不等待)。
+    if [ "${CARLIFE_AP_SKIP_SERVICE:-0}" = "1" ]; then
+        echo "[ap] 跳过 k230-carlife-wifi (由仲裁器负责)"
     else
-        echo "[ap] ! k230-carlife-wifi 没起来: journalctl -u k230-carlife-wifi"
+        systemctl stop k230-carlife 2>/dev/null
+        systemctl --no-block restart k230-carlife-wifi 2>/dev/null
+        echo "[ap] 已请求启动 k230-carlife-wifi (--no-block)"
     fi
     echo "[ap] OK 热点: SSID=$SSID 密码=$PSK 网关=$GW"
     ;;
@@ -151,7 +162,8 @@ sta)
     pkill -f k230-fallback.py 2>/dev/null
     pkill -x hostapd 2>/dev/null
     pkill -x dnsmasq 2>/dev/null
-    pkill -x wpa_supplicant 2>/dev/null
+    # 只清本网卡上的 supplicant (全局 pkill 会把别的 vif 上的连接一起杀掉)
+    pkill -f "wpa_supplicant.*-i *${IFACE}\b" 2>/dev/null
     dhcpcd -k "$IFACE" >/dev/null 2>&1 || true
     UP=$(uplink)
     [ -n "$UP" ] && $IPT -t nat -D POSTROUTING -s "$NET" -o "$UP" -j MASQUERADE 2>/dev/null
@@ -210,7 +222,7 @@ stop)
     [ -f /run/carlife-hostapd.pid ] && kill "$(cat /run/carlife-hostapd.pid)" 2>/dev/null
     pkill -x hostapd 2>/dev/null
     pkill -x dnsmasq 2>/dev/null
-    pkill -x wpa_supplicant 2>/dev/null
+    pkill -f "wpa_supplicant.*-i *${IFACE}\b" 2>/dev/null
     dhcpcd -k "$IFACE" >/dev/null 2>&1 || true
     UP=$(uplink)
     [ -n "$UP" ] && $IPT -t nat -D POSTROUTING -s "$NET" -o "$UP" -j MASQUERADE 2>/dev/null
@@ -218,8 +230,9 @@ stop)
     ip link set "$IFACE" down 2>/dev/null
     ip link set "$IFACE" up
     iw dev "$IFACE" set type managed 2>/dev/null
-    systemctl stop k230-carlife-wifi 2>/dev/null
-    systemctl start k230-carlife 2>/dev/null
+    timeout 10 systemctl stop k230-carlife-wifi 2>/dev/null
+    # oneshot 的 ExecStop 里同样不能同步 start 别的单元
+    systemctl --no-block start k230-carlife 2>/dev/null
     echo "[ap] 已停; 恢复 Miracast: systemctl start k230-miracast k230-cast"
     ;;
 status)

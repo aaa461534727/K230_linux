@@ -45,6 +45,16 @@ UNITS_carplay=${UNITS_carplay:-carplay-arbiter carplay-airplayd carplay-wireless
 # 一旦切模式就要先清干净的"其它路" (手动模式的互斥靠它, 不靠仲裁器)
 ALL_SERVICES=${ALL_SERVICES:-"miracast airplay carlife carplay"}
 
+# ---- 蓝牙策略 (2026-11-05 主人要求: 蓝牙跟着 UI 走, 不常开)
+#   主界面 / Miracast / CarLife  = 蓝牙**关** (看不到设备, 也不会被误连)
+#   AirPlay                      = 蓝牙**开** + 名字 K230-CAST + 起反控服务 k230-bt-hid
+#   CarPlay                      = 蓝牙**开** 但只做车载 (名字可配), 不起 HID 反控
+BT_UNIT=${BT_UNIT:-k230-bt-hid}
+BT_DEV=${BT_DEV:-hci0}
+BT_ON_MODES=${BT_ON_MODES:-"airplay carplay"}
+BT_NAME_airplay=${BT_NAME_airplay:-K230-CAST}
+BT_NAME_carplay=${BT_NAME_carplay:-K230-CARPLAY}
+
 [ -f "$CONF" ] && . "$CONF"
 
 log() { printf '[%s] %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
@@ -124,6 +134,170 @@ fast_off_many() {
 
 fast_off() { fast_off_many "$1"; }
 
+# ---------------------------------------------------------------- 蓝牙开关
+# 为什么要显式 hciconfig up/down: 只停 k230-bt-hid 的话适配器仍在广播,
+# 手机上照样能看到设备 (主人要的是"主界面时蓝牙不开启")。
+bt_power_on() {
+    unit_on bluetooth || {
+        log "▶ 起 bluetooth.service"
+        systemctl start bluetooth >>"$LOG" 2>&1
+        sleep 1
+    }
+    if command -v hciconfig >/dev/null 2>&1; then
+        # ★ 根因 4 配套: BlueZ 会把 Discoverable 持久化到
+        #   /var/lib/bluetooth/<bd>/settings, **上电时自动恢复 true** —— 所以"上电→
+        #   我们再关掉"之间总有几秒窗口。AirPlay (hold) 场景先把持久值改成 false。
+        if [ "${_bt_hold_disc:-0}" = 1 ]; then
+            _bp_bd=$(hciconfig "$BT_DEV" 2>/dev/null | awk '/BD Address/{print $3; exit}')
+            _bp_cfg="/var/lib/bluetooth/${_bp_bd}/settings"
+            if [ -n "${_bp_bd:-}" ] && [ -f "$_bp_cfg" ]; then
+                sed -i "s/^Discoverable=true/Discoverable=false/" "$_bp_cfg" 2>/dev/null || true
+            fi
+        fi
+        hciconfig "$BT_DEV" up >>"$LOG" 2>&1 || log "⚠ hciconfig $BT_DEV up 失败"
+    else
+        bluetoothctl power on >>"$LOG" 2>&1 || true
+    fi
+    # ★ 2026-11-05 实测踩坑 1: 光 hciconfig up 时 bluetoothctl 里 `Pairable: no`
+    #   ⇒ 手机"忽略此设备"之后重新配对会**直接被拒**(表现: 点 K230-CAST 连不上)。
+    # ★ 2026-11-05 实测踩坑 2: hci0 刚 down→up 时 bluetoothd 还没把适配器登记好,
+    #   这时立刻发 `bluetoothctl remove/pairable` 会回 `org.bluez.Error.NotReady`
+    #   (板上实测 14:42:37 就吃了这个错)。所以先等适配器"Powered: yes"再动手。
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        _bp_i=0
+        while [ "$_bp_i" -lt 20 ]; do
+            bluetoothctl show 2>/dev/null | grep -q "Powered: yes" && break
+            bluetoothctl power on >>"$LOG" 2>&1 || true
+            sleep 0.5
+            _bp_i=$((_bp_i + 1))
+        done
+        # ★ 根因 4: hold 场景**一上电就立刻关可发现**, 别等 agent/pairable 那 ~3 s ——
+        #   否则手机可能正好在这几秒扫到"看得见但 SDP 里没有 HID"的 K230-CAST。
+        if [ "${_bt_hold_disc:-0}" = 1 ]; then
+            bluetoothctl --timeout 5 discoverable off >>"$LOG" 2>&1 \
+                || bluetoothctl discoverable off >>"$LOG" 2>&1 || true
+        fi
+        # 配对 agent: 板上默认没有 agent 进程, 手机点 K230-CAST 时 SSP 确认没人应答
+        # ⇒ "连不上"。先起 agent 再开 pairable。${BT_AGENT:-} 为空则不启用 (老固件兼容)。
+        if [ -n "${BT_AGENT:-}" ]; then
+            systemctl start "$BT_AGENT" >>"$LOG" 2>&1 || log "⚠ $BT_AGENT 起不来 (手机配对可能被拒)"
+        fi
+        bluetoothctl --timeout 5 pairable on >>"$LOG" 2>&1 \
+            || bluetoothctl pairable on >>"$LOG" 2>&1 || true
+        # ★ 2026-11-05 根因 4: AirPlay 场景要等 HID 就绪才允许"可被发现"。
+        #   否则手机看得见 K230-CAST, 但 SDP 里还没有 0x1124 ⇒ iOS 弹「配对不成功」。
+        #   (调用方 bt_apply 会置 _bt_hold_disc=1, 等 bt_wait_hid_ready 成功后再开。)
+        if [ "${_bt_hold_disc:-0}" != 1 ]; then
+            bluetoothctl --timeout 5 discoverable on >>"$LOG" 2>&1 \
+                || bluetoothctl discoverable on >>"$LOG" 2>&1 || true
+        fi
+        # 回读核对: 设置失败必须留证据 (手机连不上时一眼能看出是"不可配对")
+        bluetoothctl show 2>/dev/null | grep -q "Pairable: yes" \
+            || log "⚠ 适配器仍不可配对 (Pairable: no) — 手机重新配对会被拒"
+    fi
+    # 板上有个 k230-bt-hid.path (PathExists=/sys/class/bluetooth/hci0) 会自动拉起服务;
+    # 关蓝牙时它被停掉, 这里要重新武装, 否则服务起不来。
+    systemctl start "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+}
+
+bt_power_off() {
+    # ⚠ 必须连 .path 一起停: 只停 service 会被 path 触发器立刻拉起来 (实测 stop 后仍 active)。
+    systemctl stop "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+    systemctl stop "$BT_UNIT" >>"$LOG" 2>&1 || true
+    [ -n "${BT_AGENT:-}" ] && systemctl stop "$BT_AGENT" >>"$LOG" 2>&1
+    if command -v hciconfig >/dev/null 2>&1; then
+        hciconfig "$BT_DEV" down >>"$LOG" 2>&1 || true
+    else
+        bluetoothctl power off >>"$LOG" 2>&1 || true
+    fi
+    _bp_i=0
+    while [ "$_bp_i" -lt 6 ] && unit_on "$BT_UNIT"; do
+        sleep 0.5; _bp_i=$((_bp_i + 1))
+    done
+    unit_on "$BT_UNIT" && log "⚠ $BT_UNIT 仍在运行 (蓝牙关不彻底)"
+}
+
+# 等 HID 反控服务真的 active (最多 ~20 s), 期间失败就重试。
+# 为什么不能只 systemctl start: hci0 刚 up 时 bluetoothd 还没把 SDP/profile 注册好,
+# k230-bt-hid 会以退出码 3 退出, 由 Restart=on-failure (5 s) 重试; 只 start 一次就报
+# 失败是误判 (2026-11-05 实测: 13:55:29 起, 自测只看 3 s 就以为失败)。
+bt_wait_unit() {
+    _bw_i=0
+    while [ "$_bw_i" -lt 40 ]; do
+        unit_on "$BT_UNIT" && return 0
+        systemctl start "$BT_UNIT" >>"$LOG" 2>&1 || true
+        sleep 0.5
+        _bw_i=$((_bw_i + 1))
+    done
+    unit_on "$BT_UNIT"
+}
+
+# 等 HID profile **真的**注册完 (看 /run/k230-bt-hid.status 的 `注册=是`), 最多 ~30 s。
+# ★ 2026-11-05 根因 4: 只有到这一步才允许 `discoverable on` —— 否则手机看得见设备、
+#   点下去 SDP 里没有 0x1124, iOS 就弹「配对不成功」(重启后实测空窗 2 分 7 秒)。
+bt_wait_hid_ready() {
+    _bh_i=0
+    while [ "$_bh_i" -lt 60 ]; do
+        if grep -q "注册=是" /run/k230-bt-hid.status 2>/dev/null; then
+            if command -v bluetoothctl >/dev/null 2>&1; then
+                bluetoothctl --timeout 5 discoverable on >>"$LOG" 2>&1 \
+                    || bluetoothctl discoverable on >>"$LOG" 2>&1 || true
+            fi
+            log "✓ HID 已注册 ⇒ 现在才开放可被发现 (手机此刻配 K230-CAST 才成功)"
+            return 0
+        fi
+        sleep 0.5
+        _bh_i=$((_bh_i + 1))
+    done
+    return 1
+}
+
+# 按当前模式套蓝牙策略 (唯一的入口: 各 mode_* 结束时调一次)
+bt_apply() {
+    _bt_m=$1
+    _bt_want=0
+    for _bt_s in $BT_ON_MODES; do
+        [ "$_bt_s" = "$_bt_m" ] && _bt_want=1 && break
+    done
+
+    if [ "$_bt_want" = 0 ]; then
+        bt_power_off
+        log "🔵 蓝牙策略: 模式=$_bt_m ⇒ 关"
+        return 0
+    fi
+
+    # ★ 2026-11-05 根因 4: AirPlay 先保持"不可被发现", 等 HID 注册完再开。
+    #   顺手删掉上一轮遗留的状态文件 —— 否则 bt_wait_hid_ready 会读到旧的 `注册=是`
+    #   而提前开可被发现 (板上实测踩到过)。
+    if [ "$_bt_m" = "airplay" ]; then
+        _bt_hold_disc=1
+        rm -f /run/k230-bt-hid.status
+    else
+        _bt_hold_disc=0
+    fi
+    bt_power_on
+    _bt_hold_disc=0
+    # 只 AirPlay 需要 HID 反控 (手机当鼠标用); CarPlay 交给车载那套
+    if [ "$_bt_m" = "airplay" ]; then
+        if bt_wait_unit; then
+            bt_wait_hid_ready \
+                || log "⚠ HID 未就绪 ⇒ 保持不可被发现 (宁可搜不到, 也不让手机白点一次「配对不成功」)"
+        else
+            log "⚠ $BT_UNIT 起不来 (反控不可用)"
+        fi
+    else
+        # 非 AirPlay 的模式: 不需要 HID 反控, 服务停掉但蓝牙保持开
+        systemctl stop "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+        systemctl stop "$BT_UNIT" >>"$LOG" 2>&1 || true
+    fi
+    eval "_bt_name=\${BT_NAME_$_bt_m:-}"
+    if [ -n "${_bt_name:-}" ] && command -v bluetoothctl >/dev/null 2>&1; then
+        bluetoothctl system-alias "$_bt_name" >>"$LOG" 2>&1 || true
+    fi
+    log "🔵 蓝牙策略: 模式=$_bt_m ⇒ 开 (名字=${_bt_name:-默认})"
+    return 0
+}
+
 # ⚠ POSIX sh 的函数**没有局部变量**: 每个函数都用自己独立前缀的变量名。
 #   2026-11-03 踩过: select miracast 实际起了 carplay —— 因为 stop_service 复用
 #   了 _units/_svc, 循环最后一轮是 carplay, 把外层要用的值覆盖了。
@@ -189,6 +363,7 @@ mode_ui() {
     pkill -x k230ui >>"$LOG" 2>&1 || true
     sleep 0.4                      # 给 drmplay/k230ui 一点时间 release drm master
     ensure_on "$UI_UNIT" || return 1
+    bt_apply ui
     echo "ui" >"$STATE"
     log "✅ 模式 = ui (主界面占屏)"
     say "OK mode=ui"
@@ -235,6 +410,7 @@ mode_select() {
         ensure_on "$SCREEN_UNIT" || log "⚠ k230-screen 重起失败"
     fi
 
+    bt_apply "$_ms_svc"
     echo "$_ms_svc" >"$STATE"
     log "✅ 模式 = $_ms_svc (投屏占屏, 已停其余路)"
     say "OK mode=$_ms_svc"
@@ -246,6 +422,7 @@ mode_auto() {
     pkill -x k230ui >>"$LOG" 2>&1 || true
     ensure_on "$SCREEN_UNIT" || log "⚠ $SCREEN_UNIT 起不来"
     ensure_on "$ARBITER_UNIT" || log "⚠ $ARBITER_UNIT 起不来"
+    bt_apply ui
     echo "auto" >"$STATE"
     log "✅ 模式 = auto (交还仲裁器)"
     say "OK mode=auto"

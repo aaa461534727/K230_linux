@@ -12,7 +12,8 @@
 K230-cast/
 ├── miracast/      安卓 Miracast (WFD) 相关源码
 │   ├── sink/        wfd-sink (RTSP/RTP/UIBC 收流) + drmplay 上屏 + Makefile
-│   ├── tools/       miracast 侧工具 (dhcpd/gen_nv12/drmdump/v4l2_probe/测试脚本)
+│   ├── tools/       miracast 侧工具 (dhcpd/gen_nv12/drmdump/v4l2_probe/测试脚本/wfd-autotune)
+│   │                ★ wfd-autotune = 按手机自适应选频率档 (python3, 随镜像装 /usr/bin)
 │   │                ★ 其中 pcmplay.c / v4l2_dec.c 为两条链路共用 (见 common 说明)
 │   ├── driver/      rtl8189fs P2P/WFD 驱动补丁
 │   ├── patches/     wpa_supplicant 2.11 P2P/GO 协商补丁
@@ -20,6 +21,9 @@ K230-cast/
 ├── airplay/       苹果 AirPlay 相关源码
 │   ├── k230-airplay         AirPlay 接收启动脚本 (uxplay -> H.264 ES 管道)
 │   ├── k230-airplay.service systemd 单元 (AIRPLAY_AUDIO=1 默认开音频)
+│   ├── k230-bt-hid          蓝牙反控 (经典 HID 设备端: 触摸/键盘 -> 手机)
+│   ├── k230-bt-hid-logic-test  触摸手势 → HID 报告的离线逻辑自测
+│   ├── k230-bt-hid-int-test.py 中断通道 accept/GET_REPORT 离线回归 (PASS 4/4)
 │   ├── build-uxplay.sh      板端 native 编译 uxplay 的脚本 (打 patches/)
 │   ├── patches/             uxplay 3 个 K230 补丁 (视频管道/落盘不缓冲/音频管道)
 │   ├── vendor/              uxplay 上游源码 tarball (pristine, 可复现)
@@ -34,6 +38,7 @@ K230-cast/
 └── common/        两条链路共用
     ├── k230-cast / k230-cast.service     互斥仲裁器
     ├── k230-screen.sh / .service          常驻上屏 (drmplay -F, 空闲刷黑)
+    ├── k230-dhcp-simple.py                极简 DHCP 客户端 (P2P 组接口兜底拿租约)
     └── k230-audio.sh / .service          常驻音频 (pcmplay 独占 ALSA, 吃 /run/wfd-audio.pcm)
 ```
 
