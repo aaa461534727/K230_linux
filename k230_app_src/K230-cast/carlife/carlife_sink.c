@@ -361,6 +361,13 @@ static void run_session(cl_io *io)
     static cl_parser parser;
     cl_parser_reset(&parser);
 
+    /* 2026-11-06: 会话期间置 /run/carlife-active, drmplay 认这个标记后无限保持
+     * 最后一帧 (与 AirPlay 同策略)。原因: CarLife 是**屏幕镜像** —— 手机画面静止时
+     * App 完全不产帧 (实测编码器 Stats 50 s: encode:0), 不保持就会静默 2.4 s 刷黑
+     * (主人现场「投着投着突然黑屏」)。服务停止时由 unit 的 ExecStopPost 兜底清掉。 */
+    int _mk = open("/run/carlife-active", O_CREAT | O_WRONLY, 0644);
+    if (_mk >= 0) close(_mk);
+
     uint8_t pl[64]; size_t n = 0;
     n += cl_proto_int(pl + n, 1, 1);      /* 协议主版本 */
     n += cl_proto_int(pl + n, 2, 0);
@@ -409,6 +416,7 @@ static void run_session(cl_io *io)
         if (pr < 0) { logmsg("[proto] 帧解析错误, 丢弃缓冲\n"); cl_parser_reset(&parser); continue; }
         if (pr > 0) handle_packet(&pkt);
     }
+    unlink("/run/carlife-active");
     g_io = NULL;
 }
 

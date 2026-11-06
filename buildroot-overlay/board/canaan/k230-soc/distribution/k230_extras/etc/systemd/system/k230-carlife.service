@@ -11,6 +11,8 @@ ExecStart=/root/carlife_sink --width 1280 --height 720 --fps 30
 Restart=always
 RestartSec=3
 KillMode=control-group
+# 2026-11-06: 会话标记的兜底清理 (见 k230-carlife-wifi.service)
+ExecStopPost=/bin/rm -f /run/carlife-active
 
 [Install]
 WantedBy=multi-user.target

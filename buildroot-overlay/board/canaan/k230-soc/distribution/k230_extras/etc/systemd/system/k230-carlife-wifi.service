@@ -15,6 +15,9 @@ ExecStart=/root/carlife/carlife_sink --wifi --verbose
 Restart=always
 RestartSec=3
 KillMode=control-group
+# 2026-11-06: 会话标记的兜底清理 —— drmplay 认 /run/carlife-active 后"无限保持最后一帧",
+# 崩溃/重启留下的陈旧标记会让屏永远停在上一帧, 所以停机时一律清掉。
+ExecStopPost=/bin/rm -f /run/carlife-active
 
 [Install]
 WantedBy=multi-user.target

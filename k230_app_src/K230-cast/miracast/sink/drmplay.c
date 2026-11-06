@@ -1159,10 +1159,16 @@ static int wait_readable(int fd, int ms)
  *   CarPlay 的 airplayd  → /run/airplay-active
  *   uxplay 镜像          → /run/airplay-cast-active (k230-airplay.service 的 AIRPLAY_ACTIVE_FILE)
  * 播放器必须两个都认, 否则 uxplay 侧「连上了但画面静止」会被当成「其它源静默」,
- * 2.4 s 就刷黑 (主人 2026-11-02 现场: 屏自己黑, 摸一下手机来帧才亮)。 */
-static int any_airplay_active(void) {
+ * 2.4 s 就刷黑 (主人 2026-11-02 现场: 屏自己黑, 摸一下手机来帧才亮)。
+ *
+ * 2026-11-06: 加上 CarLife (/run/carlife-active, carlife_sink 会话期间置位) ——
+ * 同一类问题: CarLife 是**屏幕镜像**, 手机画面静止时 App 完全不产帧
+ * (实测编码器 Stats 50 s: encode:0), 不保持就会 2.4 s 后刷黑
+ * (主人现场「投着投着突然黑屏」)。 */
+static int any_hold_source_active(void) {
     return access("/run/airplay-active", F_OK) == 0
-        || access("/run/airplay-cast-active", F_OK) == 0;
+        || access("/run/airplay-cast-active", F_OK) == 0
+        || access("/run/carlife-active", F_OK) == 0;
 }
 /* ---- 管道定容 (2026-10-27 v12) ----
  * 按「2 帧 + 32 KB」, 上限 1 MB (本板 /proc/sys/fs/pipe-max-size)。
@@ -1731,7 +1737,7 @@ int main(int argc, char **argv)
                 close(ffd);
             }
             fifo_mode = 1;
-            LOG("常驻模式: %s (首个会话前空闲 %d ms 刷黑; AirPlay 客户端在 (airplay-active / airplay-cast-active) 时无限保持最后一帧; 其它源静默 %d ms 即刷黑, 进程不倒)",
+            LOG("常驻模式: %s (首个会话前空闲 %d ms 刷黑; AirPlay/CarLife 客户端在 (airplay-active / airplay-cast-active / carlife-active) 时无限保持最后一帧; 其它源静默 %d ms 即刷黑, 进程不倒)",
                 fifo_path, fifo_idle_ms, fifo_idle_ms * 3);
         }
     }
@@ -1946,7 +1952,7 @@ int main(int argc, char **argv)
                      *     (2.4 s) 判会话结束刷黑 —— 既盖住实测 0.8~2.5 s 的源端抖动, 又能在
                      *     断开后 2~3 s 内变黑。绝不能给 Miracast 用 120 s, 否则断开后屏一直
                      *     停在上一帧 (主人 2026-10-29 现场报的就是这个)。 */
-                    if (any_airplay_active())
+                    if (any_hold_source_active())
                         wms = 0;
                     else
                         wms = fifo_idle_ms * 3;
@@ -2585,7 +2591,7 @@ idle:
          * macOS 静止桌面会几分钟不发帧; 半帧超时 (BODY_WAIT_MS) / 重对齐失败
          * 也会走到这里。只要看护还挂着 airplay-active / airplay-cast-active
          * (客户端没断), 就**只丢半帧、保持最后一帧**, 绝不刷黑。 */
-        if (fifo_mode && n > 0 && any_airplay_active()) {
+        if (fifo_mode && n > 0 && any_hold_source_active()) {
             g_pend_len = g_pend_off = 0;
             clock_gettime(CLOCK_MONOTONIC, &next);
             continue;
