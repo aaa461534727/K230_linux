@@ -10,15 +10,24 @@
 #   这个脚本就是那个"一个地方"。
 #
 # 模式 (写进 $STATE):
-#   ui        主界面占屏: k230-screen 停, 所有投屏端停, 仲裁器停, k230-ui 起
-#   <service> 投屏占屏: k230-ui 停, k230-screen 起, 只起该路投屏端, 仲裁器停
-#   auto      交还开机仲裁器: 所有投屏端放回待命 + k230-screen 起 + 仲裁器起 (k230-ui 停)
+#   ui             主界面占屏: 屏/所有投屏端/仲裁器/fifo keeper 全停, k230-ui 起
+#   wait:<svc>     待投屏: 该路服务起, **屏仍归 k230-ui (LVGL 二级画布)**, 不刷黑
+#   video:<svc>    投屏中: k230-ui 停, k230-screen (drmplay) 起, 刷视频流
+#   auto           交还开机仲裁器: 所有投屏端放回待命 + k230-screen 起 + 仲裁器起
+#
+# 2026-11-07 改版 (主人要求):
+#   点主界面按钮 -> SELECT -> wait 模式 (服务起但屏不让, 二级画布一直在, 不刷黑);
+#   后端探到真实视频会话 -> video 模式 (才把屏交给 drmplay);
+#   视频流断开 -> 回 wait 模式 (k230-ui 重启, 靠 active-page 自动回到刚才那个按钮的二级页);
+#   只有「返回主界面」(STOP) 才回 ui 模式。
 #
 # 用法:
 #   k230-ui-mode.sh ui                  # 让主界面占屏 (空闲态)
-#   k230-ui-mode.sh select miracast     # 让 Miracast 占屏 (miracast/airplay/carlife/carplay)
+#   k230-ui-mode.sh wait <svc>          # 起服务但保留 LVGL 二级画布 (待投屏)
+#   k230-ui-mode.sh video <svc>         # 真正出帧: 屏交给 drmplay
 #   k230-ui-mode.sh stop                # 停会话, 回主界面
 #   k230-ui-mode.sh auto                # 停会话, 交给 k230-source-arbiter
+#   k230-ui-mode.sh select <svc>        # (兼容旧调用) 直接让投屏占屏
 #   k230-ui-mode.sh probe <service>     # 会话还在吗 (exit 0 = 在)
 #   k230-ui-mode.sh status              # 打印当前模式
 #
@@ -29,8 +38,16 @@ STATE=${K230UI_STATE:-/run/k230-ui-mode.state}
 LOG=${K230UI_LOG:-/var/log/k230-ui.log}
 CONF=${K230UI_CONF:-/etc/k230-ui.conf}
 
+# 本次 UI 会话的运行态文件 (/run, 重启即失)
+UI_RUN_DIR=${K230UI_RUN_DIR:-/run/k230-ui}
+HOLD_FILE="$UI_RUN_DIR/hold-screen"          # 服务脚本见此标记 => 绝不碰 DRM/k230-screen
+ACTIVE_PAGE="$UI_RUN_DIR/active-page"        # k230ui 重启后靠它回到刚才那个按钮的二级页
+KEEPER_PID="$UI_RUN_DIR/fifo-keeper.pid"
+FIFO=${WFD_PLAYER_FIFO:-/run/wfd-player.fifo}
+
 # 各模式用到的 systemd 单元 (可在 /etc/k230-ui.conf 覆盖)
 UI_BIN=${UI_BIN:-/usr/bin/k230ui}   # 主界面可执行文件 (本机联调可指到 build-sim/)
+MODE_SWITCH=${MODE_SWITCH:-/usr/bin/k230-mode.sh}   # WiFi/BT 联动切换 (四模式)
 UI_UNIT=${UI_UNIT:-k230-ui}
 SCREEN_UNIT=${SCREEN_UNIT:-k230-screen}
 ARBITER_UNIT=${ARBITER_UNIT:-k230-source-arbiter}
@@ -44,6 +61,16 @@ UNITS_carplay=${UNITS_carplay:-carplay-arbiter carplay-airplayd carplay-wireless
 
 # 一旦切模式就要先清干净的"其它路" (手动模式的互斥靠它, 不靠仲裁器)
 ALL_SERVICES=${ALL_SERVICES:-"miracast airplay carlife carplay"}
+
+# ---- 蓝牙策略 (2026-11-05 主人要求: 蓝牙跟着 UI 走, 不常开)
+#   主界面 / Miracast / CarLife  = 蓝牙**关** (看不到设备, 也不会被误连)
+#   AirPlay                      = 蓝牙**开** + 名字 K230-CAST + 起反控服务 k230-bt-hid
+#   CarPlay                      = 蓝牙**开** 但只做车载 (名字可配), 不起 HID 反控
+BT_UNIT=${BT_UNIT:-k230-bt-hid}
+BT_DEV=${BT_DEV:-hci0}
+BT_ON_MODES=${BT_ON_MODES:-"airplay carplay"}
+BT_NAME_airplay=${BT_NAME_airplay:-K230-CAST}
+BT_NAME_carplay=${BT_NAME_carplay:-K230-CARPLAY}
 
 [ -f "$CONF" ] && . "$CONF"
 
@@ -124,6 +151,225 @@ fast_off_many() {
 
 fast_off() { fast_off_many "$1"; }
 
+# ---------------------------------------------------------------- FIFO 读者 (待投屏)
+# 为什么必须有: 投屏服务的解码器 (v4l2_dec) 一启动就 open(/run/wfd-player.fifo, O_WRONLY)。
+#   wait 模式下 k230-screen (drmplay) 是停的 ⇒ 管道没有读者 ⇒ 解码器开局卡在
+#   "最多等 10 s" 重试、超时退出, 然后 wfd-sink 被 SIGPIPE 带死、管线整条重起 ——
+#   手机上正在建的 RTSP/P2P 会话会被这一下打断 (表现就是「好几次才行」)。
+#   所以待投屏期间由一个纯 shell 的 keeper 常驻读管道并丢弃, 给解码器当读者,
+#   **完全不碰 DRM** (drmplay 才是唯一的屏所有者, 此时不起它)。
+# 切 video 时先起 k230-screen (drmplay 也成为读者)、再杀 keeper, 全程至少有一个读者,
+#   解码器拿着的写 fd 不会因为 unlink 重建或 SIGPIPE 断掉。
+fifo_keeper_start() {
+    mkdir -p "$UI_RUN_DIR"
+    if [ ! -p "$FIFO" ]; then
+        rm -f "$FIFO"
+        mkfifo "$FIFO" 2>/dev/null || true
+        chmod 666 "$FIFO" 2>/dev/null || true
+    fi
+    if [ -f "$KEEPER_PID" ] && \
+       kill -0 "$(cat "$KEEPER_PID" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    # setsid 让 keeper 自成进程组, 停的时候整组一起收 (里面的 cat 可能正阻塞在 open)
+    setsid sh -c 'while :; do cat "$1" >/dev/null 2>&1; sleep 0.05; done' \
+        K230UI_FIFO_KEEPER "$FIFO" >/dev/null 2>&1 &
+    echo $! > "$KEEPER_PID"
+    log "🟢 fifo keeper pid=$(cat "$KEEPER_PID") (待投屏期间给解码器当读者, 不占 DRM)"
+}
+
+fifo_keeper_stop() {
+    _fk_pid=$(cat "$KEEPER_PID" 2>/dev/null || echo 0)
+    if [ -n "$_fk_pid" ] && [ "$_fk_pid" != 0 ]; then
+        # 负 pid = 整个进程组 (setsid 后 $! 就是组长)
+        kill -TERM "-$_fk_pid" 2>/dev/null || kill -TERM "$_fk_pid" 2>/dev/null || true
+        # 兜底: 杀掉直接子进程 (cat/sleep), 再补一刀主进程
+        for _fk_c in /proc/[0-9]*/stat; do
+            _fk_p=${_fk_c#/proc/}; _fk_p=${_fk_p%/stat}
+            _fk_ppid=$(awk '{print $4}' "$_fk_c" 2>/dev/null) || continue
+            [ "$_fk_ppid" = "$_fk_pid" ] && kill -9 "$_fk_p" 2>/dev/null || true
+        done
+        kill -9 "$_fk_pid" 2>/dev/null || true
+    fi
+    rm -f "$KEEPER_PID"
+}
+
+
+# ---------------------------------------------------------------- 蓝牙开关
+# 为什么要显式 hciconfig up/down: 只停 k230-bt-hid 的话适配器仍在广播,
+# 手机上照样能看到设备 (主人要的是"主界面时蓝牙不开启")。
+bt_power_on() {
+    unit_on bluetooth || {
+        log "▶ 起 bluetooth.service"
+        systemctl start bluetooth >>"$LOG" 2>&1
+        sleep 1
+    }
+    if command -v hciconfig >/dev/null 2>&1; then
+        # ★ 根因 4 配套: BlueZ 会把 Discoverable 持久化到
+        #   /var/lib/bluetooth/<bd>/settings, **上电时自动恢复 true** —— 所以"上电→
+        #   我们再关掉"之间总有几秒窗口。AirPlay (hold) 场景先把持久值改成 false。
+        if [ "${_bt_hold_disc:-0}" = 1 ]; then
+            _bp_bd=$(hciconfig "$BT_DEV" 2>/dev/null | awk '/BD Address/{print $3; exit}')
+            _bp_cfg="/var/lib/bluetooth/${_bp_bd}/settings"
+            if [ -n "${_bp_bd:-}" ] && [ -f "$_bp_cfg" ]; then
+                sed -i "s/^Discoverable=true/Discoverable=false/" "$_bp_cfg" 2>/dev/null || true
+            fi
+        fi
+        hciconfig "$BT_DEV" up >>"$LOG" 2>&1 || log "⚠ hciconfig $BT_DEV up 失败"
+    else
+        bluetoothctl power on >>"$LOG" 2>&1 || true
+    fi
+    # ★ 2026-11-05 实测踩坑 1: 光 hciconfig up 时 bluetoothctl 里 `Pairable: no`
+    #   ⇒ 手机"忽略此设备"之后重新配对会**直接被拒**(表现: 点 K230-CAST 连不上)。
+    # ★ 2026-11-05 实测踩坑 2: hci0 刚 down→up 时 bluetoothd 还没把适配器登记好,
+    #   这时立刻发 `bluetoothctl remove/pairable` 会回 `org.bluez.Error.NotReady`
+    #   (板上实测 14:42:37 就吃了这个错)。所以先等适配器"Powered: yes"再动手。
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        _bp_i=0
+        while [ "$_bp_i" -lt 20 ]; do
+            bluetoothctl show 2>/dev/null | grep -q "Powered: yes" && break
+            bluetoothctl power on >>"$LOG" 2>&1 || true
+            sleep 0.5
+            _bp_i=$((_bp_i + 1))
+        done
+        # ★ 根因 4: hold 场景**一上电就立刻关可发现**, 别等 agent/pairable 那 ~3 s ——
+        #   否则手机可能正好在这几秒扫到"看得见但 SDP 里没有 HID"的 K230-CAST。
+        if [ "${_bt_hold_disc:-0}" = 1 ]; then
+            bluetoothctl --timeout 5 discoverable off >>"$LOG" 2>&1 \
+                || bluetoothctl discoverable off >>"$LOG" 2>&1 || true
+        fi
+        # 配对 agent: 板上默认没有 agent 进程, 手机点 K230-CAST 时 SSP 确认没人应答
+        # ⇒ "连不上"。先起 agent 再开 pairable。${BT_AGENT:-} 为空则不启用 (老固件兼容)。
+        if [ -n "${BT_AGENT:-}" ]; then
+            systemctl start "$BT_AGENT" >>"$LOG" 2>&1 || log "⚠ $BT_AGENT 起不来 (手机配对可能被拒)"
+        fi
+        bluetoothctl --timeout 5 pairable on >>"$LOG" 2>&1 \
+            || bluetoothctl pairable on >>"$LOG" 2>&1 || true
+        # ★ 2026-11-05 根因 4: AirPlay 场景要等 HID 就绪才允许"可被发现"。
+        #   否则手机看得见 K230-CAST, 但 SDP 里还没有 0x1124 ⇒ iOS 弹「配对不成功」。
+        #   (调用方 bt_apply 会置 _bt_hold_disc=1, 等 bt_wait_hid_ready 成功后再开。)
+        if [ "${_bt_hold_disc:-0}" != 1 ]; then
+            bluetoothctl --timeout 5 discoverable on >>"$LOG" 2>&1 \
+                || bluetoothctl discoverable on >>"$LOG" 2>&1 || true
+        fi
+        # 回读核对: 设置失败必须留证据 (手机连不上时一眼能看出是"不可配对")
+        bluetoothctl show 2>/dev/null | grep -q "Pairable: yes" \
+            || log "⚠ 适配器仍不可配对 (Pairable: no) — 手机重新配对会被拒"
+    fi
+    # 板上有个 k230-bt-hid.path (PathExists=/sys/class/bluetooth/hci0) 会自动拉起服务;
+    # 关蓝牙时它被停掉, 这里要重新武装, 否则服务起不来。
+    systemctl start "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+}
+
+bt_power_off() {
+    # ⚠ 必须连 .path 一起停: 只停 service 会被 path 触发器立刻拉起来 (实测 stop 后仍 active)。
+    systemctl stop "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+    systemctl stop "$BT_UNIT" >>"$LOG" 2>&1 || true
+    [ -n "${BT_AGENT:-}" ] && systemctl stop "$BT_AGENT" >>"$LOG" 2>&1
+    if command -v hciconfig >/dev/null 2>&1; then
+        hciconfig "$BT_DEV" down >>"$LOG" 2>&1 || true
+    else
+        bluetoothctl power off >>"$LOG" 2>&1 || true
+    fi
+    _bp_i=0
+    while [ "$_bp_i" -lt 6 ] && unit_on "$BT_UNIT"; do
+        sleep 0.5; _bp_i=$((_bp_i + 1))
+    done
+    unit_on "$BT_UNIT" && log "⚠ $BT_UNIT 仍在运行 (蓝牙关不彻底)"
+}
+
+# 等 HID 反控服务真的 active (最多 ~20 s), 期间失败就重试。
+# 为什么不能只 systemctl start: hci0 刚 up 时 bluetoothd 还没把 SDP/profile 注册好,
+# k230-bt-hid 会以退出码 3 退出, 由 Restart=on-failure (5 s) 重试; 只 start 一次就报
+# 失败是误判 (2026-11-05 实测: 13:55:29 起, 自测只看 3 s 就以为失败)。
+bt_wait_unit() {
+    _bw_i=0
+    while [ "$_bw_i" -lt 40 ]; do
+        unit_on "$BT_UNIT" && return 0
+        systemctl start "$BT_UNIT" >>"$LOG" 2>&1 || true
+        sleep 0.5
+        _bw_i=$((_bw_i + 1))
+    done
+    unit_on "$BT_UNIT"
+}
+
+# 等 HID profile **真的**注册完 (看 /run/k230-bt-hid.status 的 `注册=是`), 最多 ~30 s。
+# ★ 2026-11-05 根因 4: 只有到这一步才允许 `discoverable on` —— 否则手机看得见设备、
+#   点下去 SDP 里没有 0x1124, iOS 就弹「配对不成功」(重启后实测空窗 2 分 7 秒)。
+bt_wait_hid_ready() {
+    _bh_i=0
+    while [ "$_bh_i" -lt 60 ]; do
+        if grep -q "注册=是" /run/k230-bt-hid.status 2>/dev/null; then
+            if command -v bluetoothctl >/dev/null 2>&1; then
+                bluetoothctl --timeout 5 discoverable on >>"$LOG" 2>&1 \
+                    || bluetoothctl discoverable on >>"$LOG" 2>&1 || true
+            fi
+            log "✓ HID 已注册 ⇒ 现在才开放可被发现 (手机此刻配 K230-CAST 才成功)"
+            return 0
+        fi
+        sleep 0.5
+        _bh_i=$((_bh_i + 1))
+    done
+    return 1
+}
+
+# 按当前模式套蓝牙策略 (唯一的入口: 各 mode_* 结束时调一次)
+bt_apply() {
+    _bt_m=$1
+    _bt_want=0
+    for _bt_s in $BT_ON_MODES; do
+        [ "$_bt_s" = "$_bt_m" ] && _bt_want=1 && break
+    done
+
+    if [ "$_bt_want" = 0 ]; then
+        bt_power_off
+        log "🔵 蓝牙策略: 模式=$_bt_m ⇒ 关"
+        return 0
+    fi
+
+    # ★ 2026-11-05 根因 4: AirPlay 先保持"不可被发现", 等 HID 注册完再开。
+    #   顺手删掉上一轮遗留的状态文件 —— 否则 bt_wait_hid_ready 会读到旧的 `注册=是`
+    #   而提前开可被发现 (板上实测踩到过)。
+    if [ "$_bt_m" = "airplay" ]; then
+        _bt_hold_disc=1
+        rm -f /run/k230-bt-hid.status
+    else
+        _bt_hold_disc=0
+    fi
+    bt_power_on
+    _bt_hold_disc=0
+    # 只 AirPlay 需要 HID 反控 (手机当鼠标用); CarPlay 交给车载那套
+    if [ "$_bt_m" = "airplay" ]; then
+        if bt_wait_unit; then
+            bt_wait_hid_ready \
+                || log "⚠ HID 未就绪 ⇒ 保持不可被发现 (宁可搜不到, 也不让手机白点一次「配对不成功」)"
+        else
+            log "⚠ $BT_UNIT 起不来 (反控不可用)"
+        fi
+    else
+        # 非 AirPlay 的模式: 不需要 HID 反控, 服务停掉但蓝牙保持开
+        systemctl stop "$BT_UNIT.path" >>"$LOG" 2>&1 || true
+        systemctl stop "$BT_UNIT" >>"$LOG" 2>&1 || true
+    fi
+    eval "_bt_name=\${BT_NAME_$_bt_m:-}"
+    if [ -n "${_bt_name:-}" ] && command -v bluetoothctl >/dev/null 2>&1; then
+        bluetoothctl system-alias "$_bt_name" >>"$LOG" 2>&1 || true
+    fi
+    # ★ 2026-11-07 CarPlay: 自栈 carplay-wireless 的 SDP server 要独占 L2CAP PSM 1,
+    #   系统 bluetoothd 占着时它报 "SDP server exited: Address already in use (os error 98)"
+    #   ⇒ 手机查不到 'Wireless iAPv2' 服务, 连上蓝牙也不提示「车载设备」。
+    #   让 bluetoothd 让位; mode_wait 是「先起服务再调 bt_apply」, wireless 此时已在跑,
+    #   必须重启一次让 SDP server 重新绑定 PSM 1 (实验: 重启后 serving handle 0x00010000)。
+    #   回 ui / airplay 时 bt_power_on() 会按需重新 start bluetooth, 不影响 AirPlay 反控。
+    if [ "$_bt_m" = "carplay" ]; then
+        systemctl stop bluetooth.service >>"$LOG" 2>&1 || true
+        unit_on carplay-wireless && systemctl restart carplay-wireless >>"$LOG" 2>&1 || true
+        log "🔵 CarPlay: 已停 bluetoothd 让出 PSM 1, SDP 交 carplay-wireless 自栈"
+    fi
+    log "🔵 蓝牙策略: 模式=$_bt_m ⇒ 开 (名字=${_bt_name:-默认})"
+    return 0
+}
+
 # ⚠ POSIX sh 的函数**没有局部变量**: 每个函数都用自己独立前缀的变量名。
 #   2026-11-03 踩过: select miracast 实际起了 carplay —— 因为 stop_service 复用
 #   了 _units/_svc, 循环最后一轮是 carplay, 把外层要用的值覆盖了。
@@ -180,6 +426,10 @@ probe_carlife()  { [ "$(conn_cnt 7240 8240 9240 9241 9242 9340 9440)" -gt 0 ]; }
 # ---------------------------------------------------------------- 模式切换
 mode_ui() {
     need_ui_binary || return 1
+    # ⚠ 必须**先**清掉页面记忆: 下面 ensure_on "$UI_UNIT" 会拉起新的 k230ui 进程,
+    #   它的 app_init 读这个文件决定显示主界面还是二级画布。回主界面 = 必须忘掉。
+    rm -f "$ACTIVE_PAGE" "$HOLD_FILE"
+    fifo_keeper_stop
     # 顺序很重要: 先让别人放开 DRM, 再起 UI。
     # 一次性把「仲裁器 + 四路投屏 + 屏 + 旧界面」全部下发 stop, 再一轮杀干净。
     fast_off_many "$ARBITER_UNIT $(all_unit_list) $SCREEN_UNIT $UI_UNIT"
@@ -189,12 +439,118 @@ mode_ui() {
     pkill -x k230ui >>"$LOG" 2>&1 || true
     sleep 0.4                      # 给 drmplay/k230ui 一点时间 release drm master
     ensure_on "$UI_UNIT" || return 1
+    bt_apply ui
     echo "ui" >"$STATE"
     log "✅ 模式 = ui (主界面占屏)"
     say "OK mode=ui"
     return 0
 }
 
+# wait <svc>: 起该路服务, 但**屏仍归 k230-ui** (LVGL 二级画布), 不刷黑。
+# 关键: 不停 $UI_UNIT; 用 fifo keeper 顶替 drmplay 当管道读者; 置 hold-screen
+#       让投屏服务脚本不去抢 DRM master / 不去拉起 k230-screen。
+mode_wait() {
+    _mw_svc=$1
+    _mw_units=$(units_of "$_mw_svc")
+    if [ -z "${_mw_units:-}" ]; then
+        log "✗ 未知 service: $_mw_svc"
+        say "ERROR: unknown service $_mw_svc"
+        return 2
+    fi
+
+    _mw_prev=$(cat "$STATE" 2>/dev/null || echo "")
+    mkdir -p "$UI_RUN_DIR"
+    echo "$_mw_svc" >"$ACTIVE_PAGE"     # k230ui 重启后回到这个按钮的二级页
+    : >"$HOLD_FILE"
+
+    if [ "$_mw_prev" = "wait:$_mw_svc" ] || [ "$_mw_prev" = "video:$_mw_svc" ]; then
+        # 快路径: 视频流断开回到二级页 / 点了「重新连接」。服务本身还活着,
+        # 蓝牙状态也没变 ⇒ 不重跑 bt_apply (AirPlay 那套会等 30 s HID 注册)。
+        fast_off_many "$SCREEN_UNIT"
+        fifo_keeper_start
+        ensure_on "$UI_UNIT" || return 1
+        for _mw_u in $_mw_units; do ensure_on "$_mw_u" || true; done
+        echo "wait:$_mw_svc" >"$STATE"
+        log "✅ 模式 = wait:$_mw_svc (回到二级画布, 服务继续待命)"
+        say "OK mode=wait:$_mw_svc"
+        return 0
+    fi
+
+    # 首次进入 / 换了一路: 先做 WiFi 射频域 + 蓝牙形态联动 (重置/起目标),
+    # 再按 UI 的屏幕逻辑停其它三路。k230-mode.sh 会自检, 失败只告警不阻断 UI。
+    _mw_mode_ok=0
+    if [ -x "$MODE_SWITCH" ]; then
+        log "🔗 WiFi/BT 联动: $MODE_SWITCH $_mw_svc"
+        if sh "$MODE_SWITCH" "$_mw_svc" >>"$LOG" 2>&1; then
+            _mw_mode_ok=1
+        else
+            log "⚠ k230-mode.sh $_mw_svc 未过门禁, 回退 bt_apply"
+        fi
+    fi
+
+    # 首次进入 / 换了一路: 停其它三路 + 仲裁器 + 屏, 但**保住 k230-ui**。
+    _mw_stop="$SCREEN_UNIT $ARBITER_UNIT"
+    for _mw_s in $ALL_SERVICES; do
+        [ "$_mw_s" = "$_mw_svc" ] && continue
+        _mw_u=$(units_of "$_mw_s")
+        [ -n "${_mw_u:-}" ] && _mw_stop="$_mw_stop $_mw_u"
+    done
+    fast_off_many $_mw_stop
+    fifo_keeper_start
+    ensure_on "$UI_UNIT" || return 1
+    for _mw_u in $_mw_units; do
+        ensure_on "$_mw_u" || { log "⚠ 起 $_mw_u 失败"; say "ERROR: start $_mw_u failed"; return 1; }
+    done
+    if [ "$_mw_mode_ok" = 1 ]; then
+        log "🔵 蓝牙策略: 已由 k230-mode.sh 处理, 跳过 bt_apply"
+    else
+        bt_apply "$_mw_svc"
+    fi
+    echo "wait:$_mw_svc" >"$STATE"
+    log "✅ 模式 = wait:$_mw_svc (服务后台等投屏, LVGL 二级画布占屏, 不刷黑)"
+    say "OK mode=wait:$_mw_svc"
+    return 0
+}
+
+# video <svc>: 真实投屏会话已建立, 才把屏从 LVGL 交给 drmplay 刷视频流。
+# 顺序要点: 先起 k230-screen (drmplay 成为 fifo 读者)、**后**杀 keeper,
+#   这样解码器拿着的写 fd 全程有读者, 不会因 unlink 重建 / SIGPIPE 断掉。
+mode_video() {
+    _mv_svc=$1
+    _mv_units=$(units_of "$_mv_svc")
+    if [ -z "${_mv_units:-}" ]; then
+        log "✗ 未知 service: $_mv_svc"
+        say "ERROR: unknown service $_mv_svc"
+        return 2
+    fi
+
+    # 1) 停 UI, 放开 DRM master
+    fast_off_many "$UI_UNIT"
+    pkill -x k230ui >>"$LOG" 2>&1 || true
+    sleep 0.4
+
+    # 2) 屏所有者接管 (k230-ui.service 的 Conflicts 也会顺带停 UI)
+    ensure_on "$SCREEN_UNIT" || {
+        log "⚠ $SCREEN_UNIT 起不来, 退回 wait (保留二级画布)"
+        mode_wait "$_mv_svc"
+        return 1
+    }
+
+    # 3) drmplay 已在读 => 现在才收 keeper, 之后只剩一个读者
+    fifo_keeper_stop
+
+    # 4) 服务是 wait 阶段起的, 这里只兜底确认
+    for _mv_u in $_mv_units; do ensure_on "$_mv_u" || true; done
+
+    # 蓝牙状态与 wait 阶段一致, 不重跑 bt_apply (避免切屏时卡 30 s)
+    echo "video:$_mv_svc" >"$STATE"
+    log "✅ 模式 = video:$_mv_svc (真实投屏, drmplay 刷视频流)"
+    say "OK mode=video:$_mv_svc"
+    return 0
+}
+
+# 兼容老的「select <svc> 直接占屏」调用 (调试/手工用); 后端已改用 wait + video。
+# 先清 hold 标记, 让投屏服务脚本恢复自己管播放器, 否则会没人上屏。
 mode_select() {
     _ms_svc=$1
     _ms_units=$(units_of "$_ms_svc")
@@ -203,6 +559,10 @@ mode_select() {
         say "ERROR: unknown service $_ms_svc"
         return 2
     fi
+    rm -f "$HOLD_FILE"
+    fifo_keeper_stop
+    mkdir -p "$UI_RUN_DIR"
+    echo "$_ms_svc" >"$ACTIVE_PAGE"
 
     # 要停的 = 主界面 + 仲裁器 + 其它三路 (手动模式 = 严格互斥)
     _ms_stop="$UI_UNIT $ARBITER_UNIT"
@@ -235,17 +595,21 @@ mode_select() {
         ensure_on "$SCREEN_UNIT" || log "⚠ k230-screen 重起失败"
     fi
 
-    echo "$_ms_svc" >"$STATE"
-    log "✅ 模式 = $_ms_svc (投屏占屏, 已停其余路)"
-    say "OK mode=$_ms_svc"
+    bt_apply "$_ms_svc"
+    echo "video:$_ms_svc" >"$STATE"
+    log "✅ 模式 = video:$_ms_svc (旧 select 兼容路径, 投屏占屏)"
+    say "OK mode=video:$_ms_svc"
     return 0
 }
 
 mode_auto() {
+    rm -f "$ACTIVE_PAGE" "$HOLD_FILE"
+    fifo_keeper_stop
     fast_off_many "$UI_UNIT $(all_unit_list)"
     pkill -x k230ui >>"$LOG" 2>&1 || true
     ensure_on "$SCREEN_UNIT" || log "⚠ $SCREEN_UNIT 起不来"
     ensure_on "$ARBITER_UNIT" || log "⚠ $ARBITER_UNIT 起不来"
+    bt_apply ui
     echo "auto" >"$STATE"
     log "✅ 模式 = auto (交还仲裁器)"
     say "OK mode=auto"
@@ -264,6 +628,10 @@ do_probe() {
 cmd=${1:-status}
 case "$cmd" in
     ui)     mode_ui ;;
+    wait)   [ $# -ge 2 ] || { say "ERROR: wait needs a service"; exit 1; }
+            mode_wait "$2" ;;
+    video)  [ $# -ge 2 ] || { say "ERROR: video needs a service"; exit 1; }
+            mode_video "$2" ;;
     select) [ $# -ge 2 ] || { say "ERROR: select needs a service"; exit 1; }
             mode_select "$2" ;;
     stop)   mode_ui ;;
@@ -272,7 +640,7 @@ case "$cmd" in
             do_probe "$2" ;;
     status) [ -f "$STATE" ] && cat "$STATE" || echo "unknown" ;;
     *)
-        say "usage: $0 {ui|select <svc>|stop|auto|probe <svc>|status}"
+        say "usage: $0 {ui|wait <svc>|video <svc>|select <svc>|stop|auto|probe <svc>|status}"
         exit 1
         ;;
 esac
