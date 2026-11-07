@@ -437,6 +437,9 @@ mode_ui() {
     # ⚠ 手工跑过的 k230ui 不在任何 unit 的 cgroup 里, 上面杀不到 ——
     #   它若还活着就仍是 DRM master, 新起的这个只会静默拿不到 master (不报错、不画面)。
     pkill -x k230ui >>"$LOG" 2>&1 || true
+    # 回主界面 = 无线模式已退出; 清运行态, 否则下次点同一模式 k230-mode.sh 会误判
+    # "已经是 <mode>" 而不做 AP/P2P + 蓝牙联动.
+    rm -f /run/k230-mode.state
     sleep 0.4                      # 给 drmplay/k230ui 一点时间 release drm master
     ensure_on "$UI_UNIT" || return 1
     bt_apply ui
