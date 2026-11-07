@@ -203,7 +203,9 @@ static int video_session_alive(const char *svc)
     if (!strcmp(svc, "airplay"))
         return conn_cnt(p_airplay, 2) > 0 || file_exists("/run/airplay-cast-active");
     if (!strcmp(svc, "carplay"))
-        return file_exists("/run/airplay-active") || conn_cnt(p_carplay, 1) > 0;
+        /* CarPlay 会话以 7000 控制连接为准; /run/airplay-active 仅用于屏保持,
+         * 手机断开后可能残留, 不能单独当"会话活着" (否则屏停在最后一帧). */
+        return conn_cnt(p_carplay, 1) > 0;
     if (!strcmp(svc, "carlife"))
         return conn_cnt(p_carlife, 7) > 0 || file_exists("/run/carlife-active");
     return 1;  /* 不认识的 service: 不要误判 */

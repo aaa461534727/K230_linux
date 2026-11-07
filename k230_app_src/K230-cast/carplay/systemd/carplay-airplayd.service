@@ -9,6 +9,8 @@ ExecStart=/usr/local/bin/carplay-airplayd
 Restart=always
 RestartSec=2
 TimeoutStopSec=5
+# 服务停 = CarPlay 会话结束, 清屏保持标记, 避免后端误判会话还在
+ExecStopPost=/bin/rm -f /run/airplay-active
 
 [Install]
 WantedBy=multi-user.target

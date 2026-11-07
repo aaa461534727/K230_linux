@@ -740,9 +740,10 @@ impl Drop for RtspGuard {
             .saturating_sub(1);
         let screening = SCREEN_CONNS.load(std::sync::atomic::Ordering::SeqCst);
         log(&format!("RTSP 连接结束, 剩 {left} 条 (屏幕流 {screening} 条)"));
-        if left == 0 && screening == 0 {
+        if left == 0 {
+            // 控制连接 (7000) 全结束 = 会话结束; 即使屏幕流 socket 还僵着, 也必须放行刷黑/回二级页
             mark_airplay_active(false);
-            log("所有连接都结束 → 删 /run/airplay-active (允许刷黑)");
+            log("RTSP 控制连接全结束 → 删 /run/airplay-active (允许刷黑)");
         }
     }
 }
@@ -1590,7 +1591,7 @@ fn start_session_watchdog() {
         // 改成: RTSP 静默 且 RTSP/屏幕流连接都为 0, 才删标记。
         let rtsp_open = RTSP_CONNS.load(std::sync::atomic::Ordering::SeqCst);
         let screen_open = SCREEN_CONNS.load(std::sync::atomic::Ordering::SeqCst);
-        if idle >= 6 && rtsp_open == 0 && screen_open == 0 && std::path::Path::new(AIRPLAY_ACTIVE).exists() {
+        if idle >= 6 && rtsp_open == 0 && std::path::Path::new(AIRPLAY_ACTIVE).exists() {
             log(&format!("RTSP 已静默 {idle} s 且无连接 ⇒ 删 /run/airplay-active (允许刷黑)"));
             mark_airplay_active(false);
         }

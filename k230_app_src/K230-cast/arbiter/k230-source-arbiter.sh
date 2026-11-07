@@ -118,7 +118,7 @@ check_ap() {   # 只报警, 不动手
 }
 
 # ---------------- 会话探针 (真=有会话) ----------------
-probe_carplay()     { [ -f /run/airplay-active ] || [ "$(conn_cnt 7000)" -gt 0 ]; }
+probe_carplay()     { [ "$(conn_cnt 7000)" -gt 0 ]; }
 probe_airplay()     { [ "$(conn_cnt 7100 7101)" -gt 0 ]; }
 probe_miracast()    { [ "$(conn_cnt 7236)" -gt 0 ] || iw dev wlan0 link 2>/dev/null | grep -qi 'connected to'; }
 probe_carlife_wifi(){ [ "$(ss -tn state established 2>/dev/null | awk '

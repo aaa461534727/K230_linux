@@ -420,7 +420,7 @@ conn_cnt() {
 
 probe_miracast() { [ "$(conn_cnt 7236)" -gt 0 ] || iw dev wlan0 link 2>/dev/null | grep -qi 'connected to'; }
 probe_airplay()  { [ "$(conn_cnt 7100 7101)" -gt 0 ]; }
-probe_carplay()  { [ -f /run/airplay-active ] || [ "$(conn_cnt 7000)" -gt 0 ]; }
+probe_carplay()  { [ "$(conn_cnt 7000)" -gt 0 ]; }
 probe_carlife()  { [ "$(conn_cnt 7240 8240 9240 9241 9242 9340 9440)" -gt 0 ]; }
 
 # ---------------------------------------------------------------- 模式切换
