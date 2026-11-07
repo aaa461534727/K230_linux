@@ -12,6 +12,7 @@ Type=simple
 ExecStart=/usr/bin/k230-bt-agent
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target

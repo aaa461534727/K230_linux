@@ -12,6 +12,7 @@ Environment=CARPLAY_AP_IP=192.168.50.1
 ExecStart=/usr/local/bin/carplay-wireless
 Restart=always
 RestartSec=3
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target

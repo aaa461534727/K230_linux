@@ -8,6 +8,7 @@ Environment=CARPLAY_SRP_PASS=3939
 ExecStart=/usr/local/bin/carplay-airplayd
 Restart=always
 RestartSec=2
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=K230 CarPlay media plane (H.264 FIFO -> mvx decode -> drmplay; FT5x06 -> HID)
+After=k230-screen.service k230-audio.service
+Wants=k230-screen.service k230-audio.service
+# 与其它投屏源互斥由 k230-cast 仲裁决定, 这里不做冲突处理
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/carplay-media
+Restart=always
+RestartSec=1
+TimeoutStopSec=5
+# 播放器/解码器已经各自限流, 这里只防止它跑飞
+MemoryMax=256M
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

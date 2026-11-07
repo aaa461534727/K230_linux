@@ -1,8 +1,10 @@
 #!/bin/sh
 # carlife-ap.sh —— 无线 CarLife 热点 (wlan1) 起停
 #
-# 与 Miracast 互斥: 板子只有一颗 2.4G 网卡 (RTL8189FS), 开 AP 前必须停 P2P。
-# AirPlay 走以太网, 不受影响。
+# 与 Miracast 的关系 (2026-11-07 起): 同一颗 RTL8189FS 的两个 vif, Miracast 固定 wlan0
+# (P2P), 本 AP 固定 wlan1 ⇒ 起 AP 不再停 Miracast (只有 AP 落在 wlan0 时才让位)。
+# 注意: 单 radio 单信道共存, 两边的信道要一致才能同时稳定工作。
+# AirPlay 走 USB 以太网, 不受影响。
 #
 # 手机端 CarLife 的无线流程 (2026-10-30 逆�� APK 确认):
 #   手机连上本热点 → App 每 2 s 向 255.255.255.255:7999 广播 "CarlifeHost"
@@ -53,11 +55,18 @@ nat_on() {
 
 case "${1:-start}" in
 start)
-    echo "[ap] 停 Miracast (同一颗网卡) + 清 P2P"
+    # 2026-11-07: 本板 Miracast 已固定在 wlan0 (unit Environment=WFD_IFACE=wlan0),
+    #   AP 固定 wlan1 ⇒ 两个 vif 可以共存, 起 AP 不再停 Miracast / 不再杀 wfd-p2p。
+    #   只有 AP 真的落在 Miracast 那个接口上 (wlan0) 时才需要让位。
+    if [ "$IFACE" = "wlan0" ]; then
+        echo "[ap] 停 Miracast (AP 与 P2P 同一接口) + 清 P2P"
+        timeout 10 systemctl stop k230-miracast 2>/dev/null
+        pkill -f wfd-p2p.sh 2>/dev/null
+    else
+        echo "[ap] 保留 Miracast (在另一 vif, 不动)"
+    fi
     # 被 oneshot 单元调用时同步 stop 会死锁 ⇒ 加 timeout 兜底 (最坏 10 s 后放弃)
-    timeout 10 systemctl stop k230-miracast 2>/dev/null
     timeout 10 systemctl stop k230-cast 2>/dev/null
-    pkill -f wfd-p2p.sh 2>/dev/null
     pkill -f k230-fallback.py 2>/dev/null
     pkill -x hostapd 2>/dev/null
     pkill -x dnsmasq 2>/dev/null
@@ -91,6 +100,10 @@ wpa=2
 wpa_passphrase=$PSK
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
+# 2026-11-07: 禁用 600 s GTK 轮换. 现场铁证: AP 空闲跑到第 3 次 rekey (12:45:52) 后,
+#   手机 associated 6 s 就断、零 DHCP, hostapd -f 详细日志无任何 EAPOL/4-way 行;
+#   重启 hostapd 进程也无效, 只有 reboot 才恢复. SIGHUP 不会重读本段, 必须在启动前写入.
+wpa_group_rekey=0
 EOF
 
     hostapd -B -P /run/carlife-hostapd.pid "$CONF" >"$HLOG" 2>&1

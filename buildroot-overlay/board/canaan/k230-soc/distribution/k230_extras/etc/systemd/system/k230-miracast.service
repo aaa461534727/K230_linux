@@ -20,6 +20,10 @@ Type=simple
 #   Miracast 改用 wlan0 做 P2P(STA 侧), 这样热点与投屏可以同时待命。
 #   实测 (2026-11-02): wlan0 起 P2P device 后 wlan1 的 hostapd/AP 不受影响。
 Environment=WFD_IFACE=wlan0
+# 2026-11-07: P2P listen 必须与 AP 同信道 (AP 在 ch6=2437)。8189fs 只有一颗 radio:
+#   listen 钉 ch1 时, wlan1 的 beacon TX 直接归零 -> 手机连得上 SSID 也拿不到 IP;
+#   实测 GO_FREQ=2437 后 AP 与 P2P 可同时在线 (station 保持 + ping 0% loss + 7236 LISTEN)。
+Environment=WFD_GO_FREQ=2437
 Environment=WFD_FORCE_OPER_CH=1
 Environment=WFD_PERSISTENT_RECONNECT=0
 ExecStartPre=/bin/rm -f /run/wfd-p2p.hold

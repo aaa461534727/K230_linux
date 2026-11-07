@@ -1584,8 +1584,14 @@ fn start_session_watchdog() {
         let idle = now_secs().saturating_sub(last);
         // iOS 实测每 **2 s** 一条 POST /feedback (两条连接各一条), 所以 6 s = 连丢 3 拍,
         // 只有在"真的断开"时才会发生 ⇒ 断开后 ~7 s 内刷黑, 又不会把 WiFi 抖动当断开。
-        if idle >= 6 && std::path::Path::new(AIRPLAY_ACTIVE).exists() {
-            log(&format!("RTSP 已静默 {idle} s ⇒ 判定会话结束, 删 /run/airplay-active (允许刷黑)"));
+        // 2026-11-07: 只有「RTSP 静默」还不够 —— CarPlay 控制连接 (7000) 或屏幕流
+        // 还活着时, 6 s 没请求是正常的 (手机静态画面不发 RTSP)。此前这里无条件删标记,
+        // drmplay 120 s 后刷黑, 表现为「屏幕像息屏, 摸一下才亮」。
+        // 改成: RTSP 静默 且 RTSP/屏幕流连接都为 0, 才删标记。
+        let rtsp_open = RTSP_CONNS.load(std::sync::atomic::Ordering::SeqCst);
+        let screen_open = SCREEN_CONNS.load(std::sync::atomic::Ordering::SeqCst);
+        if idle >= 6 && rtsp_open == 0 && screen_open == 0 && std::path::Path::new(AIRPLAY_ACTIVE).exists() {
+            log(&format!("RTSP 已静默 {idle} s 且无连接 ⇒ 删 /run/airplay-active (允许刷黑)"));
             mark_airplay_active(false);
         }
     });

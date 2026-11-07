@@ -1,4 +1,11 @@
 CONFIG_BT=m
+# 2026-11-07 CarPlay: iAP2 over RFCOMM 需要内核 RFCOMM 协议模块。此前只在 build 树
+# .config 里用 scripts/config 手工开过, fragment 没写 ⇒ 重烧的镜像只带 btusb.ko,
+# carplay-wireless 起 RFCOMM socket 报 "Protocol not supported (os error 93)",
+# 手机连上蓝牙后查不到 iAP2 服务、不提示「车载设备」。
+# 写进 fragment 保证任何机器重编内核都会产出并安装 rfcomm.ko / hidp.ko。
+CONFIG_BT_RFCOMM=m
+CONFIG_BT_HIDP=m
 CONFIG_USB_USBNET=y
 CONFIG_USB_CONFIGFS=m
 CONFIG_USB_CONFIGFS_F_FS=y

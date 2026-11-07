@@ -22,6 +22,7 @@ Environment=K230_BT_HID_NAME=K230-CAST
 ExecStart=/usr/bin/k230-bt-hid run --gate unit --transport classic
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
 # 退出码 3 = 蓝牙不可用 (无 hci0 / bluetoothd 没跑), 值得重启等它就绪
 SuccessExitStatus=0
 
