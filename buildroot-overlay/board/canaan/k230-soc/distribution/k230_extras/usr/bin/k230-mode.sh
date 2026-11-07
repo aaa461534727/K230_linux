@@ -5,7 +5,7 @@
 #   miracast  P2P 域, 蓝牙关
 #   carplay   AP 域 + 车载蓝牙 (iAP2)
 #   carlife   AP 域, 蓝牙关 (CarLife 不用蓝牙)
-#   airplay   USB 域, 反控 HID 蓝牙
+#   airplay   AP 域 (无线, iPhone 连 K230-CARPLAY WiFi 走 mDNS 投屏), 反控 HID 蓝牙
 #
 # 规则:
 #   · WiFi 只在 P2P ↔ AP 互切时重置 (modprobe -r/modprobe 8189fs)
@@ -25,7 +25,7 @@ wait_7236(){ _i=0; while [ "$_i" -lt 30 ]; do ss -lnt 2>/dev/null | grep -q ":72
 wait_ap(){ _i=0; while [ "$_i" -lt 20 ]; do iw dev wlan1 info 2>/dev/null | grep -q "type AP" && return 0; sleep 1; _i=$((_i+1)); done; return 1; }
 sdp_serving(){ _s=$(systemctl show -p ActiveEnterTimestamp --value carplay-wireless 2>/dev/null); [ -n "$_s" ] || return 1; journalctl -u carplay-wireless --since "$_s" --no-pager 2>/dev/null | grep -q "serving .*Wireless iAPv2"; }
 wait_sdp(){ _i=0; while [ "$_i" -lt 20 ]; do sdp_serving && return 0; sleep 1; _i=$((_i+1)); done; return 1; }
-domain(){ case "$1" in miracast) echo p2p;; carplay|carlife) echo ap;; airplay) echo usb;; *) echo unknown;; esac; }
+domain(){ case "$1" in miracast) echo p2p;; carplay|carlife|airplay) echo ap;; *) echo unknown;; esac; }
 bt_name(){ hciconfig hci0 name 2>/dev/null | awk -F"'" '/Name:/{print $2}'; }
 hci_pscan(){ hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING PSCAN'; }
 # hci0 无响应时做 USBDEVFS_RESET (CSR dongle 连续切模式后会卡在 BD=00:00 / Broken pipe)
@@ -96,7 +96,14 @@ case "$MODE" in
         wait_active k230-shared-ap || { say "✗ k230-shared-ap 起不来"; exit 1; }
         wait_ap || { say "✗ wlan1 没进 AP"; exit 1; }
         ;;
-    airplay) : ;;
+    airplay)
+        # ★ 2026-11-07: 无线 AirPlay —— 进 AirPlay 模式时板子起 AP, 让 iPhone 连
+        #   K230-CARPLAY WiFi 后走 mDNS 发现 K230-CAST 并投屏 (替代原本的 USB 以太网)。
+        #   AirPlay 反控(蓝牙 HID) 仍在 step 6 起, 与 AP 互不冲突。
+        systemctl start k230-shared-ap >/dev/null 2>&1
+        wait_active k230-shared-ap || { say "✗ k230-shared-ap 起不来"; exit 1; }
+        wait_ap || { say "✗ wlan1 没进 AP"; exit 1; }
+        ;;
 esac
 
 # 5) 起应用服务
@@ -135,7 +142,8 @@ case "$MODE" in
     carlife)
         active k230-shared-ap && active k230-carlife-wifi && ok=1 ;;
     airplay)
-        active bluetooth && active k230-bt-hid && hci_pscan \
+        active k230-shared-ap && iw dev wlan1 info 2>/dev/null | grep -q "type AP" \
+            && active bluetooth && active k230-bt-hid && hci_pscan \
             && grep -q '注册=是' /run/k230-bt-hid.status 2>/dev/null \
             && [ "$(bt_name)" = "K230-CAST" ] && ok=1 ;;
     carplay)
