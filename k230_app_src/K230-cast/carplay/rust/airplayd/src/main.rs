@@ -759,6 +759,11 @@ fn spawn_screen_listener(listener: std::net::TcpListener, port: u16, out_key: [u
                 Ok(mut s) => {
                     let peer = s.peer_addr().ok();
                     log(&format!("[screen:{port}] 手机连上了: {peer:?}"));
+                    // 帧静默超时检测: 手机掉 WiFi 常不发 FIN, 7000 会悬 30~40s; 故以
+                    // 「屏幕流最近 FRAME_TIMEOUT 内有帧」作为会话存活信号, 停发即清 marker.
+                    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                    let mut last_frame = std::time::Instant::now();
+                    let mut marker_on = true;
                     if SCREEN_CONNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                         mark_airplay_active(true);
                         log("[screen] 置 /run/airplay-active (静默保持最后一帧)");
@@ -779,13 +784,28 @@ fn spawn_screen_listener(listener: std::net::TcpListener, port: u16, out_key: [u
                     let mut total: u64 = 0;
                     let mut wrote_dump: usize = 0;
                     loop {
-                        if s.read_exact(&mut hdr).is_err() {
-                            log(&format!("[screen:{port}] 连接结束: {frames} 帧 / {total} B"));
-                            if SCREEN_CONNS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                                mark_airplay_active(false);
-                                log("[screen] 最后一条屏幕流断开 → 删 /run/airplay-active (允许刷黑)");
+                        match s.read_exact(&mut hdr) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                                  || e.kind() == std::io::ErrorKind::TimedOut => {
+                                // 读超时 = 屏幕流静默. 超过帧超时阈值就清 marker, 让后端快速
+                                // 回二级页; 但**不关 socket** (帧恢复即重新置 marker, 避免把还
+                                // 连着的会话误杀). 真实断开时手机不再发帧, marker 持续清除.
+                                if last_frame.elapsed() > std::time::Duration::from_secs(4) && marker_on {
+                                    mark_airplay_active(false);
+                                    marker_on = false;
+                                    log(&format!("[screen:{port}] 帧静默 >4s → 清 marker (会话可能已断, 保留 socket)"));
+                                }
+                                continue;
                             }
-                            break;
+                            Err(_) => {
+                                log(&format!("[screen:{port}] 连接结束: {frames} 帧 / {total} B"));
+                                if SCREEN_CONNS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                                    mark_airplay_active(false);
+                                    log("[screen] 最后一条屏幕流断开 → 删 /run/airplay-active (允许刷黑)");
+                                }
+                                break;
+                            }
                         }
                         let body_size = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
                         let opcode = hdr[4];
@@ -839,6 +859,11 @@ fn spawn_screen_listener(listener: std::net::TcpListener, port: u16, out_key: [u
                             }
                         };
                         frames += 1;
+                        last_frame = std::time::Instant::now();
+                        if !marker_on {
+                            mark_airplay_active(true);
+                            marker_on = true;
+                        }
                         if frames == 1 {
                             log(&format!(
                                 "[screen:{port}] 首帧 Annex-B {} B, 起始 {}",
@@ -1588,7 +1613,11 @@ fn start_session_watchdog() {
         // 2026-11-07: 只有「RTSP 静默」还不够 —— CarPlay 控制连接 (7000) 或屏幕流
         // 还活着时, 6 s 没请求是正常的 (手机静态画面不发 RTSP)。此前这里无条件删标记,
         // drmplay 120 s 后刷黑, 表现为「屏幕像息屏, 摸一下才亮」。
+        // 2026-11-07: 只有「RTSP 静默」还不够 —— CarPlay 控制连接 (7000) 或屏幕流
+        // 还活着时, 6 s 没请求是正常的 (手机静态画面不发 RTSP)。此前这里无条件删标记,
+        // drmplay 120 s 后刷黑, 表现为「屏幕像息屏, 摸一下才亮」。
         // 改成: RTSP 静默 且 RTSP/屏幕流连接都为 0, 才删标记。
+        // (CarPlay 的快速断开检测由屏幕流「帧静默超时」单独负责, 不在这里, 以免误伤 AirPlay 的静态保持)
         let rtsp_open = RTSP_CONNS.load(std::sync::atomic::Ordering::SeqCst);
         let screen_open = SCREEN_CONNS.load(std::sync::atomic::Ordering::SeqCst);
         if idle >= 6 && rtsp_open == 0 && std::path::Path::new(AIRPLAY_ACTIVE).exists() {

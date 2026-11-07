@@ -195,7 +195,6 @@ static int video_session_alive(const char *svc)
 {
     static const int p_miracast[] = { 7236 };
     static const int p_airplay[]  = { 7100, 7101 };
-    static const int p_carplay[]  = { 7000 };
     static const int p_carlife[]  = { 7240, 8240, 9240, 9241, 9242, 9340, 9440 };
 
     if (!strcmp(svc, "miracast"))
@@ -203,9 +202,10 @@ static int video_session_alive(const char *svc)
     if (!strcmp(svc, "airplay"))
         return conn_cnt(p_airplay, 2) > 0 || file_exists("/run/airplay-cast-active");
     if (!strcmp(svc, "carplay"))
-        /* CarPlay 会话以 7000 控制连接为准; /run/airplay-active 仅用于屏保持,
-         * 手机断开后可能残留, 不能单独当"会话活着" (否则屏停在最后一帧). */
-        return conn_cnt(p_carplay, 1) > 0;
+        /* 以 /run/airplay-active (帧活动 marker) 为准: airplayd 在有屏幕流连接时置之,
+         * 手机断开 (掉 WiFi 常不发 FIN, 7000 悬在 ESTABLISHED 30~40s) 后由帧静默超时 /
+         * RTSP 静默看门狗在数秒内清掉. 若只看 7000 连接数, 会卡在最后一帧不回二级页. */
+        return file_exists("/run/airplay-active");
     if (!strcmp(svc, "carlife"))
         return conn_cnt(p_carlife, 7) > 0 || file_exists("/run/carlife-active");
     return 1;  /* 不认识的 service: 不要误判 */
