@@ -82,10 +82,18 @@ pkill -9 -x drmplay 2>/dev/null || true
 pkill -9 -x ai2dplay 2>/dev/null || true
 sleep 0.3
 rm -f "$PIDFILE"
-# 只有这里允许重建管道, 且一定在「玩家已全部杀掉」之后 ⇒ 不会有人拿着旧 inode
-rm -f "$FIFO"
-mkfifo "$FIFO" 2>/dev/null || true
-chmod 666 "$FIFO" 2>/dev/null || true
+# ★ 2026-11-07 (UI 待投屏改版): **不要 unlink 重建一个还有效的管道**。
+#   wait 模式下 fifo keeper 和投屏解码器已经握着这个 inode, video 模式只是把读者
+#   从 keeper 换成 drmplay。若这里 rm+mkfifo, 解码器写的是旧 inode、drmplay 读的是
+#   新 inode ⇒ 解码器吃 SIGPIPE 退出、整条管线重起、手机上刚建好的 RTSP 会话被掐断。
+#   只有「不存在 / 不是 fifo」时才重建 (正常路径永远不会走到)。
+if [ -p "$FIFO" ]; then
+    log "接管屏: 复用已有 $FIFO (保 inode, 解码器不中断)"
+else
+    rm -f "$FIFO"
+    mkfifo "$FIFO" 2>/dev/null || true
+    chmod 666 "$FIFO" 2>/dev/null || true
+fi
 
 # ★ exec 不换 pid ⇒ 这个 pidfile 就是后面 drmplay 的 pid (体检靠它)
 echo $$ >"$PIDFILE"

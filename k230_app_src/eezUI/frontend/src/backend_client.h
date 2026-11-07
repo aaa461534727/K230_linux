@@ -10,9 +10,17 @@
  *
  * 协议: Unix domain socket, 纯文本一行一条 (UTF-8 无关, 纯 ASCII)
  *   请求   STATUS | SELECT <service> | STOP | AUTO
- *   响应   OK state=<idle|starting|running|stopping|error> service=<name|none> msg=<任意文本>
+ *   响应   OK state=<idle|starting|waiting|running|stopping|error> service=<name|none> page=<name|none> msg=<任意文本>
  *          ERR msg=<任意文本>
  *   service 取值: miracast | airplay | carlife | carplay
+ *   page    = 后端认为当前该显示的二级画布 (waiting/running 时 = service; idle 时 = none)
+ *
+ * 状态语义:
+ *   idle      主界面 (LVGL 占屏, 无投屏服务)
+ *   starting  正在跑模式切换脚本
+ *   waiting   待投屏: 该路服务已起, 但**屏仍归 LVGL 二级画布** (不刷黑)
+ *   running   投屏中: 屏归 drmplay 视频流 (此时 k230ui 被停, 不显示)
+ *   stopping  正在收尾回主界面
  */
 #ifndef K230UI_BACKEND_CLIENT_H
 #define K230UI_BACKEND_CLIENT_H
@@ -25,6 +33,7 @@ typedef enum {
     BE_STATE_UNKNOWN = 0,
     BE_STATE_IDLE,
     BE_STATE_STARTING,
+    BE_STATE_WAITING,
     BE_STATE_RUNNING,
     BE_STATE_STOPPING,
     BE_STATE_ERROR
@@ -33,6 +42,7 @@ typedef enum {
 typedef struct {
     be_state_t state;
     char service[24]; /* miracast / airplay / carlife / carplay / none */
+    char page[24];    /* 当前该显示的二级画布 / none */
     char message[128];
     int  connected;   /* 1 = 最近一次请求拿到了响应 */
 } be_status_t;

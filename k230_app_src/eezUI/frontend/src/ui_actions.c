@@ -1,19 +1,23 @@
 /**
- * ui_actions.c — 主界面 4 个按钮 + 状态标签的全部业务逻辑
+ * ui_actions.c — 主界面 4 个按钮 + 状态标签的业务逻辑
  *
- * 交互约定 (只用一个屏幕, 不加二级页面):
- *   - 点某个服务按钮       -> 启动那一路 (后端负责停掉其它路、让出/夺回屏幕)
- *   - 再点同一路 (运行中)  -> 停掉, 回到待命 (等同后端 AUTO)
- *   - 底部标签实时显示后端状态; 后端没起来就显示 "backend offline"
+ * 交互约定 (2026-11-07 改版):
+ *   - 点某个服务按钮   -> 进该服务的画布 **并立刻自动起服务** (be_select)
+ *                        后端 waiting 态只起服务不让屏, 画布一直在, 不刷黑
+ *   - 画布「重新连接」 -> 后端对同一路幂等, 仅异常时用
+ *   - 画布「返回主界面」-> STOP, 回主界面
+ *   - 真正出帧时后端停 k230ui 把屏交给 drmplay; 视频流断开再拉起 k230ui,
+ *     pages_restore() 自动回到刚才那个按钮的画布
  *
- * 视觉反馈: 正在运行的那一路按钮加白边 (LV_STATE_FOCUSED 之外的独立描边),
- *           其余按钮清除描边 —— 触摸屏上一眼能看出"现在在跑哪个"。
+ * 为什么点按钮就能直接启动: 后端新增 waiting 模式 —— 起服务但**不碰 DRM**,
+ *   LVGL 继续占屏, 所以不需要「开始投屏」那一次额外点击, 也不存在刷黑等待。
  */
 #include "ui_actions.h"
 #include "backend_client.h"
 #include "actions.h"
 #include "screens.h"
 #include "ui.h"
+#include "ui_pages.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -76,37 +80,24 @@ static void set_status_text(const char *text, uint32_t color)
                                 LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
-/* 点按钮的统一处理: 同一路在跑 -> 停; 否则 -> 起 */
-static void handle_service_click(const char *service)
+/* 点主界面按钮: 进该服务的画布 + 立刻自动起对应服务 (不再需要「开始投屏」) */
+static void show_and_start(int index, const char *service)
 {
-    be_status_t st;
-
-    be_get_status(&st);
-
-    if (st.state == BE_STATE_RUNNING && !strcmp(st.service, service)) {
-        be_stop_session();
-        set_status_text("Stopping...", COL_WARN);
-        return;
-    }
-    if (st.state == BE_STATE_STARTING && !strcmp(st.service, service)) {
-        /* 正在起, 再点一次就别重复下命令了 */
-        return;
-    }
-
+    pages_show(index);
     be_select(service);
-    set_status_text("Starting...", COL_WARN);
 }
 
-/* ------------------------------------------------------- EEZ 的 5 个 action */
-void action_on_miracast_click(lv_event_t *e) { (void)e; handle_service_click("miracast"); }
-void action_on_airplay_click(lv_event_t *e)  { (void)e; handle_service_click("airplay"); }
-void action_on_carlife_click(lv_event_t *e)  { (void)e; handle_service_click("carlife"); }
-void action_on_carplay_click(lv_event_t *e)  { (void)e; handle_service_click("carplay"); }
+void action_on_miracast_click(lv_event_t *e) { (void)e; show_and_start(PAGE_MIRACAST, "miracast"); }
+void action_on_airplay_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_AIRPLAY,  "airplay"); }
+void action_on_carlife_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_CARLIFE,  "carlife"); }
+void action_on_carplay_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_CARPLAY,  "carplay"); }
 
 void action_on_main_loaded(lv_event_t *e)
 {
     (void)e;
-    set_status_text("Ready - tap a service", COL_MUTED);
+    /* 主界面文案换成中文 (EEZ 生成的是英文, 字体也是 Montserrat) */
+    pages_apply_main_texts();
+    set_status_text("准备就绪，请选择投屏方式", COL_MUTED);
 }
 
 /* --------------------------------------------------------- 状态轮询 (500ms) */
@@ -118,39 +109,49 @@ static void poll_status_cb(lv_timer_t *t)
     (void)t;
     be_get_status(&st);
 
+    /* 二级画布自己刷状态行 (不在画布上时是空操作) */
+    pages_update_status(&st);
+
     switch (st.state) {
     case BE_STATE_IDLE:
         set_highlight(NULL);
-        set_status_text("Ready - tap a service", COL_MUTED);
+        set_status_text("准备就绪，请选择投屏方式", COL_MUTED);
         break;
 
     case BE_STATE_STARTING:
         set_highlight(button_for_service(st.service));
-        snprintf(buf, sizeof(buf), "Starting %s...", service_label(st.service));
+        snprintf(buf, sizeof(buf), "正在启动 %s…", service_label(st.service));
+        set_status_text(buf, COL_WARN);
+        break;
+
+    case BE_STATE_WAITING:
+        set_highlight(button_for_service(st.service));
+        snprintf(buf, sizeof(buf), "%s 已就绪，等待设备连接…",
+                 service_label(st.service));
         set_status_text(buf, COL_WARN);
         break;
 
     case BE_STATE_RUNNING:
         set_highlight(button_for_service(st.service));
-        snprintf(buf, sizeof(buf), "%s running - tap again to stop",
+        snprintf(buf, sizeof(buf), "%s 投屏中",
                  service_label(st.service));
         set_status_text(buf, COL_OK);
         break;
 
     case BE_STATE_STOPPING:
-        set_status_text("Stopping...", COL_WARN);
+        set_status_text("正在停止…", COL_WARN);
         break;
 
     case BE_STATE_ERROR:
         set_highlight(NULL);
-        snprintf(buf, sizeof(buf), "Error: %s",
-                 st.message[0] ? st.message : "unknown");
+        snprintf(buf, sizeof(buf), "出错：%s",
+                 st.message[0] ? st.message : "未知错误");
         set_status_text(buf, COL_ERR);
         break;
 
     default:
         set_highlight(NULL);
-        set_status_text(st.connected ? "Backend: unknown state" : "Backend offline",
+        set_status_text(st.connected ? "后端状态未知" : "后端未连接（k230-ui-backend）",
                         st.connected ? COL_WARN : COL_ERR);
         break;
     }
@@ -160,6 +161,8 @@ static void poll_status_cb(lv_timer_t *t)
 void app_init(const char *backend_sock)
 {
     be_start(backend_sock);
+    /* 后端从 video 回到 waiting 会重启本进程; 靠状态文件自动回到刚才那个按钮的画布 */
+    pages_restore();
     if (!s_poll_timer)
         s_poll_timer = lv_timer_create(poll_status_cb, 500, NULL);
     poll_status_cb(NULL);

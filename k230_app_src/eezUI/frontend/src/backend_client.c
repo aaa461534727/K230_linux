@@ -102,6 +102,7 @@ static be_state_t parse_state(const char *s)
 {
     if (!strcmp(s, "idle"))     return BE_STATE_IDLE;
     if (!strcmp(s, "starting")) return BE_STATE_STARTING;
+    if (!strcmp(s, "waiting"))  return BE_STATE_WAITING;
     if (!strcmp(s, "running"))  return BE_STATE_RUNNING;
     if (!strcmp(s, "stopping")) return BE_STATE_STOPPING;
     if (!strcmp(s, "error"))    return BE_STATE_ERROR;
@@ -129,6 +130,11 @@ static void apply_reply(const char *line)
         copy_str(g_status.service, sizeof(g_status.service), buf);
     else
         copy_str(g_status.service, sizeof(g_status.service), "none");
+
+    if (kv_value(line, "page", buf, sizeof(buf)))
+        copy_str(g_status.page, sizeof(g_status.page), buf);
+    else
+        copy_str(g_status.page, sizeof(g_status.page), "none");
 
     {
         const char *m = strstr(line, "msg=");
@@ -350,6 +356,7 @@ void be_start(const char *sock_path)
     memset(&g_status, 0, sizeof(g_status));
     g_status.state = BE_STATE_UNKNOWN;
     copy_str(g_status.service, sizeof(g_status.service), "none");
+    copy_str(g_status.page, sizeof(g_status.page), "none");
     copy_str(g_status.message, sizeof(g_status.message), "connecting...");
     g_qhead = g_qtail = g_qcount = 0;
     g_running = 1;
@@ -402,6 +409,7 @@ const char *be_state_name(be_state_t s)
     switch (s) {
     case BE_STATE_IDLE:     return "idle";
     case BE_STATE_STARTING: return "starting";
+    case BE_STATE_WAITING:  return "waiting";
     case BE_STATE_RUNNING:  return "running";
     case BE_STATE_STOPPING: return "stopping";
     case BE_STATE_ERROR:    return "error";

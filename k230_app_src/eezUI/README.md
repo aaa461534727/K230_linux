@@ -1,25 +1,55 @@
 # eezUI —— K230 上电主界面 (LVGL + EEZ Studio)
 
 > 一句话: 板子上电看到的主界面 —— 4 个按钮 (Miracast / AirPlay / CarLife / CarPlay),
-> 点哪个就起哪一路投屏; 投屏时把屏幕让给投屏, 手机断开后自动回到主界面。
+> **点哪个就立刻自动起对应服务并停在该服务的中文说明画布** (不用再点「开始投屏」);
+> 等待投屏期间屏上一保持 LVGL 页面、不刷黑; 真正出帧才把屏让给 drmplay 刷视频流;
+> 视频流断开自动回到刚才那个按钮的二级画布; 只有点「返回主界面」才回主界面。
+>
+> (2026-11-07 改版, 见 `K230/docs/PROGRESS.md` 当日条目; 旧行为「点按钮进画布 → 再点开始投屏 →
+> 屏让给 drmplay → 空闲刷黑 → 断开回主界面」已作废。)
 >
 > 位置: `K230/src/eezUI/` (放在 `src/` 下是为了不破坏「项目顶层只许 9 项」的白名单,
 > `eezUI` 本身是一个独立目录, 前端 `frontend/` + 后端 `backend/` 分开)。
 
 ---
 
-## 1. 边界与现状 (2026-11-03)
+## 0. 2026-11-07 交互改版 (主人要求, 板端已验收)
+
+| # | 要求 | 实现 |
+|---|---|---|
+| ① | 点按钮直接自动起相应服务, 不用再点「开始投屏」 | `ui_actions.c` `show_and_start()` = `pages_show()` + `be_select()`; 二级画布「开始投屏」按钮改成「重新连接」(后端对同一路 SELECT 幂等) |
+| ② | 保持在这个界面, 除非点「返回主界面」 | 后端新增 `waiting` 态: 只起服务、**不碰 DRM**; `k230-ui` 不停, LVGL 二级画布继续占屏; 去掉 60/180/1800 s 宽限期自动弹回主界面 |
+| ③ | 等待投屏界面不刷黑, 保留 LVGL 页面; 投屏开始后才刷视频流 | `k230-ui-mode.sh wait <svc>` 用 fifo keeper 给解码器当读者, 不起 drmplay; `hold-screen` 标记让 `wfd-p2p.sh` / `k230-airplay` 跳过播放器启停; 后端探到真实会话才切 `video <svc>` (停 UI、起 drmplay) |
+| ④ | 视频流断开自动回刚才那个按钮的二级页 | 后端 `video → wait` 重新拉起 `k230-ui`; `pages_show()` 把 service 写进 `/run/k230-ui/active-page`, `pages_restore()` 在 `app_init` 读回来自动 `pages_show()`; 「返回主界面」/ `ui` 模式清掉这个文件 |
+
+板端验收: `K230/logs/20261107-0215-k230-ui-autostart-verify.log`
+(含 `k230ui-ctl` 全状态流转 + `k230-tap.py` 真触摸点按钮/返回, 4 项全绿)。
+
+> ⚠️ **改中文文案必须重跑字体** (2026-11-07 踩过): `font_cjk_20.c / font_cjk_28.c` 是
+> `tools/make-cjk-font.py` 按 `ui_pages.c` / `ui_actions.c` 字符串字面量打出来的**子集字体**,
+> 新增汉字没打进去就会显示成方框 (豆腐块)。改完文案跑:
+> `python3 tools/make-cjk-font.py` → `bash tools/board-build.sh` → scp 上板重启 `k230-ui`。
+> 脚本内置自检: 生成后回读 `.c` 的 `U+` 注释, 缺任意一个字就 `sys.exit(1)`, 不会静默漏字。
+> 依赖 `lv_font_conv` (本机 `npm i -g lv_font_conv`) + `DroidSansFallbackFull.ttf` / `DejaVuSans.ttf`。
+> 取证: `logs/20261107-0312-k230-ui-font-fix.log` + `captures/20261107-0312-k230-ui-font-{before,after}-*.png`。
+
+---
+
+## 1. 边界与现状 (2026-11-04)
 
 | 项 | 状态 | 证据 |
 |---|---|---|
-| 主界面 (480x800, 4 按钮 + 状态行) | ✅ 已可跑 | `K230/captures/20261103-0022-k230-eezui-main-idle-sim.png` |
+| 主界面 (480x800, 4 按钮 + 状态行) | ✅ 已可跑 | `K230/captures/20261104-0827-k230-ui-main-cn.png` |
 | 点按钮 -> 后端 -> 状态回显 (白边高亮 + 绿字) | ✅ 本机整链打通 (mock 后端) | `K230/captures/20261103-0022-k230-eezui-main-running-sim.png` |
-| 板端交叉编译 `k230ui` (RISC-V ELF64, 98K) | ✅ 已编过 | `frontend/build-board/k230ui` |
+| 板端交叉编译 `k230ui` (RISC-V ELF64, 216K) | ✅ 已编过, md5 `8acfca735071048411fdb61522044772` | `frontend/build-board/k230ui` + `K230/build/logs/20261104-0830-k230-ui-board-build.log` |
 | **板端实机出画面** (LVGL 走 SDK 的 `liblvgl_linux.so` + DRM + evdev) | ✅ **已上真板** | `K230/captures/20261103-1642-k230-eezui-board-main-ui.png` (板上 `drmdump` 抓 scanout 转 PNG) |
 | **四个按钮真起服务 + 屏幕让位** | ✅ **板上实测 9 个场景全绿** | `K230/logs/20261103-1642-k230-eezui-board-e2e.log` |
 | **上电自动进主界面** (reboot 实测) | ✅ 重启后 `k230-ui-backend` 自己把界面拉起来 | 同上日志 (uptime 0 min + `mode=ui` + `k230ui master=y`) |
-| 中文文案 | ⏳ 未做 (当前英文, 用 LVGL 内置 Montserrat; 中文需另做 TTF 子集字体) | — |
-| 手指实测 (真触摸点击) | ⏳ 未做 (硬件要人按); 按钮→socket 链路用 `k230ui-ctl` 等价验证 + 模拟器真 CLICKED 事件验证 | — |
+| **主界面 + 4 个二级画布全中文** | ✅ **已上板**, 用 lv_font_conv 打的子集字体 (不依赖板端 TTF) | 5 张画布照 `K230/captures/20261104-0827-k230-ui-*.png` |
+| **点按钮 → 中文说明画布 → 「开始投屏」** | ✅ **Miracast/安卓真机闭环** | `K230/logs/20261104-0824-k230-miracast-cast-verify.log` (`上屏 flip 60/60` / `内容变化 60/60` / 60.0 fps) |
+| **手机断开 → 自动回主界面** | ✅ 板端实测 (无人工干预) | `K230/logs/20261104-0825-k230-ui-auto-return.log` + `captures/20261104-0825-k230-ui-auto-return-main.png` |
+| 触摸点击 | ✅ 触摸链路已用 evdev 注入验证 (`scripts/k230-tap.py`) | 4 个画布 + 返回 + 开始投屏均已脚本点通; **真手指**待主人按一下确认 |
+| AirPlay / CarLife / CarPlay 的「开始投屏」 | ⏳ 画布已上板验证, 各自真机链路待跑 (AirPlay 待 iPhone) | — |
 
 ---
 
@@ -31,19 +61,28 @@ K230/src/eezUI/
 ├── frontend/                 ← 界面 (EEZ Studio 工程 + LVGL 代码 + 模拟器)
 │   ├── eez-project/          ← EEZ Studio 工程 (k230-ui.eez-project)
 │   ├── ui/                   ← EEZ **生成**的 C 代码 (不要手改, 会被覆盖)
-│   ├── src/                  ← 手写代码 (main_sdl/main_board/ui_actions/backend_client)
+│   ├── src/                  ← 手写代码
+│   │   ├── main_sdl.c        ← 入口 (SDL 模拟器 / DRM 板端同一份)
+│   │   ├── ui_actions.c      ← 主界面按钮 → pages_show()+be_select() (自动起服务); 状态轮询中文化
+│   │   ├── ui_pages.{c,h}    ← 4 个服务的中文说明画布 (纯 LVGL 手写) + active-page 页面记忆/恢复
+│   │   ├── font_cjk.h        ← 中文字体声明
+│   │   ├── font_cjk_20.c     ← 20px 正文子集 (生成物, ~209 KB)
+│   │   └── font_cjk_28.c     ← 28px 标题子集 (生成物, ~370 KB)
 │   ├── tools/make-eez-project.py   ← 生成 .eez-project 的脚本 (改布局/文案从这里改)
+│   ├── tools/make-cjk-font.py      ← 扫源码字符串 → lv_font_conv 打中文字体子集
 │   ├── tools/board-build.sh        ← 交叉编译板端 k230ui
 │   ├── scripts/              ← fetch-lvgl / build-sim / run-sim
 │   ├── lv_conf.h             ← 本机模拟器配置 (SDL2)
 │   └── lv_conf_board.h       ← 板端配置副本 (必须和 liblvgl.so 一致!)
 └── backend/                  ← 后端 (屏幕让位 + 服务启停)
     ├── k230-ui-backend.c     ← 守护进程 (Unix socket, 文本行协议)
-    ├── k230-ui-mode.sh       ← 模式切换 (ui / select <svc> / stop / auto / probe)
+    ├── k230-ui-mode.sh       ← 模式切换 (ui / wait <svc> / video <svc> / select / auto / probe)
     ├── systemd/              ← k230-ui.service + k230-ui-backend.service
     ├── k230-ui.conf.example  ← 按钮 -> unit 映射
     └── tools/                ← k230ui-ctl (调试 CLI) + mock 脚本 + 安装脚本
 ```
+
+> 板端触摸注入脚本在项目层: `K230/scripts/k230-tap.py` (不属于本工程, 但调试 UI 必用)。
 
 ---
 
@@ -60,7 +99,7 @@ K230/src/eezUI/
 所以必须有"唯一决策者"决定**此刻谁该上屏**, 这就是后端:
 
 ```
-   用户点按钮
+   画布上点「开始投屏」
        │
        ▼
    k230ui  ──SELECT miracast──►  k230-ui-backend  ──fork──►  k230-ui-mode.sh select miracast
@@ -74,6 +113,41 @@ K230/src/eezUI/
 
 手机断开后: 后端自己探端口 (`/proc/net/tcp` 的 ESTABLISHED), 连续 2 次探不到
 => 自动 `stop` => 回主界面。**用户不需要手动关**。
+
+---
+
+## 3.5 产品化交互: 主界面 → 中文说明画布 → 投屏接管 (2026-11-04)
+
+以前「点按钮 = 立刻发 `SELECT`」, 用户来不及看怎么连。现在改成两段:
+
+```
+主界面 (4 个中文按钮)
+   │  点 Miracast/AirPlay/CarLife/CarPlay —— ⚠ 只换页面, 不发任何命令
+   ▼
+该服务的中文说明画布
+   ├─ 标题 / 副标题 / 主色条 / 4 步中文说明 / 状态行
+   ├─ 「开始投屏」 ──► be_select(svc) ──► 后端停 k230-ui, k230-screen 接管 ⇒ 画面直接顶替画布
+   └─ 「返回主界面」 ─► 若已启动先 be_stop_session(), 再回主界面
+```
+
+**为什么不"点按钮直接启动"**: 后端收到 `SELECT` 后 ~1 s 就 `systemctl stop k230-ui` 把 DRM 让给
+`k230-screen`, 画布会一闪而过。所以启动动作必须下沉到画布里的「开始投屏」。
+
+| 落点 | 作用 |
+|---|---|
+| `frontend/src/ui_pages.{c,h}` | 4 个画布 (纯 LVGL 手写, **不动 EEZ 生成物 `ui/`**) + `pages_show()` / `pages_back()` / `pages_update_status()` |
+| `frontend/src/ui_actions.c` | 主界面按钮只调 `pages_show(PAGE_xxx)`; 状态轮询中文化 |
+| `frontend/src/font_cjk.h` + `font_cjk_20.c` / `font_cjk_28.c` | 20px 正文 / 28px 标题子集字体 (bpp4) |
+| `frontend/tools/make-cjk-font.py` | 扫 `ui_pages.c` / `ui_actions.c` 的 C 字符串字面量 → 自动生成子集 (改文案后**必须重跑**) |
+| `K230/scripts/k230-tap.py` | 板端触摸注入 (板上没有 `/dev/uinput` / `getevent` / `evemu`, 直写 `/dev/input/event0` 灌 MT-B) |
+
+画布布局 (480x800): 标题 y26 / 副标题 y74 / 主色条 y112 / 说明 y136 (432x380, 行距 8) /
+状态行 y536 / 「开始投屏」y614 高 82 / 「返回主界面」y710 高 66。
+
+画布文案按板端真实事实写: AirPlay 设备名 = `K230-CAST` (`AIRPLAY_NAME`), CarLife/CarPlay 共用热点
+`K230-CARPLAY` / `k230carplay` (`k230-shared-ap.service` 的 `CARLIFE_AP_SSID/PSK`)。
+
+> ⚠ 改画布文案后要 `python3 tools/make-cjk-font.py` 重打字体, 否则新字会是空白格。
 
 ---
 
@@ -169,6 +243,19 @@ convert -size 480x800 -depth 8 bgra:/tmp/frame.bgra /tmp/ui.png   # 转 PNG 看
 | 8 | `scp k230ui /usr/bin/k230ui` 报 `Text file busy` | 程序正在跑, 内核不许覆盖可执行文件 | 传 `/tmp/xxx.new` 再 `mv` (board-install.sh 已改) |
 | 9 | 板上有个 `k230-carlife` (有线) 一直 `activating`, restart counter 793 | 该 unit 的 `ExecStart=/root/carlife_sink` 不存在 (203/EXEC), 又 `Restart=always` | 与 UI 无关; `systemctl stop k230-carlife && systemctl reset-failed k230-carlife` 收掉即可 (有线 CarLife 本来就不用, 会切走调试网卡) |
 
+### 4.6 中文字体 + 触摸注入的坑 (2026-11-04 现场, 改字体/自动化点击前必看)
+
+| # | 现象 | 根因 | 现在的做法 |
+|---|---|---|---|
+| 1 | 板上中文全不出来, 日志 `Compressed fonts is used but LV_USE_FONT_COMPRESSED is not enabled` | 板端 SDK 的 `lv_conf.h` 是 `LV_USE_FONT_COMPRESSED 0`, 但 `lv_font_conv` 默认输出压缩字库 | `make-cjk-font.py` 固定加 `--no-compress --no-prefilter` |
+| 2 | 英文/数字全是空框 | `DroidSansFallbackFull.ttf` 是**纯中文兜底字体, 不含 ASCII** | 同一份字体里叠 DejaVu: `--font DejaVuSans.ttf -r 0x20-0x7E` |
+| 3 | CarPlay 画布「设置 → 通用」的 `→` 变空白格 | **`--font` 顺序**: 中文兜底字体若放在**后**, lv_font_conv 会把 `U+2192` 当成"前者已声明但无字形"而丢掉 | 顺序必须 **中文兜底在前, DejaVu 在后**; DejaVu 加 `-r 0x2190-0x2193`; 生成后校验 cmap 里 `含→: True` |
+| 4 | `python3 k230-tap.py X Y` 点了没反应 | 按住 80 ms 太短, LVGL 有时判不出 click | 加 `--ms 220` |
+| 5 | UI 刚启动后的第一次注入被吞掉 | LVGL 还没处理完首帧 / 触摸设备刚发现 | 先往角落空白点 `(2,2)` 热身一次, 再点真按钮 |
+
+> 板子没有 `/dev/uinput`、没有 `getevent` / `evemu`, 所以 `k230-tap.py` 是直接往
+> `/dev/input/event0` 写 MT-B (slot B) 事件序列 —— 这是本板唯一可脚本化的点击方式。
+
 ---
 
 ## 5. 前端文件到底谁做? (回答"我要怎么配合你")
@@ -182,10 +269,11 @@ convert -size 480x800 -depth 8 bgra:/tmp/frame.bgra /tmp/ui.png   # 转 PNG 看
 |---|---|---|---|
 | ① 界面布局/样式 | `tools/make-eez-project.py` **或** EEZ Studio 手工拖 | ✅ 都能 | 脚本生成 = 改代码就改界面; EEZ 手工拖 = 所见即所得 |
 | ② 生成 C 代码 | EEZ Studio 无头构建 (`--build-project`) | ✅ 随时 | `ui/*.c/h`, **不要手改** |
-| ③ 事件响应 | `src/ui_actions.c` (手写, 只有 5 个函数) | ❌ 手写 | 这里才有业务逻辑 (调后端 + 刷状态) |
+| ③ 事件响应 | `src/ui_actions.c` (手写) + `src/ui_pages.c` (手写二级画布) | ❌ 手写 | 这里才有业务逻辑 (换页 + 调后端 + 刷状态) |
 
-也就是说: **界面长什么样** 完全在 ①, **点下去干什么** 只在 ③ 的 5 个函数里,
+也就是说: **界面长什么样** 完全在 ①, **点下去干什么** 在 ③ 的手写函数里,
 两者之间由 EEZ 生成的 `ui/actions.h` 按名字连起来 (`action_on_miracast_click` 等)。
+二级画布 (中文说明页) 不走 EEZ, 直接 `ui_pages.c` 里用 LVGL API 建对象。
 
 所以配合方式 (任选):
 - **你自己动手调外观**: `EEZ Studio` 打开 `frontend/eez-project/k230-ui.eez-project`,
@@ -194,8 +282,9 @@ convert -size 480x800 -depth 8 bgra:/tmp/frame.bgra /tmp/ui.png   # 转 PNG 看
   ⚠ 一旦在 EEZ Studio 里改过, **别再跑 `make-eez-project.py`** (会覆盖你的手工改动)。
 - **告诉我改什么** (按钮文案/颜色/布局/加图标/加页面): 我改 `tools/make-eez-project.py`
   重新生成, 你只验收。
-- **要中文**: 需要把 TTF 做成 LVGL 字体 (子集, 否则字库很大), 我可以用
-  `lv_font_conv` 生成; 现在先用英文 (LVGL 内置 Montserrat, 零额外体积)。
+- **要中文**: ✅ **已做** —— `tools/make-cjk-font.py` 会扫 `ui_actions.c` / `ui_pages.c` 里的
+  C 字符串字面量, 用 `lv_font_conv` 打子集 (20px / 28px, bpp4, 不压缩);
+  改完文案重跑一次脚本 + `bash tools/board-build.sh` 即可。
 
 ---
 

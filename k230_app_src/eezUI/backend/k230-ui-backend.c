@@ -6,15 +6,20 @@
  *   不能同时跑; 而"谁该上屏"又要看用户点了哪个按钮、会话什么时候结束。
  *   本守护进程 = 唯一的决策者:
  *     · 对外只开一个 Unix socket (文本行协议), UI 只跟它说话, 不直接碰 systemd;
- *     · 收到 SELECT/STOP 就调 k230-ui-mode.sh 做"停对方 -> 起自己"的屏幕让位,
- *       脚本是子进程异步跑, 期间照样能应答 STATUS (UI 不会卡);
- *     · 运行中每 2 s 探一次会话 (看 /proc/net/tcp 里对应端口的 ESTABLISHED 连接),
- *       手机断开就自动收尾并切回主界面。
+ *     · 收到 SELECT <svc> 只起该路服务、**不碰 DRM**: LVGL 二级画布继续占屏
+ *       (waiting 态), 用户不会被刷黑, 也不会被宽限期弹回主界面;
+ *     · 探到真实投屏会话建立 (端口/会话标记) 才切 video 模式: 停 k230-ui、起 drmplay 刷视频流;
+ *     · 探到视频流断开再切回 wait 模式: 停 drmplay、重新拉起 k230-ui
+ *       (靠 /run/k230-ui/active-page 自动回到刚才那个按钮的二级画布);
+ *     · STOP = 回主界面 (唯一能离开二级画布的动作)。
+ *
+ * 状态: idle -> starting -> waiting <-> (starting) -> running -> waiting ... -> stopping -> idle
  *
  * 协议 (一行一条, 见 frontend/src/backend_client.h):
  *   请求  STATUS | SELECT <svc> | STOP | AUTO
- *   响应  OK state=<idle|starting|running|stopping|error|unknown> service=<svc|none> msg=<文本>
+ *   响应  OK state=<idle|starting|waiting|running|stopping|error|unknown> service=<svc|none> page=<svc|none> mode=<...> msg=<文本>
  *         ERR msg=<文本>
+ *   page = 后端认为当前该显示的二级画布 (waiting/running 时 = service; idle 时 = none)
  *
  * 用法:
  *   k230-ui-backend                       # 板端 (systemd 拉起)
@@ -44,20 +49,18 @@
 #define SOCK_DEFAULT  "/run/k230-ui/backend.sock"
 #define SCRIPT_DEFAULT "/usr/bin/k230-ui-mode.sh"
 
-#define PROBE_PERIOD_S 2.0   /* 运行中多久探一次会话 */
+#define PROBE_PERIOD_S 2.0   /* 多久探一次会话 (waiting 探开始 / running 探断开) */
 #define CLIENT_READ_MS 500   /* 读客户端一行最多等多久 */
-/* 刚切进某一路后的"宽限期": 这段时间内探不到会话**不算断开**。
- * 为什么必须有: 用户点了 Miracast 之后, 手机上找设备/连 P2P 要十几秒,
- * CarPlay/CarLife 还要手机先连热点再建会话, 动辄 30~60 s。
- * 没有宽限期的话, 按钮点下去 4 s 就自动弹回主界面 (= 按钮看起来没反应)。 */
-#define GRACE_DEFAULT_S 60.0
+/* 连续几次探不到会话才算真断 (端口刚建/刚拆的瞬间会抖) */
+#define PROBE_MISS_MAX 2
 
 /* ---------------------------------------------------------------- 状态机 */
 typedef enum {
     ST_UNKNOWN = 0,
     ST_IDLE,
     ST_STARTING,
-    ST_RUNNING,
+    ST_WAITING,      /* 服务已起, 但屏仍归 LVGL 二级画布 (不刷黑) */
+    ST_RUNNING,      /* 真实投屏中: 屏归 drmplay 视频流, k230ui 被停 */
     ST_STOPPING,
     ST_ERROR
 } state_t;
@@ -67,6 +70,7 @@ static const char *state_str(state_t s)
     switch (s) {
     case ST_IDLE:     return "idle";
     case ST_STARTING: return "starting";
+    case ST_WAITING:  return "waiting";
     case ST_RUNNING:  return "running";
     case ST_STOPPING: return "stopping";
     case ST_ERROR:    return "error";
@@ -77,19 +81,18 @@ static const char *state_str(state_t s)
 static struct {
     state_t state;
     char    service[24];   /* miracast / airplay / carlife / carplay / none */
+    char    page[24];      /* 该显示的二级画布 / none */
     char    message[128];
-} g_st = { ST_UNKNOWN, "none", "booting" };
+} g_st = { ST_UNKNOWN, "none", "none", "booting" };
 
 /* 子进程 (模式脚本) 跟踪 */
 static pid_t g_child = 0;
-static char  g_child_next[24];   /* 脚本跑完后要进入的 service 名 ("" = 回 idle) */
-static char  g_pending_svc[24];  /* 忙的时候收到的下一个请求 (最后一条胜出) */
-/* 板上真正处在哪个模式: ui / miracast / airplay / carlife / carplay / auto
- * 为什么不能只靠 g_st.state: AUTO 跑完后 g_st.state 也是 IDLE (界面不在屏上, 屏交给仲裁器),
- * 但此时屏上**不是主界面**。2026-11-03 板上踩过: 从 auto 按 STOP 被当成 "already idle"
- * 丢弃, 用户按了回主界面, 屏上还是仲裁器的画面。 */
-static char  g_mode[24] = "ui";
-static int   g_pending = 0;      /* 0 无 / 1 = select / 2 = stop / 3 = auto */
+static char  g_child_next[24];       /* 脚本跑完后要进入的 service 名 ("" = 回 idle) */
+static state_t g_child_next_state;   /* 脚本跑完后要进入的状态 */
+static char  g_pending_svc[24];      /* 忙的时候收到的下一个请求 (最后一条胜出) */
+/* 板上真正处在哪个模式: ui / wait:<svc> / video:<svc> / auto */
+static char  g_mode[32] = "ui";
+static int   g_pending = 0;          /* 0 无 / 1 = select / 2 = stop / 3 = auto */
 
 /* 配置 */
 static char  g_sock_path[108] = SOCK_DEFAULT;
@@ -97,9 +100,7 @@ static char  g_script[256] = SCRIPT_DEFAULT;
 static int   g_verbose = 0;
 static int   g_listen = -1;
 static double g_last_probe = 0;
-static int    g_probe_miss = 0;   /* 连续几次探不到会话 (2 次才算真断) */
-static double g_run_start = 0;    /* 进入 RUNNING 的时刻 (宽限期起点) */
-static double g_grace_s = GRACE_DEFAULT_S;
+static int    g_probe_miss = 0;      /* running 态连续几次探不到会话 */
 
 static const char *KNOWN_SERVICES[] = { "miracast", "airplay", "carlife", "carplay" };
 
@@ -182,8 +183,15 @@ static int file_exists(const char *p)
     return access(p, F_OK) == 0;
 }
 
-/* 返回值: 1 = 会话还在, 0 = 会话已结束 */
-static int session_alive(const char *svc)
+/* 返回值: 1 = 真实投屏会话已建立 / 仍在, 0 = 还没连上 / 已断开。
+ *
+ * 为什么判据里**不含蓝牙反控**: 蓝牙是 AirPlay 用户在手机上先连的那一步,
+ * 它连上不等于视频流开始; 反过来视频断开后蓝牙可能还连着, 若把它算进来
+ * 就永远不会从 video 回到二级页。waiting 态只认「视频会话」信号。
+ *
+ * 这些端口/标记出现在实际出帧之前 (RTSP/会话建立那一拍), 正是切 video 的时机:
+ * 后端一探到就停 k230-ui 起 drmplay, 解码器的 fifo 读者随即接上。 */
+static int video_session_alive(const char *svc)
 {
     static const int p_miracast[] = { 7236 };
     static const int p_airplay[]  = { 7100, 7101 };
@@ -193,18 +201,20 @@ static int session_alive(const char *svc)
     if (!strcmp(svc, "miracast"))
         return conn_cnt(p_miracast, 1) > 0;
     if (!strcmp(svc, "airplay"))
-        return conn_cnt(p_airplay, 2) > 0;
+        return conn_cnt(p_airplay, 2) > 0 || file_exists("/run/airplay-cast-active");
     if (!strcmp(svc, "carplay"))
         return file_exists("/run/airplay-active") || conn_cnt(p_carplay, 1) > 0;
     if (!strcmp(svc, "carlife"))
-        return conn_cnt(p_carlife, 7) > 0;
-    return 1;  /* 不认识的 service: 不要误杀 */
+        return conn_cnt(p_carlife, 7) > 0 || file_exists("/run/carlife-active");
+    return 1;  /* 不认识的 service: 不要误判 */
 }
 
 /* ---------------------------------------------------------------- 跑模式脚本 */
-/* mode_arg: "ui" / "stop" / "auto" / "select <svc>"
- * next_svc: 脚本成功后进入的 service ("" = idle) */
-static int spawn_mode2(const char *mode, const char *arg, const char *next_svc)
+/* mode: "ui" / "stop" / "auto" / "wait" / "video" (后两个带 arg=<svc>)
+ * next_svc:   脚本成功后进入的 service ("" = idle)
+ * next_state: 脚本成功后进入的状态 (ST_WAITING / ST_RUNNING / ST_IDLE) */
+static int spawn_mode2(const char *mode, const char *arg, const char *next_svc,
+                       state_t next_state)
 {
     pid_t pid;
 
@@ -232,9 +242,12 @@ static int spawn_mode2(const char *mode, const char *arg, const char *next_svc)
 
     g_child = pid;
     snprintf(g_child_next, sizeof(g_child_next), "%s", next_svc);
+    g_child_next_state = next_state;
     /* 记下目标模式 (脚本成功与否后面由 reap_child 兜) */
-    if (!strcmp(mode, "select") && arg && *arg)
-        snprintf(g_mode, sizeof(g_mode), "%s", arg);
+    if (!strcmp(mode, "wait") && arg && *arg)
+        snprintf(g_mode, sizeof(g_mode), "wait:%s", arg);
+    else if (!strcmp(mode, "video") && arg && *arg)
+        snprintf(g_mode, sizeof(g_mode), "video:%s", arg);
     else if (!strcmp(mode, "auto"))
         snprintf(g_mode, sizeof(g_mode), "auto");
     else
@@ -243,9 +256,9 @@ static int spawn_mode2(const char *mode, const char *arg, const char *next_svc)
 }
 
 /* 单参数便捷版 */
-static int spawn_mode(const char *mode, const char *next_svc)
+static int spawn_mode(const char *mode, state_t next_state)
 {
-    return spawn_mode2(mode, "", next_svc);
+    return spawn_mode2(mode, "", "", next_state);
 }
 
 /* 检查子进程是否结束, 结束就推进状态机 */
@@ -269,16 +282,20 @@ static void reap_child(void)
             set_msg("mode switch failed (unit may be missing)");
             /* 失败也要把自己的状态归零, 否则 UI 会一直显示 starting */
             g_pending = 0;
-        } else if (g_child_next[0]) {
-            g_st.state = ST_RUNNING;
+        } else if (g_child_next[0] &&
+                   (g_child_next_state == ST_WAITING || g_child_next_state == ST_RUNNING)) {
+            g_st.state = g_child_next_state;
             snprintf(g_st.service, sizeof(g_st.service), "%s", g_child_next);
-            set_msg("%s running", g_child_next);
+            snprintf(g_st.page, sizeof(g_st.page), "%s", g_child_next);
+            set_msg(g_child_next_state == ST_WAITING
+                        ? "%s waiting for device" : "%s running",
+                    g_child_next);
             g_last_probe = now_s();
-            g_run_start = now_s();
             g_probe_miss = 0;
         } else {
             g_st.state = ST_IDLE;
             snprintf(g_st.service, sizeof(g_st.service), "none");
+            snprintf(g_st.page, sizeof(g_st.page), "none");
             set_msg("ready");
         }
     }
@@ -293,16 +310,18 @@ static void reap_child(void)
         if (g_pending == 1 && svc[0] && strcmp(svc, g_st.service)) {
             g_st.state = ST_STARTING;
             snprintf(g_st.service, sizeof(g_st.service), "%s", svc);
+            snprintf(g_st.page, sizeof(g_st.page), "%s", svc);
             set_msg("starting %s", svc);
-            spawn_mode2("select", svc, svc);
+            spawn_mode2("wait", svc, svc, ST_WAITING);
         } else if (g_pending == 2 || g_pending == 3) {
             /* 注意: 不能要求 state != IDLE。
              * 2026-11-03 板上踩过: AUTO 跑完状态归 IDLE (屏交给了仲裁器), 此时排队的
              * STOP 被当成"已经在 idle 了"丢掉 ⇒ 用户按了回主界面, 屏上还是投屏/仲裁器画面。 */
             /* 3 = AUTO: 不能降级成 stop, 否则用户想交还仲裁器却停在主界面 */
             g_st.state = ST_STOPPING;
+            snprintf(g_st.page, sizeof(g_st.page), "none");
             set_msg("stopping");
-            spawn_mode(g_pending == 3 ? "auto" : "stop", "");
+            spawn_mode(g_pending == 3 ? "auto" : "stop", ST_IDLE);
         }
         g_pending = 0;
         g_pending_svc[0] = '\0';
@@ -327,8 +346,9 @@ static void reply(int fd, const char *fmt, ...)
 
 static void cmd_status(int fd)
 {
-    reply(fd, "OK state=%s service=%s mode=%s msg=%s", state_str(g_st.state),
-          g_st.service[0] ? g_st.service : "none", g_mode,
+    reply(fd, "OK state=%s service=%s page=%s mode=%s msg=%s", state_str(g_st.state),
+          g_st.service[0] ? g_st.service : "none",
+          g_st.page[0] ? g_st.page : "none", g_mode,
           g_st.message[0] ? g_st.message : "-");
 }
 
@@ -341,13 +361,12 @@ static void cmd_select(int fd, const char *svc)
         return;
     }
 
-    /* 点的就是当前跑着的那一路 -> 当作"停" */
+    /* 同一路已在 waiting: 「重新连接」按钮走这里 —— 重跑一次 wait 模式把
+     * 服务/fifo 读者/UI 都补回来 (脚本里有快路径, 不会动屏也不会重配蓝牙)。
+     * running 态 k230ui 已被停, 用户点不到, 直接幂等回 OK。 */
     if (!busy && g_st.state == ST_RUNNING && !strcmp(g_st.service, svc)) {
-        g_st.state = ST_STOPPING;
-        set_msg("stopping %s", svc);
-        spawn_mode("stop", "");
-        reply(fd, "OK state=%s service=%s msg=stopping %s", state_str(g_st.state),
-              g_st.service, svc);
+        reply(fd, "OK state=%s service=%s page=%s msg=already running",
+              state_str(g_st.state), g_st.service, g_st.page);
         return;
     }
 
@@ -355,37 +374,40 @@ static void cmd_select(int fd, const char *svc)
         /* 正在切: 记住最后一次点击, 切完再执行 */
         snprintf(g_pending_svc, sizeof(g_pending_svc), "%s", svc);
         g_pending = 1;
-        reply(fd, "OK state=%s service=%s msg=queued %s", state_str(g_st.state),
-              g_st.service, svc);
+        reply(fd, "OK state=%s service=%s page=%s msg=queued %s", state_str(g_st.state),
+              g_st.service, g_st.page, svc);
         return;
     }
 
+    /* SELECT = 只起该路服务, **不碰 DRM**: LVGL 二级画布继续占屏 (waiting) */
     g_st.state = ST_STARTING;
     snprintf(g_st.service, sizeof(g_st.service), "%s", svc);
+    snprintf(g_st.page, sizeof(g_st.page), "%s", svc);
     set_msg("starting %s", svc);
-    spawn_mode2("select", svc, svc);
-    reply(fd, "OK state=%s service=%s msg=starting %s", state_str(g_st.state),
-          g_st.service, svc);
+    spawn_mode2("wait", svc, svc, ST_WAITING);
+    reply(fd, "OK state=%s service=%s page=%s msg=starting %s", state_str(g_st.state),
+          g_st.service, g_st.page, svc);
 }
 
 static void cmd_stop(int fd, int to_auto)
 {
     if (g_child > 0) {
         g_pending = to_auto ? 3 : 2;
-        reply(fd, "OK state=%s service=%s msg=queued %s", state_str(g_st.state),
-              g_st.service, to_auto ? "auto" : "stop");
+        reply(fd, "OK state=%s service=%s page=%s msg=queued %s", state_str(g_st.state),
+              g_st.service, g_st.page, to_auto ? "auto" : "stop");
         return;
     }
     /* 只有"确实已经在主界面"才回 already idle; auto 模式下 g_st.state 也是 IDLE,
      * 但屏上是仲裁器的画面, 必须真的切回 ui。 */
     if (g_st.state == ST_IDLE && !strcmp(g_mode, "ui")) {
-        reply(fd, "OK state=idle service=none msg=already idle");
+        reply(fd, "OK state=idle service=none page=none msg=already idle");
         return;
     }
     g_st.state = ST_STOPPING;
+    snprintf(g_st.page, sizeof(g_st.page), "none");
     set_msg("stopping");
-    spawn_mode(to_auto ? "auto" : "stop", "");
-    reply(fd, "OK state=%s service=%s msg=stopping", state_str(g_st.state), g_st.service);
+    spawn_mode(to_auto ? "auto" : "stop", ST_IDLE);
+    reply(fd, "OK state=%s service=%s page=none msg=stopping", state_str(g_st.state), g_st.service);
 }
 
 static void handle_line(int fd, char *line)
@@ -543,8 +565,9 @@ int main(int argc, char **argv)
     if (!no_init) {
         g_st.state = ST_STARTING;
         snprintf(g_st.service, sizeof(g_st.service), "none");
+        snprintf(g_st.page, sizeof(g_st.page), "none");
         set_msg("initializing ui");
-        spawn_mode("ui", "");
+        spawn_mode("ui", ST_IDLE);
     } else {
         g_st.state = ST_IDLE;
         set_msg("ready (no-init)");
@@ -568,26 +591,34 @@ int main(int argc, char **argv)
 
         reap_child();
 
-        /* 运行中: 定期探会话, 手机断开就自动回主界面 */
-        if (g_st.state == ST_RUNNING && g_child <= 0) {
+        /* waiting <-> running 自动循环 (没有宽限期, 一直停在这条路上,
+         * 除非用户点「返回主界面」发 STOP):
+         *   waiting: 探到真实会话 -> 切 video (停 UI、起 drmplay 刷视频流)
+         *   running: 连续 2 拍探不到会话 -> 切回 wait (停 drmplay、重启 UI 回二级页) */
+        if (g_child <= 0 &&
+            (g_st.state == ST_WAITING || g_st.state == ST_RUNNING)) {
             double t = now_s();
             if (t - g_last_probe >= PROBE_PERIOD_S) {
                 g_last_probe = t;
-                if (session_alive(g_st.service)) {
-                    g_probe_miss = 0;
-                    if (strstr(g_st.message, "running") == NULL)
+                if (g_st.state == ST_WAITING) {
+                    if (video_session_alive(g_st.service)) {
+                        vlog("[backend] %s 会话建立, 切 video 让屏给 drmplay", g_st.service);
+                        g_st.state = ST_STARTING;
+                        set_msg("%s streaming, switching to video", g_st.service);
+                        spawn_mode2("video", g_st.service, g_st.service, ST_RUNNING);
+                    }
+                } else {  /* ST_RUNNING */
+                    if (video_session_alive(g_st.service)) {
+                        g_probe_miss = 0;
                         set_msg("%s running", g_st.service);
-                } else if (t - g_run_start < g_grace_s) {
-                    /* 宽限期内: 用户还在手机上找设备, 不要弹回主界面 */
-                    g_probe_miss = 0;
-                    set_msg("%s waiting for device", g_st.service);
-                } else if (++g_probe_miss >= 2) {
-                    /* 连续 2 拍探不到才算真断 —— 端口刚建/刚拆的瞬间会抖 */
-                    vlog("[backend] %s 会话结束, 回主界面", g_st.service);
-                    g_probe_miss = 0;
-                    g_st.state = ST_STOPPING;
-                    set_msg("%s ended", g_st.service);
-                    spawn_mode("stop", "");
+                    } else if (++g_probe_miss >= PROBE_MISS_MAX) {
+                        /* 端口刚建/刚拆的瞬间会抖, 连续 2 拍才算真断 */
+                        vlog("[backend] %s 视频流断开, 切回二级页", g_st.service);
+                        g_probe_miss = 0;
+                        g_st.state = ST_STARTING;
+                        set_msg("%s stream ended, back to page", g_st.service);
+                        spawn_mode2("wait", g_st.service, g_st.service, ST_WAITING);
+                    }
                 }
             }
         }

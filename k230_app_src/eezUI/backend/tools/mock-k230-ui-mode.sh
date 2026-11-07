@@ -13,14 +13,14 @@ STATE=${K230UI_MOCK_STATE:-/tmp/k230-ui-mock.state}
 sleep "${K230UI_MOCK_DELAY:-0.6}"
 
 case "${1:-}" in
-    select)
-        [ $# -ge 2 ] || { echo "ERROR: select needs a service"; exit 1; }
+    wait|video|select)
+        [ $# -ge 2 ] || { echo "ERROR: $1 needs a service"; exit 1; }
         case "$2" in
             miracast|airplay|carlife|carplay) ;;
             *) echo "ERROR: unknown service $2"; exit 2 ;;
         esac
-        echo "$2" > "$STATE"
-        echo "OK mode=$2"
+        echo "$1:$2" > "$STATE"
+        echo "OK mode=$1:$2"
         ;;
     ui|stop)
         echo ui > "$STATE"
@@ -39,7 +39,7 @@ case "${1:-}" in
         [ -f "$STATE" ] && cat "$STATE" || echo unknown
         ;;
     *)
-        echo "usage: $0 {ui|select <svc>|stop|auto|probe <svc>|status}"
+        echo "usage: $0 {ui|wait <svc>|video <svc>|select <svc>|stop|auto|probe <svc>|status}"
         exit 1
         ;;
 esac
