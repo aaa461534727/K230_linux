@@ -46,6 +46,14 @@ ACTIVE_FILE="${AIRPLAY_ACTIVE_FILE:-/run/airplay-active}"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG"; }
 
 ensure_player() {
+    # ★ 2026-11-07 (UI 待投屏改版): 屏暂时归 LVGL 主界面 (k230-ui), 后端还没切 video。
+    #   这时不能 `systemctl restart k230-screen` —— 会起 drmplay 和 k230-ui 抢 DRM
+    #   master (黑屏/紫屏)。管道读者由 k230-ui-mode.sh 的 fifo keeper 提供,
+    #   本脚本只管协议和解码器, 上屏交给后端在真正出帧时统一切。
+    if [ -f /run/k230-ui/hold-screen ]; then
+        log "⏸ hold-screen: 待投屏, 屏归 LVGL, 跳过播放器体检/重启"
+        return 0
+    fi
     # ★ 2026-10-27: 本函数原来也自己「pkill -B → rm -f 管道 → mkfifo → setsid drmplay」。
     #   和 k230-screen.sh / wfd-p2p.sh 三份逻辑撞在一起时, 后到的会把别人刚建好的管道
     #   inode 删掉 ⇒ 活着的玩家 fd 指向 (deleted) inode, 新管道没有读者 ⇒ 解码器 fopen

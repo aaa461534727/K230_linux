@@ -925,6 +925,15 @@ PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
 PLAYER_FIFO_MODE=0
 
 start_player() {
+    # ★ 2026-11-07 (UI 待投屏改版): 屏暂时归 LVGL 主界面 (k230-ui), 后端还没切 video。
+    #   这时**绝不碰 DRM / 不起 drmplay / 不拉起 k230-screen**, 否则两个进程抢
+    #   DRM master ⇒ 黑屏/紫屏, 用户刚点的二级画布直接消失。
+    #   管道读者由 k230-ui-mode.sh 的 fifo keeper 提供, 这里只要让管线继续写 fifo。
+    if [ -f /run/k230-ui/hold-screen ]; then
+        PLAYER_FIFO_MODE=1
+        log "⏸ hold-screen: 待投屏, 屏归 LVGL, 跳过播放器启停 (fifo keeper 顶着读者)"
+        return 0
+    fi
     [ -x "$PLAYER_BIN" ] || return 0
     if [ "$PLAYER_BIN" != /usr/bin/drmplay ]; then
         # vgplay 不支持 -F 常驻, 退回老的「管线里当最后一段」
@@ -1007,6 +1016,8 @@ stop_blank() {
     pkill -9 -f "drmplay --blank" 2>/dev/null || true
 }
 start_blank() {
+    # ★ 2026-11-07: 待投屏时屏归 LVGL, drmplay -B 会抢 DRM master, 必须跳过。
+    [ -f /run/k230-ui/hold-screen ] && return 0
     [ -x /usr/bin/drmplay ] || return 0
     # 2026-10-26: 常驻播放器已经在占 CRTC 并会自己刷黑, 再去起一个 -B 只会抢
     #   DRM master (现场症状: SETCRTC Permission denied + 紫屏/黑屏抖动)。
