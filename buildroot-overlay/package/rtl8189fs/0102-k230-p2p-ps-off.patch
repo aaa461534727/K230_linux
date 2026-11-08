@@ -1,0 +1,33 @@
+--- a/include/autoconf.h
++++ b/include/autoconf.h
+@@ -68,7 +68,7 @@
+ 	#define CONFIG_P2P_REMOVE_GROUP_INFO
+ 
+ 	/* #define CONFIG_DBG_P2P */
+-	#define CONFIG_P2P_PS
++	//#define CONFIG_P2P_PS
+ 	#define CONFIG_P2P_OP_CHK_SOCIAL_CH
+ 	#define CONFIG_CFG80211_ONECHANNEL_UNDER_CONCURRENT  /* replace CONFIG_P2P_CHK_INVITE_CH_LIST flag */
+ 	/*#define CONFIG_P2P_INVITE_IOT*/
+--- a/include/rtw_mlme.h
++++ b/include/rtw_mlme.h
+@@ -443,7 +443,7 @@
+ 	u16						ext_listen_interval;	/*	The interval to be available with legacy AP (ms) */
+ 	u16						ext_listen_period;	/*	The time period to be available for P2P listen state (ms) */
+ #endif
+-#ifdef CONFIG_P2P_PS
++#if 1//def CONFIG_P2P_PS
+ 	enum P2P_PS_MODE		p2p_ps_mode; /* indicate p2p ps mode */
+ 	enum P2P_PS_STATE		p2p_ps_state; /* indicate p2p ps state */
+ 	u8						noa_index; /* Identifies and instance of Notice of Absence timing. */
+--- a/include/wifi.h
++++ b/include/wifi.h
+@@ -1275,7 +1275,7 @@
+ 	P2P_CANCEL_RO_CH_WK = 7,
+ };
+ 
+-#ifdef CONFIG_P2P_PS
++#if 1//def CONFIG_P2P_PS
+ enum P2P_PS_STATE {
+ 	P2P_PS_DISABLE = 0,
+ 	P2P_PS_ENABLE = 1,
