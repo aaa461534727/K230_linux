@@ -1,0 +1,30 @@
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -5014,8 +5014,6 @@
+ 	rtw_k230_force_group_capab((u8 *)ies, ies_len, 0x00);
+ 
+ 	p2p_ie = rtw_get_p2p_ie((u8 *)ies, ies_len, NULL, &p2p_ielen);
+-	pr_info("K230P2P: extra ies type=%d len=%zu p2p_ielen=%u\n",
+-		type, ies_len, p2p_ielen);
+ 
+ 	if (type == 0x1 && p2p_ie && p2p_ielen > 0) {
+ 		rtw_p2p_set_role(pwdinfo, P2P_ROLE_GO);
+@@ -5039,9 +5037,6 @@
+ 
+ 	RTW_INFO(FUNC_NDEV_FMT" hidden_ssid:%d, auth_type:%d\n", FUNC_NDEV_ARG(ndev),
+ 		settings->hidden_ssid, settings->auth_type);
+-	pr_info("K230P2P: start_ap enter head=%zu tail=%zu bies=%zu pries=%zu\n",
+-		settings->beacon.head_len, settings->beacon.tail_len,
+-		settings->beacon.beacon_ies_len, settings->beacon.proberesp_ies_len);
+ 
+ 	if (rtw_cfg80211_sync_iftype(adapter) != _SUCCESS) {
+ 		ret = -ENOTSUPP;
+@@ -5115,8 +5110,6 @@
+ 	 * 空口 beacon 永远只有 55 B 的老 WPS IE (无 0x1041/0x1012) ⇒ 任何 WPS
+ 	 * enrollee (MIUI 手机 / 海奇板) 都判 "AP without active PBC Registrar"
+ 	 * 而拒绝入组。这里补齐额外 IE, 并强制重发一次 beacon。 */
+-	pr_info("K230P2P: change_beacon bies=%zu pries=%zu\n",
+-		info->beacon_ies_len, info->proberesp_ies_len);
+ 	rtw_k230_p2p_apply_extra_ies(ndev, info->beacon_ies,
+ 				     info->beacon_ies_len, 0x1);
+ 	rtw_k230_p2p_apply_extra_ies(ndev, info->proberesp_ies,
