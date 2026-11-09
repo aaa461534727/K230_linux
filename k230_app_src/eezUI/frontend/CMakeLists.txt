@@ -36,7 +36,10 @@ add_subdirectory(third_party/lvgl EXCLUDE_FROM_ALL)
 add_executable(k230ui-sim
     src/main_sdl.c
     src/ui_actions.c
+    src/ui_pages.c
     src/backend_client.c
+    src/font_cjk_20.c
+    src/font_cjk_28.c
     ui/screens.c
     ui/styles.c
     ui/images.c

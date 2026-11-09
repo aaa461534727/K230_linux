@@ -1,0 +1,3354 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""k230-bt-hid — 让 K230 当 **BLE HID 外设 (HOGP: 鼠标 + 键盘)**, 手机连上后
+可以用板子的触摸屏 / 控制命令去操作手机 (苹果 AirPlay 反控的唯一可行路径)。
+
+为什么是蓝牙而不是 WiFi (2026-11-04 定论, 见 docs/BT_HID_REVERSE_PLAN.md):
+  · AirPlay **屏幕镜像**是单向流 (手机 → 接收端), 协议里没有回传触摸的通道;
+    反控属于 CarPlay (`/command` + iAP2 + MFi-SAP 密钥), 需要 MFi 认证芯片。
+  · 安卓的 Miracast 有 **UIBC** (本板已跑通), 所以安卓优先 UIBC, 蓝牙只是兜底。
+  · iOS 没有别的路: 只能让板子装成"系统级输入设备" = 蓝牙鼠标/键盘 (海奇同原理)。
+
+实现要点 (为什么这么写):
+  · 用 BLE **HOGP** 而不是经典蓝牙 HID: Linux 内核只实现了经典 HID 的**主机端**,
+    设备端要在 L2CAP 上自己写协议; BLE 这边只要 BlueZ 的 GATT/广播 D-Bus 接口,
+    userspace 就能做 (本板 BlueZ 5.72 + GattManager1 + LEAdvertisingManager1 都有)。
+  · HID 服务 (0x1812) 的特征都带 `encrypt-*` 权限 —— 真 HID 设备的做法,
+    手机连上会先配对 (Just Works), 之后才读 Report Map / 订阅 Report。
+  · 触摸源 `/dev/input/event0` (FT5x06) 是**绝对坐标**; BLE 鼠标只认**相对位移**,
+    所以这里做 绝对 → 相对 的换算 (一个 SYN 帧的位移合并后按 127 一段发),
+    并实现 点按 / 拖动 / 双击 / 双指滚动。
+  · 控制管道 `/run/k230-bt-hid.fifo` 让别的程序 (或 adb 自测) 不用摸屏也能注入事件。
+
+用法:
+  k230-bt-hid run                 # 前台跑 (systemd 用这个); 注册 GATT + 开始广播
+  k230-bt-hid status              # 看运行状态 (广播/配对/已发多少报告)
+  k230-bt-hid send "<命令>"       # 往控制管道写一条命令
+  k230-bt-hid selftest            # 不用手机也能自检: 画个方块 + 单击 + 打字
+  k230-bt-hid dump                # 把 GATT 结构打出来 (调试注册用)
+
+控制管道命令 (一行一条):
+  move <dx> <dy>              鼠标相对移动 (仅 rel 模式; abs 模式请用 tap/at)
+  tap <u> <v>                 归一化 (0~1) 绝对定位 + 点击 ← abs 模式主用
+  at <px> <py>                绝对定位 (镜像像素) 不点击
+  reanchor                    把指针锚回内容区左上角 (位置丢了用)
+  cal                         打印绝对定位的几何/增益/已知位置
+  wheel <n>                   滚轮 (正=向下)
+  click [left|right|middle] [n]
+  down|up [left|right|middle]
+  key <usage> [down|up|tap] [mod]   HID 键码 (0x04='a'; mod 0x08=Cmd ⇒ 0x08 + 0x0B = Cmd+H 回主屏)
+  text <ascii...>             按 US 布局打一串 ASCII
+  consumer <usage>            多媒体键 (如 0xCD = 播放/暂停)
+  status                      往日志打一行统计
+
+退出码: 0 正常; 2 参数错; 3 蓝牙不可用 (无 hci0 / BlueZ 未跑)。
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+try:
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+    from gi.repository import GLib
+except ImportError as e:  # pragma: no cover
+    print("k230-bt-hid: 缺 python3-dbus / python3-gi (%s)" % e, file=sys.stderr)
+    sys.exit(3)
+
+# 必须先把 dbus 绑到 GLib 主循环: 否则 export 对象 / 收信号 / 异步调用全部 RuntimeError
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+# ---------------------------------------------------------------- 常量
+ADAPTER = os.environ.get("K230_BT_HID_ADAPTER", "/org/bluez/hci0")
+DEVICE_NAME = os.environ.get("K230_BT_HID_NAME", "K230-CAST")
+APP_PATH = "/org/k230/bthid"
+ADV_PATH = "/org/k230/bthid/adv"
+AGENT_PATH = "/org/k230/bthid/agent"
+# 2026-11-06 改: NoInputNoOutput → DisplayYesNo。
+#   安卓手机重新配对时会要求 MITM 保护 (btmon: IO Capability Response 里
+#   `Authentication: Dedicated Bonding - MITM required`), 走 Numeric Comparison;
+#   而 NoInputNoOutput 的 agent 只能 Just Works, BlueZ 收到 User Confirmation Request 后
+#   1.2 ms 内直接回 HCI `User Confirmation Request Neg Reply` ⇒ 手机侧显示"配对失败",
+#   现场表现是"任何手机都连不上"(2026-11-06 09:44 btmon 实测)。
+#   DisplayYesNo 才允许 Numeric Comparison; PairAgent 仍自动确认 (车机无人值守场景)。
+#   对端不要求 MITM 时 DisplayYesNo 照样走 Just Works, 不退化。
+AGENT_CAPABILITY = "DisplayYesNo"
+PROFILE_PATH = "/org/k230/bthid/profile"
+
+# 经典 HID (BR/EDR) 的两个 L2CAP 通道 (HID 规范 1.1 / 蓝牙 Assigned Numbers):
+#   0x0011 = 控制通道 (SET/GET REPORT, SET_PROTOCOL ...) —— 由 BlueZ profile 交给我们 fd
+#   0x0013 = 中断通道 (设备发 input report 用)          —— BlueZ 一个 UUID 只能挂一个 PSM,
+#                                                          所以这条自己开裸 L2CAP server
+PSM_HID_CONTROL = 0x0011
+PSM_HID_INTERRUPT = 0x0013
+STATUS_FILE = os.environ.get("K230_BT_HID_STATUS", "/run/k230-bt-hid.status")
+# 守护进程在 system bus 上的唯一名: GATT 对象挂在**本进程连接**上, 另一个进程要
+# 查这张表 (k230-bt-hid dump) 必须知道这个 :1.NNN, 所以启动时落盘。
+NAME_FILE = os.environ.get("K230_BT_HID_NAME_FILE", "/run/k230-bt-hid.name")
+FIFO = os.environ.get("K230_BT_HID_FIFO", "/run/k230-bt-hid.fifo")
+EVDEV = os.environ.get("K230_BT_HID_EVDEV", "/dev/input/event0")
+# 自测/实验室: 设了它, 所有 HID 报告都不走蓝牙, 只追加成 "<时间戳> <类型> <十六进制>"
+# 一行 —— 让 scripts/k230-tp-e2e-test.py 能在没有手机的情况下验证报告内容和时序。
+SINK = os.environ.get("K230_BT_HID_SINK") or None
+
+# 手感参数 (现场想调只改环境变量)
+SENS = float(os.environ.get("K230_BT_HID_SENS", "2.2"))   # 触摸像素 → 鼠标位移倍率
+CLICK_MOVE_PX = 14        # 按下后移动超过这么多像素就判"拖动"而不是"点击"
+MOVE_DEADBAND = 4         # 手指抖动死区: 位移累计超过这么多像素才真正发 HID 报告
+CLICK_MAX_MS = 280        # 按下到抬起短于这个算点击
+DRAG_HOLD_MS = 200        # 按住超过这个时间且已在移动 ⇒ 开始拖
+SCROLL_STEP_PX = 26       # 双指移动多少像素折算 1 格滚轮
+MAX_DELTA = 127           # 单个 HID 报告最大位移
+
+# 三条报告的 struct 格式 (Report ID + 数据, 小端) —— 必须和 REPORT_MAP 里的位宽一致,
+# k230-bt-hid-logic-test 会把两边对上 (desc 位宽 ↔ struct.calcsize)。
+FMT_MOUSE = "<BBbbb"      # id, buttons, dx, dy, wheel   = 1+1+3 = 5 B
+FMT_KEY = "<BBB6B"        # id, modifiers, reserved, 6 keys = 1+8 = 9 B
+FMT_CONS = "<BH"          # id, 16-bit usage              = 1+2 = 3 B
+# 绝对触摸 (HID 数字化仪 / Touch Screen), 2 指固定长度:
+#   id(1) + 指0[标志(1) X(2) Y(2)] + 指1[标志(1) X(2) Y(2)] = 11 B
+#   标志字节位序必须和下面的描述符一致: bit0=Tip Switch, bit1=In Range,
+#   bit2~6=Contact ID(5 bit), bit7=Contact Count。
+FMT_TP = "<BBHHBHH"       # id, f0, x0, y0, f1, x1, y1  = 11 B
+TP_LOGICAL_MAX = 1920     # 描述符里 X/Y 的 Logical Maximum (与海奇 AC632GX 一致)
+TP_MAX_FINGERS = 2
+TP_MIN_INTERVAL = 0.012    # 纯移动帧的最小间隔 (12 ms ≈ 83 Hz, 够跟手又不塞爆经典蓝牙队列)
+# 一次接触最短保持多久再发"抬起" (2026-11-06 真机取证后加):
+# 板上日志里成功的点击都是 75~96 ms, 主人反馈"点了没反应 / 像长按"的那几下正好都是
+# 35~38 ms —— 比真人手指还短 (面板报得快)。iOS 侧把 HID 输入报告按自己的节拍采进来,
+# 38 ms 的接触有可能只被采到一帧: 轻则被当成"一直按着"(只留下高亮), 重则整次点击被丢。
+# 这里给接触时间兜个底, 保证手机至少看到两帧按下 + 一帧抬起。60 ms 远小于 iOS 的
+# 500 ms 长按阈值, 代价只是松开最多晚 ~25 ms。0 = 关掉 (老行为)。
+try:
+    TP_MIN_HOLD_MS = int(os.environ.get("K230_BT_HID_MIN_HOLD_MS", "60") or 0)
+except ValueError:
+    TP_MIN_HOLD_MS = 60
+
+# 抬起帧重复发几遍 (2026-11-06 对照海奇 libhidalgo.so 后加)。
+# 海奇 hccast_hid_tp_feed 在"没有接触"时会把同一份 11 B 报告**连发 3 次**
+# (0x3a84 / 0x3ac4 / 0x3ad8)。经典蓝牙一个连接间隔只带一包, 抬起帧被后面的
+# 事件顶掉一次, iOS 就认为手指还按着 —— 之后所有按下都被当成同一个 contact 的
+# 移动(单击变长按)、并且会一直粘着不恢复。多发两遍的代价是 22 B, 值得。
+# K230_BT_HID_REL_REPEAT=1 可回到老行为。
+try:
+    TP_REL_REPEAT = max(1, min(5, int(os.environ.get("K230_BT_HID_REL_REPEAT", "3") or 1)))
+except ValueError:
+    TP_REL_REPEAT = 3
+
+# 空闲保活 (2026-11-05 真机实测后加): 手机侧空闲 ~4 s 就把链路降进 Sniff, 再往后
+# 还会挂 Sniff Subrating; 实测两种后果 —— ① 空闲后第一下触摸要等链路醒来
+# (btmon: Exit Sniff→Mode Change Active 24 ms, subrating 建立后 223 ms);
+# ② 彻底没流量 ~3 min 后手机侧以 reason=8 (Connection Timeout) 直接断链,
+# 控制台就"用着用着不动了"。所以只要连着就每 KEEPALIVE_MS 发一条"无操作"报告,
+# 让链路留在 Active。0 = 关掉。可用 K230_BT_HID_KEEPALIVE_MS 覆盖。
+# 间隔为什么要 500 ms 而不是 2000: 2026-11-05 在努比亚上对比测过 ——
+#   2000 ms: 5 min 内 28 次 Sniff/Subrating, subrating 建立后首触要等 223 ms;
+#    500 ms: 100 s 内只有 2 次 Sniff 且没挂上 subrating, 首触直发无等待。
+# 手机侧的空闲计时器比 2 s 短, 2 s 压不住; 500 ms 才稳。代价是 ~2 条/s 的空包。
+try:
+    KEEPALIVE_MS = int(os.environ.get("K230_BT_HID_KEEPALIVE_MS", "500") or 0)
+except ValueError:
+    KEEPALIVE_MS = 500
+
+# Contact ID 用哪种策略: slot = 只在 0/1 之间轮转 (默认, 2 指触摸屏的正确做法);
+# rotate = 0..31 全轮转 (老行为, 实测十几笔后 iOS 拒收); fixed = 恒 1 (A/B 用)。
+# 2026-11-06 真机现场: 连滑十几笔后 iOS 把整条触摸 collection 挂掉 (空口报文完整、
+# 音量键/键盘正常、只有 Report ID 4 不被消费), 20~30 s 后自己恢复。
+# 40 笔纯左右滑对照: rotate 27/40 (第 18~30 笔连挂) / fixed 39/40 ⇒ 根因是 cid 一路涨。
+CID_MODE = (os.environ.get("K230_BT_HID_CID_MODE", "slot") or "slot").lower()
+
+# HID Report Map: 鼠标(Report ID 1) + 键盘(Report ID 2) + 多媒体(Report ID 3)
+REPORT_MAP = bytes([
+    # ---- 鼠标 ----
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,       # Usage Page(Generic Desktop) / Usage(Mouse) / Collection(App)
+    0x85, 0x01,                                #   Report ID (1)
+    0x09, 0x01, 0xA1, 0x00,                    #   Usage(Pointer) / Collection(Physical)
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x05,        #     Usage Page(Button) 1..5
+    0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x03, 0x81, 0x03,        #     3 bit 填充
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
+    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,   # -127..127 相对
+    0xC0, 0xC0,
+    # ---- 键盘 ----
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,        # Usage(Keyboard) / Collection(App)
+    0x85, 0x02,                                 #   Report ID (2)
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,        #   修饰键 E0..E7
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x03,        #   1 字节保留
+    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+    0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,               #   6 个普通键
+    # LED 输出报告 (大小写/NumLock 灯): 5 bit + 3 bit 填充 = 1 字节,
+    # 必须和 ReportRef [0x02, 0x02] 的 0x2A4D 特征一致, 否则主机写 LED 会解析失败。
+    0x05, 0x08, 0x19, 0x01, 0x29, 0x05,
+    0x95, 0x05, 0x75, 0x01, 0x91, 0x02,        #   LEDs 1..5
+    0x95, 0x01, 0x75, 0x03, 0x91, 0x03,        #   3 bit 填充
+    0xC0,
+    # ---- 多媒体键 (Consumer Control) ----
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01,
+    0x85, 0x03,                                 #   Report ID (3)
+    0x15, 0x00, 0x26, 0xFF, 0x03,
+    0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,   # 16 位 usage
+    0xC0,
+    # ---- 绝对触摸 (Digitizer / Touch Screen) — Report ID 4 ----
+    # ★ 2026-11-05: 这一段是**海奇的原始描述符** (从他们板上 libhidalgo.so 里挖出来的
+    #   字节, 见 docs/QUIRKS.md §9)。海奇的反控之所以"跟手", 就是因为蓝牙这一路发的
+    #   不是鼠标相对位移, 而是 **TP_MULTI 绝对触摸**: 手机把它当触摸屏, 触点 = 手指位置,
+    #   不需要猜点击/拖动, 也不会开环漂移, 边缘手势 (iPhone 底部上滑 = 控制中心) 天然可用。
+    #   我们原来只发鼠标 (Report ID 1) ⇒ 手机上是个"指针", 永远做不到这些。
+    0x05, 0x0D,                                 # Usage Page (Digitizer)
+    0x09, 0x04,                                 # Usage (Touch Screen)
+    0xA1, 0x01,                                 # Collection (Application)
+    0x85, 0x04,                                 #   Report ID (4)
+    0x09, 0x22, 0xA1, 0x02,                     #   Finger / Collection (Logical)
+    0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,   # Tip Switch
+    0x09, 0x32, 0x15, 0x00, 0x25, 0x01, 0x81, 0x02,                            # In Range
+    0x09, 0x51, 0x75, 0x05, 0x95, 0x01, 0x16, 0x00, 0x00, 0x26, 0x1F, 0x00, 0x81, 0x02,  # Contact ID
+    0x09, 0x47, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,                            # Contact Count
+    0x05, 0x01, 0x26, 0x80, 0x07, 0x75, 0x10, 0x55, 0xFD, 0x65, 0x33,
+    0x09, 0x30, 0x35, 0x00, 0x46, 0x80, 0x07, 0x81, 0x02,                      # X (0..1920)
+    0x09, 0x31, 0x46, 0x80, 0x07, 0x81, 0x02,                                  # Y (0..1920)
+    0xC0,
+    0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,         #   第二根手指
+    0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,
+    0x09, 0x32, 0x15, 0x00, 0x25, 0x01, 0x81, 0x02,
+    0x09, 0x51, 0x75, 0x05, 0x95, 0x01, 0x16, 0x00, 0x00, 0x26, 0x1F, 0x00, 0x81, 0x02,
+    0x09, 0x47, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,
+    0x05, 0x01, 0x26, 0x80, 0x07, 0x75, 0x10, 0x55, 0xFD, 0x65, 0x33,
+    0x09, 0x30, 0x35, 0x00, 0x46, 0x80, 0x07, 0x81, 0x02,
+    0x09, 0x31, 0x46, 0x80, 0x07, 0x81, 0x02,
+    0xC0,
+    0xC0,
+])
+
+
+# ---------------------------------------------------------------- 经典 HID 的 SDP 记录
+# 经典蓝牙的"我是什么设备"是查 SDP 得到的 (BLE 那边是 GATT 特征), 所以要给一条完整
+# HID 服务记录: 服务类 0x1124 + 控制 PSM 0x11 + 附加协议 PSM 0x13 + HID 描述符。
+# 少任何一条, 手机 (bta_hh) 就会 BTA_HH_OPN_EVT 失败:
+#   2026-11-04 实测: 没 SDP 记录时手机报 `BTA_HH_OPN_EVT status=7`;
+#   挂上这条记录后 status=0, 且 `bta_hh_co_send_hid_info: dscp_len=144` 描述符被收下。
+SDP_XML = """<?xml version="1.0" encoding="UTF-8" ?>
+<record>
+  <attribute id="0x0000"><uint32 value="0x00010000"/></attribute>
+  <attribute id="0x0001"><sequence><uuid value="0x1124"/></sequence></attribute>
+  <attribute id="0x0004">
+    <sequence>
+      <sequence><uuid value="0x0100"/></sequence>
+      <sequence><uuid value="0x0003"/><uint8 value="0x11"/></sequence>
+      <!-- HIDP (0x0019) 必须出现在协议描述里, 这是 HID 设备 SDP 记录的标准写法;
+           缺了它有些主机 (尤其 iOS) 会认为"这不是一个 HID 设备"。 -->
+      <sequence><uuid value="0x0019"/></sequence>
+    </sequence>
+  </attribute>
+  <attribute id="0x0005"><sequence><uuid value="0x1002"/></sequence></attribute>
+  <attribute id="0x0006">
+    <sequence><uint16 value="0x656e"/><uint16 value="0x006a"/><uint16 value="0x0100"/></sequence>
+  </attribute>
+  <attribute id="0x0009">
+    <sequence><sequence><uuid value="0x1124"/><uint16 value="0x0101"/></sequence></sequence>
+  </attribute>
+  <attribute id="0x000d">
+    <sequence>
+      <sequence>
+        <sequence><uuid value="0x0100"/></sequence>
+        <sequence><uuid value="0x0003"/><uint8 value="0x13"/></sequence>
+        <sequence><uuid value="0x0019"/></sequence>
+      </sequence>
+    </sequence>
+  </attribute>
+  <attribute id="0x0100"><text value="%(name)s"/></attribute>
+  <attribute id="0x0101"><text value="K230 reverse control HID (mouse+keyboard)"/></attribute>
+  <!-- ★ 2026-11-05 修: 这一段原来 0x020A 往后**类型整体错位** (0x020A 写成 uint16,
+       0x020C 写成 boolean, 0x020E 写成 uint16 …), 末尾还多了两个不存在的属性
+       0x020F/0x0210。iOS 解析 HID SDP 记录比 BlueZ 严, 属性类型对不上就会
+       "连接不成功"。下面按 HID Profile 1.1 规范 ID↔类型一一对应。 -->
+  <attribute id="0x0200"><uint16 value="0x0111"/></attribute>   <!-- HIDDeviceReleaseNumber -->
+  <attribute id="0x0201"><uint16 value="0x0111"/></attribute>   <!-- HIDParserVersion -->
+  <attribute id="0x0202"><uint8 value="0xc0"/></attribute>      <!-- HIDDeviceSubclass: 键盘+指点 -->
+  <attribute id="0x0203"><uint8 value="0x00"/></attribute>      <!-- HIDCountryCode -->
+  <attribute id="0x0204"><boolean value="true"/></attribute>    <!-- HIDVirtualCable -->
+  <attribute id="0x0205"><boolean value="true"/></attribute>    <!-- HIDReconnectInitiate -->
+  <attribute id="0x0206">
+    <sequence>
+      <sequence>
+        <uint8 value="0x22"/>
+        <text encoding="hex" value="%(report_map)s"/>
+      </sequence>
+    </sequence>
+  </attribute>
+  <attribute id="0x0207">
+    <sequence><sequence><uint16 value="0x0409"/><uint16 value="0x0100"/></sequence></sequence>
+  </attribute>
+  <attribute id="0x0208"><boolean value="false"/></attribute>   <!-- HIDSDPDisable -->
+  <attribute id="0x0209"><boolean value="true"/></attribute>    <!-- HIDBatteryPower -->
+  <attribute id="0x020a"><boolean value="true"/></attribute>    <!-- HIDRemoteWake -->
+  <attribute id="0x020b"><uint16 value="0x0101"/></attribute>   <!-- HIDProfileVersion 1.1 -->
+  <attribute id="0x020c"><uint16 value="0x0c80"/></attribute>   <!-- HIDSupervisionTimeout 3200ms -->
+  <attribute id="0x020d"><boolean value="true"/></attribute>    <!-- HIDNormallyConnectable -->
+  <attribute id="0x020e"><boolean value="false"/></attribute>   <!-- HIDBootDevice -->
+</record>
+"""
+
+# Class of Device: 主类 = 外设 (0x000500), 次类 = 键盘+鼠标 (0x40|0x80 = 0xC0)
+# 不设它手机列表里图标就是"未知设备", 也认不出是键鼠。
+COAD = 0x0005C0
+
+
+# ASCII → HID usage (US 布局)
+_ASCII_USAGE = {
+    'a': 0x04, 'b': 0x05, 'c': 0x06, 'd': 0x07, 'e': 0x08, 'f': 0x09, 'g': 0x0A,
+    'h': 0x0B, 'i': 0x0C, 'j': 0x0D, 'k': 0x0E, 'l': 0x0F, 'm': 0x10, 'n': 0x11,
+    'o': 0x12, 'p': 0x13, 'q': 0x14, 'r': 0x15, 's': 0x16, 't': 0x17, 'u': 0x18,
+    'v': 0x19, 'w': 0x1A, 'x': 0x1B, 'y': 0x1C, 'z': 0x1D,
+    '1': 0x1E, '2': 0x1F, '3': 0x20, '4': 0x21, '5': 0x22, '6': 0x23, '7': 0x24,
+    '8': 0x25, '9': 0x26, '0': 0x27,
+    '\n': 0x28, '\x1b': 0x29, '\x08': 0x2A, '\t': 0x2B, ' ': 0x2C,
+    '-': 0x2D, '=': 0x2E, '[': 0x2F, ']': 0x30, '\\': 0x31, ';': 0x33, "'": 0x34,
+    '`': 0x35, ',': 0x36, '.': 0x37, '/': 0x38,
+}
+_SHIFT_CHARS = set('!@#$%^&*()_+{}|:"<>?~')
+
+
+def log(msg):
+    sys.stderr.write("[bt-hid %s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def ba(b):
+    return dbus.ByteArray(bytes(b))
+
+
+def sdict(d):
+    return dbus.Dictionary(d, signature="sv")
+
+
+# ---------------------------------------------------------------- GATT 对象
+class Char(dbus.service.Object):
+    def __init__(self, bus, path, uuid, flags, service_path, value=b""):
+        self.path = path
+        self.service_path = service_path
+        self._notifying = False
+        self._value = bytearray(value)
+        self._descriptors = []
+        self.props = {
+            "UUID": dbus.String(uuid),
+            "Service": dbus.ObjectPath(service_path),
+            "Flags": dbus.Array(list(flags), signature="s"),
+            "Value": ba(self._value),
+            "Notifying": dbus.Boolean(False),
+            "Descriptors": dbus.Array([], signature="o"),
+        }
+        dbus.service.Object.__init__(self, bus, path)
+
+    def add_desc(self, desc):
+        self._descriptors.append(desc)
+        self.props["Descriptors"].append(dbus.ObjectPath(desc.path))
+
+    # org.freedesktop.DBus.Properties
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        if prop not in self.props:
+            raise dbus.exceptions.DBusException(
+                "org.freedesktop.DBus.Error.InvalidArgs", "no such property: %s" % prop)
+        return self.props[prop]
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return sdict(self.props)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ssv", out_signature="")
+    def Set(self, interface, prop, value):
+        self.props[prop] = value
+
+    # org.bluez.GattCharacteristic1
+    @dbus.service.method("org.bluez.GattCharacteristic1",
+                         in_signature="a{sv}", out_signature="ay")
+    def ReadValue(self, options):
+        return ba(self._value)
+
+    @dbus.service.method("org.bluez.GattCharacteristic1",
+                         in_signature="aya{sv}", out_signature="")
+    def WriteValue(self, value, options):
+        self._value = bytearray(value)
+        self.on_write(self._value)
+
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="", out_signature="")
+    def StartNotify(self):
+        self._notifying = True
+        self.props["Notifying"] = dbus.Boolean(True)
+        log("手机订阅了 %s" % self.path)
+
+    @dbus.service.method("org.bluez.GattCharacteristic1", in_signature="", out_signature="")
+    def StopNotify(self):
+        self._notifying = False
+        self.props["Notifying"] = dbus.Boolean(False)
+        log("手机取消订阅 %s" % self.path)
+
+    def on_write(self, value):
+        pass
+
+    def notify(self, data):
+        self._value = bytearray(data)
+        self.props["Value"] = ba(self._value)
+        if not self._notifying:
+            return False
+        try:
+            self.PropertiesChanged("org.bluez.GattCharacteristic1",
+                                   {"Value": ba(self._value)}, [])
+        except Exception as e:  # noqa: BLE001
+            log("notify 失败: %s" % e)
+            return False
+        return True
+
+
+class Desc(dbus.service.Object):
+    def __init__(self, bus, path, uuid, char_path, value=b"", flags=("read",)):
+        self.path = path
+        self._value = bytearray(value)
+        self.props = {
+            "UUID": dbus.String(uuid),
+            "Characteristic": dbus.ObjectPath(char_path),
+            "Value": ba(self._value),
+            # BlueZ 的 desc_create() 会读 Flags 解析权限; 缺了它就整 app 注册失败
+            "Flags": dbus.Array(list(flags), signature="s"),
+        }
+        dbus.service.Object.__init__(self, bus, path)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        return self.props[prop]
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return sdict(self.props)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ssv", out_signature="")
+    def Set(self, interface, prop, value):
+        self.props[prop] = value
+
+    @dbus.service.method("org.bluez.GattDescriptor1",
+                         in_signature="a{sv}", out_signature="ay")
+    def ReadValue(self, options):
+        return ba(self._value)
+
+
+class Svc(dbus.service.Object):
+    def __init__(self, bus, path, uuid, primary=True):
+        self.path = path
+        self.chars = []
+        self.props = {
+            "UUID": dbus.String(uuid),
+            "Primary": dbus.Boolean(primary),
+            "Characteristics": dbus.Array([], signature="o"),
+            "Includes": dbus.Array([], signature="o"),
+        }
+        dbus.service.Object.__init__(self, bus, path)
+
+    def add_char(self, ch):
+        self.chars.append(ch)
+        self.props["Characteristics"].append(dbus.ObjectPath(ch.path))
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        return self.props[prop]
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return sdict(self.props)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ssv", out_signature="")
+    def Set(self, interface, prop, value):
+        self.props[prop] = value
+
+
+class GattApp(dbus.service.Object):
+    """GATT 应用根对象: BlueZ 上来先调 GetManagedObjects 拿全表。"""
+
+    def __init__(self, bus):
+        self.path = APP_PATH
+        self.services = []          # [(path, props)]
+        self.chars = []             # [(path, props)]
+        self.descs = []             # [(path, props)]
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def add_service(self, svc):
+        self.services.append((svc.path, svc.props))
+
+    def add_char(self, ch):
+        self.chars.append((ch.path, ch.props))
+        for d in ch._descriptors:
+            self.descs.append((d.path, d.props))
+
+    @dbus.service.method("org.freedesktop.DBus.ObjectManager",
+                         in_signature="", out_signature="a{oa{sa{sv}}}")
+    def GetManagedObjects(self):
+        out = dbus.Dictionary({}, signature="oa{sa{sv}}")
+        buckets = (("org.bluez.GattService1", self.services),
+                   ("org.bluez.GattCharacteristic1", self.chars),
+                   ("org.bluez.GattDescriptor1", self.descs))
+        for iface, items in buckets:
+            for path, props in items:
+                p = dbus.ObjectPath(path)
+                out.setdefault(p, dbus.Dictionary({}, signature="sa{sv}"))
+                out[p][dbus.String(iface)] = sdict(props)
+        return out
+
+
+class Adv(dbus.service.Object):
+    def __init__(self, bus, path, props):
+        self.path = path
+        self.props = props
+        dbus.service.Object.__init__(self, bus, path)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        return self.props[prop]
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return sdict(self.props)
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ssv", out_signature="")
+    def Set(self, interface, prop, value):
+        self.props[prop] = value
+
+    @dbus.service.method("org.bluez.LEAdvertisement1", in_signature="", out_signature="")
+    def Release(self):
+        log("广播被 BlueZ 释放")
+
+
+class PairAgent(dbus.service.Object):
+    """Just Works 配对: 手机上点一下即可, 不弹码。"""
+
+    def __init__(self, bus, path):
+        self.path = path
+        dbus.service.Object.__init__(self, bus, path)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        log("配对: AuthorizeService %s %s → 允许" % (device, uuid))
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        log("配对: RequestAuthorization %s → 允许" % device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        log("配对: RequestConfirmation %s %06d → 允许" % (device, int(passkey)))
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        return "0000"
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        return dbus.UInt32(0)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        log("配对: DisplayPasskey %s %06d" % (device, int(passkey)))
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        log("配对: DisplayPinCode %s %s" % (device, pincode))
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        log("配对: Cancel")
+
+
+UUID_HID = "00001812-0000-1000-8000-00805f9b34fb"
+UUID_GAP = "00001800-0000-1000-8000-00805f9b34fb"
+UUID_DIS = "0000180a-0000-1000-8000-00805f9b34fb"
+UUID_BAT = "0000180f-0000-1000-8000-00805f9b34fb"
+UUID_REPORT = "00002a4d-0000-1000-8000-00805f9b34fb"
+UUID_REPORT_REF = "00002908-0000-1000-8000-00805f9b34fb"
+
+
+class HidDevice:
+    """鼠标 + 键盘 + 多媒体键 (HID over GATT). 所有 HID 特征要求加密。"""
+
+    def __init__(self, bus, app, name, encrypt=True):
+        self.bus = bus
+        self.app = app
+        self.name = name
+        self.stats = {"mouse": 0, "key": 0, "consumer": 0, "touch": 0, "blocked": 0,
+                      "slow": 0, "slowms": 0, "peer": "", "since": time.time()}
+        r = (lambda f: ["encrypt-" + f]) if encrypt else (lambda f: [f])
+
+        # ---------- DIS: 厂商/型号/PnP ----------
+        # 注意: GAP(0x1800) 与 GATT(0x0001) 由 BlueZ 自己建, 应用里**不能**声明,
+        # 否则 parse_uuid() 直接判 "GAP service must be handled by BlueZ" → 整个应用注册失败。
+        dis = Svc(bus, APP_PATH + "/svc/dis", UUID_DIS)
+        self._svc(app, dis)
+        for tag, uuid, val in (
+                ("manuf", "00002a29-0000-1000-8000-00805f9b34fb", b"K230"),
+                ("model", "00002a24-0000-1000-8000-00805f9b34fb", b"K230-CAST HID"),
+                ("pnp", "00002a50-0000-1000-8000-00805f9b34fb",
+                 struct.pack("<BHHH", 0x02, 0x1D6B, 0x0246, 0x0100))):
+            self._chr(app, dis, Char(bus, APP_PATH + "/svc/dis/chr/" + tag, uuid,
+                                     ["read"], dis.path, val))
+
+        # ---------- Battery: 100% ----------
+        bat = Svc(bus, APP_PATH + "/svc/bat", UUID_BAT)
+        self._svc(app, bat)
+        self._chr(app, bat, Char(bus, APP_PATH + "/svc/bat/chr/level",
+                                 "00002a19-0000-1000-8000-00805f9b34fb",
+                                 ["read", "notify"], bat.path, b"\x64"))
+
+        # ---------- HID 0x1812 ----------
+        hid = Svc(bus, APP_PATH + "/svc/hid", UUID_HID)
+        self._svc(app, hid)
+
+        self.ch_info = Char(bus, APP_PATH + "/svc/hid/chr/info",
+                            "00002a4a-0000-1000-8000-00805f9b34fb", r("read"),
+                            hid.path, struct.pack("<HBB", 0x0111, 0x00, 0x02))
+        self._chr(app, hid, self.ch_info)
+
+        self.ch_map = Char(bus, APP_PATH + "/svc/hid/chr/rmap",
+                           "00002a4b-0000-1000-8000-00805f9b34fb", r("read"),
+                           hid.path, REPORT_MAP)
+        self._chr(app, hid, self.ch_map)
+
+        self.ch_ctrl = Char(bus, APP_PATH + "/svc/hid/chr/cp",
+                            "00002a4c-0000-1000-8000-00805f9b34fb",
+                            ["write-without-response"], hid.path, b"\x00")
+        self._chr(app, hid, self.ch_ctrl)
+
+        self.ch_proto = Char(bus, APP_PATH + "/svc/hid/chr/proto",
+                             "00002a4e-0000-1000-8000-00805f9b34fb",
+                             ["read", "write-without-response"], hid.path, b"\x01")
+        self._chr(app, hid, self.ch_proto)
+
+        # 三个 Input Report (各带 Report Reference 描述符: [report id, type=1])
+        self.rep_mouse = self._report(app, hid, "mouse", 1, r("notify"))
+        self.rep_key = self._report(app, hid, "key", 2, r("notify"))
+        self.rep_cons = self._report(app, hid, "cons", 3, r("notify"))
+        self.rep_tp = self._report(app, hid, "tp", 4, r("notify"))   # 绝对触摸
+
+        # 键盘 LED 输出报告 (Report Reference: [2, type=2])
+        self.rep_led = Char(bus, APP_PATH + "/svc/hid/chr/led", UUID_REPORT,
+                            r("write"), hid.path, b"\x00")
+        self.rep_led.add_desc(Desc(bus, APP_PATH + "/svc/hid/chr/led/desc/rref",
+                                   UUID_REPORT_REF, self.rep_led.path, bytes([0x02, 0x02])))
+        self._chr(app, hid, self.rep_led)
+
+
+    def _svc(self, app, svc):
+        app.add_service(svc)
+
+    def _chr(self, app, svc, ch):
+        svc.add_char(ch)
+        app.add_char(ch)
+
+    def _report(self, app, svc, tag, rid, flags):
+        path = APP_PATH + "/svc/hid/chr/rep_" + tag
+        ch = Char(self.bus, path, UUID_REPORT, flags + ["read"], svc.path, bytes([0]))
+        ch.add_desc(Desc(self.bus, path + "/desc/rref", UUID_REPORT_REF, path,
+                         bytes([rid, 0x01])))
+        self._chr(app, svc, ch)
+        return ch
+
+    # ---- 发报告
+    def _send(self, ch, data, kind):
+        t0 = time.monotonic()
+        ok = ch.notify(data)
+        self._note_latency(t0)
+        if ok:
+            self.stats[kind] = self.stats.get(kind, 0) + 1
+            return True
+        self.stats["blocked"] += 1
+        return False
+
+    def _note_latency(self, t0):
+        """记一次发送耗时。>30 ms 说明**蓝牙通道在排队** —— 触摸会表现为
+        "抬手迟到 ⇒ 单击变长按"。这是 2026-11-05 真机上"单击偶尔变长按"的
+        唯一可量化指标, 所以必须能看见。"""
+        ms = (time.monotonic() - t0) * 1000.0
+        if ms >= 30.0:
+            self.stats["slow"] = self.stats.get("slow", 0) + 1
+            if ms > self.stats.get("slowms", 0):
+                self.stats["slowms"] = int(ms)
+
+    def mouse(self, buttons=0, dx=0, dy=0, wheel=0):
+        dx = clamp(int(round(dx)), -MAX_DELTA, MAX_DELTA)
+        dy = clamp(int(round(dy)), -MAX_DELTA, MAX_DELTA)
+        wheel = clamp(int(wheel), -MAX_DELTA, MAX_DELTA)
+        return self._send(self.rep_mouse,
+                          struct.pack(FMT_MOUSE, 0x01, buttons & 0x1F, dx, dy, wheel),
+                          "mouse")
+
+    def key(self, modifiers=0, keys=()):
+        keys = [int(k) & 0xFF for k in keys][:6]
+        rep = struct.pack(FMT_KEY, 0x02, modifiers & 0xFF, 0x00,
+                          *(keys + [0] * (6 - len(keys))))
+        return self._send(self.rep_key, rep, "key")
+
+    def key_tap(self, usage, modifiers=0):
+        self.key(modifiers, [usage])
+        time.sleep(0.02)
+        self.key(0, [])
+
+    def consumer(self, usage):
+        return self._send(self.rep_cons, struct.pack(FMT_CONS, 0x03, usage & 0x3FF),
+                          "consumer")
+
+    def touch_report(self, f0, f1, kind="touch"):
+        """发一条绝对触摸报告 (2 指固定长度)。
+
+        f = (tip, in_range, contact_id, contact_count, x, y); 坐标系 0..TP_LOGICAL_MAX。
+        手机把它当**触摸屏**: 触点就是手指位置 —— 不跟手/漂移/单击被当拖动这些问题
+        在这一路里根本不存在 (对照海奇: 他们蓝牙 HID 描述符里就有这个集合)。
+        """
+        return self._send(self.rep_tp, pack_tp(f0, f1), kind)
+
+
+class ClassicProfile(dbus.service.Object):
+    """BlueZ Profile1: 只负责"拿到控制通道的 fd"和断线通知。
+
+    BlueZ 会在 SDP 里应答我们注册的那条 HID 记录, 手机连 PSM 0x11 时把 fd 交过来。
+    """
+
+    def __init__(self, bus, path, dev):
+        dbus.service.Object.__init__(self, bus, path)
+        self.dev = dev
+        self.ctrl_fd = None
+        self.protocol = 1        # 1 = Report Protocol (默认), 0 = Boot Protocol
+        self.idle = 0            # 单位 4 ms; 0 = 只在状态变化时上报
+
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="oha{sv}", out_signature="")
+    def NewConnection(self, device, fd, props):
+        self.ctrl_fd = fd.take()
+        log("📱 手机连上经典 HID 控制通道 (设备 %s, fd=%d)" % (device, self.ctrl_fd))
+        GLib.io_add_watch(self.ctrl_fd, GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_ctrl)
+        return None
+
+    @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
+    def RequestDisconnection(self, device):
+        log("📴 手机断开经典 HID (%s)" % device)
+        self._close()
+        return None
+
+    @dbus.service.method("org.bluez.Profile1", in_signature="", out_signature="")
+    def Release(self):
+        self._close()
+
+    def _close(self):
+        if self.ctrl_fd is not None:
+            try:
+                os.close(self.ctrl_fd)
+            except OSError:
+                pass
+            self.ctrl_fd = None
+
+    def _on_ctrl(self, fd, cond):
+        try:
+            data = os.read(fd, 1024)
+        except OSError as e:
+            log("📴 控制通道读失败: %s" % e)
+            return False
+        if not data:
+            log("📴 控制通道读到 EOF (对端关闭)")
+            return False
+        # HID 控制通道: 高 4 位 = 事务类型, 低 4 位 = 参数
+        #   0x2x HANDSHAKE / 0x4x GET_REPORT / 0x5x SET_REPORT
+        #   0x6x GET_PROTOCOL / 0x7x SET_PROTOCOL / 0x8x GET_IDLE / 0x9x SET_IDLE
+        #   0xAx DATA
+        # 2026-11-05: 以前只记录"没命中分支"的字节, 主机发 GET_REPORT/GET_PROTOCOL
+        #   这类被静默处理的事务就完全看不见 —— iOS 那次排障卡了很久就是这个原因。
+        #   现在**每条**都记 (含 hex), 下次连不上直接看日志就知道主机问到哪一步。
+        t = data[0] & 0xF0
+        p = data[0] & 0x0F
+        log("← 控制通道 trans=0x%x param=0x%x len=%d hex=%s"
+            % (t, p, len(data), data.hex()))
+
+        if t == 0x50 and len(data) >= 2:                    # SET_REPORT (主机写 LED)
+            if self.dev:
+                self.dev.on_output_report(data[1:])
+            return True
+        if t == 0x40:                                       # GET_REPORT
+            self._answer_get_report(p, data[1:])
+        elif t == 0x60:                                     # GET_PROTOCOL → 当前协议
+            self._reply(bytes([0xA0, self.protocol & 0x01]))
+        elif t == 0x70:                                     # SET_PROTOCOL → 记下, 成功不回
+            if len(data) >= 2:
+                self.protocol = data[1] & 0x01
+                log("   协议切换: %s" % ("Boot" if self.protocol == 0 else "Report"))
+                if self.dev:
+                    self.dev.boot = (self.protocol == 0)
+        elif t == 0x80:                                     # GET_IDLE → idle rate
+            self._reply(bytes([0xA0, self.idle & 0xFF]))
+        elif t == 0x90:                                     # SET_IDLE → 记下, 成功不回
+            if len(data) >= 2:
+                self.idle = data[1] & 0xFF
+        # 0x20 HANDSHAKE / 0xA0 DATA: 主机侧回给我们的, 记过就够了
+        return True
+
+    def _answer_get_report(self, rtype, params):
+        """GET_REPORT: 主机要指定报告类型的当前值。
+
+        格式 (HID 1.1 §7.4.2): 参数 1 = report type (1=Input,2=Output,3=Feature),
+        参数 2 = report id。回 DATA (0xA0|rtype) + 报告数据 (含 report id)。
+        没有的 report id 按规范回 ERR_INVALID_REPORT_ID, 不支持的 rtype 回
+        ERR_UNSUPPORTED_REQUEST —— 以前一律回 0x03, iOS 可能因此直接放弃
+        (2026-11-05 改成按规范分流, 并把每次请求都记下来)。
+        """
+        rid = params[0] if params else 0
+        rep = None
+        if self.dev:
+            rep = self.dev.get_report(rtype, rid)
+        if rep is not None:
+            self._reply(bytes([0xA0 | (rtype & 0x03)]) + rep)
+            log("   → GET_REPORT rtype=%d id=%d 回 DATA %s" % (rtype, rid, rep.hex()))
+        elif rtype in (1, 2, 3) and rid not in (0, 1, 2, 3):
+            self._reply(bytes([0x04]))                      # ERR_INVALID_REPORT_ID
+        else:
+            self._reply(bytes([0x03]))                      # ERR_UNSUPPORTED_REQUEST
+        return
+
+    def _reply(self, payload):
+        if self.ctrl_fd is None:
+            return
+        try:
+            os.write(self.ctrl_fd, payload)
+        except OSError as e:
+            log("⚠ 控制通道回复失败: %s" % e)
+
+
+class ClassicHidDevice:
+    """经典蓝牙 (BR/EDR) HID 设备端 —— 和 HidDevice 同样对外 API, 底层换成 L2CAP。
+
+    ★ 为什么必须支持这条路 (2026-11-04 现场定论):
+      板上这支 USB dongle 是 **Barrot 克隆** (内核 dmesg 原文:
+      `CSR: Unbranded CSR clone detected` +
+      `Couldn't suspend the device for our Barrot 8041a02 receive-issue workaround`),
+      它的 **LE 广播引擎是坏的**:
+        · BlueZ 走扩展广播: `LE Set Extended Advertising {Params,Data,Enable}` 全 Success,
+          btmon 里 AD 也齐 (Flags 0x06 + 0x1812 + Appearance), 但空中一个包都不发;
+        · 换裸 HCI 传统广播 (Params/Data/Enable 全 0x00) 同样没人收得到;
+        · 手机蓝牙栈能正常收到周围**其它** LE 设备 (`btif_get_device_type ... type 2`),
+          唯独收不到我们 (公有地址 / 随机地址都试过) ⇒ 不是代码, 不是 UI 过滤;
+        · 它还能把 ext adv 卡成 EBUSY (`Opcode 0x2039 failed: -16`), 只有重载 btusb 能清。
+      **但经典通道完全正常**: `l2ping` 20/20 0% 丢包, 手机 `BTA_HH_OPN_EVT status=0`,
+      描述符 `dscp_len=144` 被收下, 手机屏幕出现鼠标指针, 收到 REL_X/REL_Y。
+      ⇒ 这块 dongle 上走经典 HID; 换一支正常 dongle 后可切回 `--transport ble` (iOS 用)。
+    """
+
+    def __init__(self, bus, name, on_ready=None):
+        self.bus = bus
+        self.name = name
+        # profile 注册成功 (D-Bus 异步回调) 后通知上层: 上层这才去开"可被发现"。
+        # 2026-11-05 重启后现场根因 4 —— 顺序反了就会出现"手机看得见设备、点下去
+        # 查不到 HID 服务 ⇒ iOS 弹配对不成功"。
+        self.on_ready = on_ready
+        # ⚠ "touch" 必须在这: classic 与 BLE 是两个独立实例, 各自一份 stats。
+        #   2026-11-05 板上实测: 只在 BLE 那份加了 touch, 经典通道第一次发触摸报告就
+        #   KeyError('touch') → 回调中途崩 → 抬手那条没发出去 → iOS 30 s 后重置中断通道。
+        self.stats = {"mouse": 0, "key": 0, "consumer": 0, "touch": 0, "blocked": 0,
+                      "slow": 0, "slowms": 0, "peer": "", "since": time.time()}
+        self.int_sock = None        # 监听 socket
+        self.int_conn = None        # 已 accept 的连接
+        self.on_peer = None         # 上层回调 (对端地址) —— 用来按机型选反控通路
+        self.on_hup = None          # 上层回调 (对端断开) —— 停保活 + 刷状态文件
+        self.buttons = 0
+        self.led = 0
+        self.profile = None
+        self.ready = False
+        self.boot = False           # 主机 SET_PROTOCOL(0) 后为 True (键盘走 8 字节裸报告)
+        # 最近一次发出的报告 (GET_REPORT 要能取回当前值)
+        self.last = {1: bytes(4), 2: bytes(8), 3: bytes(2)}
+
+        if SINK:
+            # 自测模式 (K230_BT_HID_SINK): 不碰 BlueZ / L2CAP, 报告只落盘。
+            # 这样 scripts/k230-tp-e2e-test.py 可以在**不影响**正在跑的真守护进程、
+            # 也不需要手机的情况下, 验证报告内容和时序。
+            log("⚠ 自测模式: 报告只落盘 (%s), 不建蓝牙通道" % SINK)
+            return
+        self._open_interrupt()
+        self._register_profile()
+
+    # ---------- 中断通道 (PSM 0x13): 设备 → 主机 发 input report
+    def _open_interrupt(self):
+        try:
+            s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET,
+                              socket.BTPROTO_L2CAP)
+            s.bind(("00:00:00:00:00:00", PSM_HID_INTERRUPT))
+            s.listen(4)
+            s.setblocking(False)      # accept 回调里必须非阻塞 (见 _on_int_conn)
+        except OSError as e:
+            log("✗ 中断通道监听失败 PSM=0x%04x: %s" % (PSM_HID_INTERRUPT, e))
+            return
+        self.int_sock = s
+        # 注意回调签名: PyGObject 的 io_add_watch 是 (channel, condition, *data),
+        # 写成 (fd=None) 会在 accept 之前就 TypeError (2026-11-04 第一版踩过)。
+        GLib.io_add_watch(s.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                          self._on_int_conn)
+        log("✓ 中断通道已监听 PSM=0x%04x" % PSM_HID_INTERRUPT)
+
+    def _on_int_conn(self, *_a):
+        """★ 2026-11-05 根因修复: 这个回调以前 `return False`。
+
+        PyGObject 的 source 返回 False = **把监听 watch 摘掉**, 于是服务启动后
+        **只有第一台手机**能连上中断通道, 之后所有连接都躺在 listen 队列里没人
+        accept —— 现场对得上: 服务 23:10:59 起, 23:11:36 Redmi 连上 (唯一一条
+        "✓ 中断通道已连接"), 之后 09:09 Redmi / 09:44 iPhone 全部没反应。
+        ⇒ 现在永远 return True (继续监听), 并在新连接到来时关掉旧连接。
+        """
+        accepted = 0
+        while True:
+            try:
+                conn, addr = self.int_sock.accept()
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError as e:
+                log("⚠ 中断通道 accept 失败: %s" % e)
+                return True
+            accepted += 1
+            peer = addr[0] if addr else "?"
+            old = self.int_conn
+            # 新连接顶掉旧连接 (手机断线重连时旧 fd 可能还没报 HUP)
+            self.int_conn = conn
+            self.ready = True
+            self.stats["peer"] = peer
+            GLib.io_add_watch(conn.fileno(), GLib.PRIORITY_DEFAULT,
+                              GLib.IO_HUP | GLib.IO_ERR, self._on_int_hup)
+            if old is not None:
+                try:
+                    old.close()
+                except OSError:
+                    pass
+            log("✓ 中断通道已连接 (%s) —— 可以发 HID 报告了" % peer)
+            # getattr: 自测/回归里有用 __new__ 跳过 __init__ 建的实例 (没有 on_peer)
+            cb = getattr(self, "on_peer", None)
+            if cb:
+                try:
+                    cb(peer)
+                except Exception as e:  # noqa: BLE001
+                    log("⚠ 对端识别失败: %s" % e)
+            # 新连接先发一条"所有手指抬起"的触摸报告 (全 0):
+            # 手机可能还留着上一轮"按下未抬起"的状态, 不发这条, 往后所有触点都被
+            # 当成同一根手指的拖动。发失败无所谓 (没连上时本来也发不了)。
+            try:
+                self.touch_report((0, 0, 0, 0, 0, 0), (0, 0, 1, 0, 0, 0))
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _on_int_hup(self, fd, cond):
+        log("📴 中断通道断开, 等手机重连")
+        self.ready = False
+        conn = self.int_conn
+        self.int_conn = None
+        if conn is not None:
+            try:
+                conn.close()       # 关 socket 对象 (GLib 传进来的 fd 就是它)
+            except OSError:
+                pass
+        # 通知上层 (停保活 + 刷状态文件): 不通知的话 status 会一直留着上一台手机的
+        # `对端=`, 现场读状态会以为还连着 (2026-11-05 实测踩过)。
+        cb = getattr(self, "on_hup", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:  # noqa: BLE001
+                log("⚠ 断开回调失败: %s" % e)
+        return False
+
+    def get_report(self, rtype, rid):
+        """给控制通道 GET_REPORT 用: 返回当前报告的原始字节 (含 report id)。"""
+        if rtype == 1 and rid in self.last:      # Input
+            return bytes([rid]) + self.last[rid]
+        if rtype == 2 and rid == 2:              # Output (键盘 LED)
+            return bytes([0x02, self.led & 0xFF])
+        return None
+
+    # ---------- 控制通道 (PSM 0x11): 走 BlueZ Profile1
+    def _register_profile(self):
+        self.profile = ClassicProfile(self.bus, PROFILE_PATH, self)
+        mgr = dbus.Interface(self.bus.get_object("org.bluez", "/org/bluez"),
+                             "org.bluez.ProfileManager1")
+        opts = {
+            "Name": dbus.String("K230 Remote HID"),
+            "Role": dbus.String("server"),
+            "RequireAuthentication": dbus.Boolean(False),
+            "RequireAuthorization": dbus.Boolean(False),
+            "ServiceRecord": dbus.String(
+                SDP_XML % {"name": self.name, "report_map": REPORT_MAP.hex()}),
+            "PSM": dbus.UInt16(PSM_HID_CONTROL),
+        }
+
+        def ok():
+            log("✓ 经典 HID profile 已注册 (SDP 0x1124, 控制 PSM 0x11, 中断 PSM 0x13)")
+            if self.on_ready:
+                try:
+                    self.on_ready()
+                except Exception as e:  # noqa: BLE001
+                    log("⚠ 注册成功回调失败: %s" % e)
+
+        def err(e):
+            log("✗ 经典 HID profile 注册失败: %s" % e)
+            if "already registered" in str(e):
+                # BlueZ 的 input 插件 (HID 主机端) 占了 0x1124。我们做的是设备端, 要让位。
+                log("   → BlueZ 的 `input` 插件抢了 0x1124 (它只做 HID 主机). 让 bluetoothd 别加载它:")
+                log("     mkdir -p /etc/systemd/system/bluetooth.service.d")
+                log("     printf '[Service]\\nExecStart=\\nExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=input\\n'"
+                    " > /etc/systemd/system/bluetooth.service.d/override.conf")
+                log("     systemctl daemon-reload && systemctl restart bluetooth")
+
+        mgr.RegisterProfile(dbus.ObjectPath(PROFILE_PATH), UUID_HID, opts,
+                            reply_handler=ok, error_handler=err)
+
+    # ---------- 发报告 (0xA1 = INPUT report 的事务头, 后面接 Report ID + 数据)
+    def _send_raw(self, report, kind):
+        if SINK:
+            # 自测模式 (K230_BT_HID_SINK=/path/file): 报告不发蓝牙, 只把"本应发出去的
+            # 字节 + 时刻"追加到文件。用途见 scripts/k230-tp-e2e-test.py —— 没有手机
+            # 也能验证触摸报告的内容/时序 (单击是不是被拖成长按、坐标对不对、有没有洪水)。
+            # 生产环境不设这个变量, 这段等于不存在。
+            try:
+                with open(SINK, "a", encoding="ascii") as f:
+                    f.write("%.6f %s %s\n" % (time.time(), kind, bytes(report).hex()))
+            except OSError:
+                pass
+            self.stats[kind] = self.stats.get(kind, 0) + 1
+            return True
+        if self.int_conn is None:
+            self.stats["blocked"] += 1
+            return False
+        t0 = time.monotonic()
+        try:
+            self.int_conn.send(b"\xA1" + report)
+        except OSError as e:
+            self.stats["blocked"] += 1
+            log("⚠ 发报告失败: %s" % e)
+            return False
+        ms = (time.monotonic() - t0) * 1000.0
+        if ms >= 30.0:
+            self.stats["slow"] = self.stats.get("slow", 0) + 1
+            if ms > self.stats.get("slowms", 0):
+                self.stats["slowms"] = int(ms)
+        # 计数只是观测值: 用 get() 兜底, 绝不能让"少一个 key"把发送路径带崩。
+        self.stats[kind] = self.stats.get(kind, 0) + 1
+        return True
+
+    def _send(self, report, kind):
+        self.last[report[0]] = bytes(report[1:])   # 供控制通道 GET_REPORT 取回
+        return self._send_raw(report, kind)
+
+    def mouse(self, buttons=0, dx=0, dy=0, wheel=0):
+        dx = clamp(int(round(dx)), -MAX_DELTA, MAX_DELTA)
+        dy = clamp(int(round(dy)), -MAX_DELTA, MAX_DELTA)
+        wheel = clamp(int(wheel), -MAX_DELTA, MAX_DELTA)
+        rep = struct.pack(FMT_MOUSE, 0x01, buttons & 0x1F, dx, dy, wheel)
+        self.last[1] = bytes(rep[1:])
+        if self.boot:     # Boot Protocol 鼠标报告 = 3 B (无 report id, 无滚轮)
+            return self._send_raw(struct.pack("<Bbb", buttons & 0x1F, dx, dy), "mouse")
+        return self._send(rep, "mouse")
+
+    def key(self, modifiers=0, keys=()):
+        keys = [int(k) & 0xFF for k in keys][:6]
+        keys8 = keys + [0] * (6 - len(keys))
+        rep = struct.pack(FMT_KEY, 0x02, modifiers & 0xFF, 0x00, *keys8)
+        self.last[2] = bytes(rep[1:])
+        if self.boot:     # Boot Protocol 键盘报告 = 8 B (无 report id)
+            return self._send_raw(struct.pack("<BB6B", modifiers & 0xFF, 0x00, *keys8), "key")
+        return self._send(rep, "key")
+
+    def key_tap(self, usage, modifiers=0):
+        self.key(modifiers, [usage])
+        time.sleep(0.02)
+        self.key(0, [])
+
+    def consumer(self, usage):
+        return self._send(struct.pack(FMT_CONS, 0x03, usage & 0x3FF), "consumer")
+
+    def touch_report(self, f0, f1, kind="touch"):
+        """绝对触摸 (Report ID 4) —— 见 BLE 侧同名方法的说明。
+
+        kind 只用于统计分流: 真手势记 "touch", 空闲保活记 "ka" (两者字节完全一样)。
+        """
+        if self.boot:
+            return False              # Boot Protocol 没有触摸报告, 只能走鼠标
+        return self._send(pack_tp(f0, f1), kind)
+
+    def on_output_report(self, data):
+        """键盘 LED (主机 → 设备), 只记录不回传。"""
+        if len(data) >= 2 and data[0] == 0x02:
+            self.led = data[1]
+
+
+def pack_tp(f0, f1):
+    """把两指的 (tip, in_range, contact_id, contact_count, x, y) 打成 11 B 报告。
+
+    标志字节位序必须和 REPORT_MAP 最后那段描述符一致:
+      bit0=Tip Switch / bit1=In Range / bit2~6=Contact ID / bit7=Contact Count
+    """
+    def flag(f):
+        tip, inr, cid, cnt = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
+        return ((1 if tip else 0) | (2 if inr else 0)
+                | ((cid & 0x1F) << 2) | ((1 if cnt else 0) << 7))
+    return struct.pack(FMT_TP, 0x04,
+                       flag(f0), clamp(int(f0[4]), 0, 0xFFFF), clamp(int(f0[5]), 0, 0xFFFF),
+                       flag(f1), clamp(int(f1[4]), 0, 0xFFFF), clamp(int(f1[5]), 0, 0xFFFF))
+
+
+# ---------------------------------------------------------------- 触摸 → 鼠标/触摸
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+SYN_REPORT = 0x00
+BTN_TOUCH = 0x14A
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x2F, 0x35, 0x36
+ABS_MT_TRACKING_ID = 0x39
+
+# kernel 的 struct input_event = struct timeval + __u16 type + __u16 code + __s32 value。
+# timeval 在 64 位 (K230 = riscv64) 是 2×8 B ⇒ 一条事件 24 B; 32 位是 16 B。
+# 写死 24 或写死 "<IIHHi" 都错过一次 (2026-11-05), 这里按平台算一次。
+EV_SZ = struct.calcsize("<qqHHi") if struct.calcsize("P") == 8 else struct.calcsize("<IIHHi")
+EV_FMT = "<qqHHi" if EV_SZ == 24 else "<IIHHi"
+
+
+# ---------------------------------------------------------------- 绝对定位 (2026-11-05)
+# 为什么改: 原来「触屏位移 × 固定灵敏度 2.2 → 相对鼠标」根本对不准 —— iOS 对相对
+#   位移做**速度相关加速度**, 1 个 count 走多少像素不是常数。实测 (板 → iPhone, 镜像
+#   内容 416x720, 每条报告间隔 4 ms, 指针位置用镜像帧差分量):
+#       单条报告 20 counts → 12 px (0.60 px/count)
+#                40 → 57 (1.43)   60 → 106 (1.77)   80 → 142 (1.78)
+#               100 → 160 (1.60)  120 → 179 (1.49)  127 → 186 (1.46)
+#   即「先加速到饱和再略降」, 且 25→30 counts 之间有个台阶; 斜着 (dx,dy 同一包) 每轴
+#   位移还会打折。所以固定灵敏度一定漂。
+#
+# 改法: **归一化绝对定位** —— 触屏点 → 内容矩形 (/run/wfd-uibc-geom) → 镜像像素 →
+#   用实测步长表拆成一串单轴 HID 报告。位移**可叠加** (实测 127+127+26 = 396 px,
+#   模型 391; 40+40=114 vs 114; 90+30=184 vs 184)。
+# 边界: 12~20 counts 的小步长**连发**比单发走得远 (残余速度), 表里已按连发修正;
+#   连发 5×20 实测 88 px (单发表只算 60) ⇒ 表里 20 counts 记 17 px (不是 12)。
+GEOM_FILE = os.environ.get("K230_WFD_GEOM", "/run/wfd-uibc-geom")
+CAL_FILE = os.environ.get("K230_BT_HID_CAL", "/etc/k230-bt-hid-cal.json")
+ABS_CADENCE = 0.004        # 报告间隔 —— 必须和标定时一致 (加速度跟速度有关)
+ABS_MIN_GAP = 0.008        # 两次定位的最小间隔 (合并后每批一次, 别再加延迟)
+ABS_STEP_MIN = 4.0         # 目标残差小于这个就不再挪 (再小指针不动)
+FAIL_RETRY_GAP = 0.40      # 报告发送失败后的退避时间 (手机没连时不要每帧都撞, 见 goto())
+ABS_ANCHOR_IDLE = 5.0      # 空闲超过这么久 ⇒ 下次触摸重新锚定
+#   为什么: 绝对定位是**开环**跟踪 (iOS 没有绝对坐标接口), 中间只要有人手工挪了指针
+#   (手机自己点 / 插了别的鼠标 / 屏幕边缘夹住), 我们记的位置就与真实位置脱钩, 且误差
+#   会一直带着走。空闲后重锚一次 (~50 ms) 把误差截断。
+#   2026-11-06 补: 只按「空闲 5 s」判还不够 —— 5 s 内的连续点击会**带着上一次的误差**
+#   接着走。现在改成**每次手指落下都重锚** (见 _pos_abs), 这个常量只保留给 FIFO 直通路径。
+CLAMP_STEP_PX = 100.0      # 锚定时按「一条 -127 最少能走多少 px」保守估条数 (见 clamp)
+CAL_W = 416                # 标定时的内容区宽度 (内容尺寸变了按比例折算)
+# (位移 px, counts) 实测表, 降序 —— "一条报告能走多远"
+CAL_STEPS = [(186, 127), (179, 120), (170, 110), (160, 100), (151, 90), (142, 80),
+             (130, 70), (106, 60), (82, 50), (57, 40), (33, 30), (24, 26),
+             (17, 20), (13, 16), (10, 12)]
+
+
+def load_cal():
+    """读 /etc/k230-bt-hid-cal.json (换手机/现场微调用); 缺文件就用内置实测表。"""
+    cal = {"gain": 1.0, "calW": CAL_W, "steps": CAL_STEPS, "peers": {}}
+    try:
+        with open(CAL_FILE, encoding="utf-8") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return cal
+    if not isinstance(j, dict):
+        return cal
+    for k in ("gain", "calW"):
+        if isinstance(j.get(k), (int, float)):
+            cal[k] = float(j[k])
+    st = []
+    for it in (j.get("steps") or []):
+        if isinstance(it, (list, tuple)) and len(it) == 2:
+            try:
+                st.append((float(it[0]), int(it[1])))
+            except (TypeError, ValueError):
+                pass
+    if st:
+        cal["steps"] = sorted(st, reverse=True)
+    if isinstance(j.get("peers"), dict):
+        cal["peers"] = j["peers"]
+    return cal
+
+
+# ---------- 端类型识别: 决定反控走哪条 HID 通路 (2026-11-05, 2026-11-06 改)
+#
+# 同一个 HID 描述符里同时有「鼠标 + 绝对触摸屏 (Report ID 4)」两套接口, 但对端吃哪一套
+# 不一样: 安卓/Windows 把 Touch Screen 当真正的触摸屏 (触点即手指)。
+# **2026-11-06 实测更正**: iOS 在**经典 BR/EDR HID** 上也消费 Report ID 4 (底边上滑
+# 三轮 14.7~92.2% 画面变化且不复原, 每轮 20 条报告全进通道) ⇒ iPhone/iPad 也走绝对触摸,
+# 不再需要辅助触控指针。macOS 未测, 仍保守走鼠标指针。
+# 手工指定 (/etc/k230-bt-hid-peers.json) 与环境变量 K230_BT_HID_TOUCH 仍可覆盖。
+IOS_HINTS = ("iphone", "ipad", "ipod")
+MAC_HINTS = ("macbook", "imac", "mac mini", "mac pro", "apple tv", "mac")
+APPLE_VIDS = ("05ac", "004c")      # Apple Inc. / Apple (Modalias usb:vXXXXp...)
+PEERS_FILE = os.environ.get("K230_BT_HID_PEERS", "/etc/k230-bt-hid-peers.json")
+
+
+def classify_peer(name="", modalias="", klass=0, addr=""):
+    """按对端属性判断反控该走哪条通路。返回 (mode, why)。
+
+    mode: "touch" = HID 绝对触摸 (Report ID 4) | "mouse" = 鼠标指针 (相对位移)
+    顺序: 手工指定 > iOS 名字 > macOS 名字 > Apple VID (名字未知) > 其余一律触摸。
+    """
+    ov = load_peer_overrides().get(addr.upper())
+    if ov in ("touch", "mouse"):
+        return ov, "按 %s 里对 %s 的指定" % (PEERS_FILE, addr or "?")
+    lo = (name or "").lower()
+    ma = (modalias or "").lower()
+    for hint in IOS_HINTS:
+        if hint in lo:
+            return "touch", "设备名含 %r (iOS 吃绝对触摸 Report ID 4)" % hint
+    for hint in MAC_HINTS:
+        if hint in lo:
+            return "mouse", "设备名含 %r (macOS 未验证 ID4, 走鼠标指针)" % hint
+    for vid in APPLE_VIDS:
+        if ("v" + vid) in ma:
+            return "mouse", "Modalias 是 Apple 但名字未识别 (usb:v%s..., 保守走鼠标)" % vid.upper()
+    return "touch", "非 Apple 设备 (%s) 一律用 HID 绝对触摸" % (name or addr or "?")
+
+
+def load_peer_overrides():
+    """读 /etc/k230-bt-hid-peers.json: {"DC:F0:90:26:36:C0": "touch"} —— 名字被改过时的兜底。"""
+    try:
+        with open(PEERS_FILE, encoding="utf-8") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(j, dict):
+        return {}
+    out = {}
+    for k, v in j.items():
+        if isinstance(v, dict):
+            v = v.get("mode")
+        if isinstance(v, str) and v.lower() in ("touch", "mouse"):
+            out[str(k).upper()] = v.lower()
+    return out
+
+
+class AbsPointer:
+    """把「镜像像素坐标」翻译成一串相对 HID 报告 —— iOS 指针没有绝对坐标接口。
+
+    只在 AirPlay 投屏时可用: 内容矩形从 `/run/wfd-uibc-geom` 读 (drmplay 发布),
+    没有这个文件说明现在不是 AirPlay 会话 (Miracast 走 UIBC, 不该抢)。
+    """
+
+    def __init__(self, hid):
+        self.hid = hid
+        self.cal = load_cal()
+        self.geom = None        # None = 没有几何 (不是投屏会话, 不许猜位置)
+        self.steps = list(self.cal["steps"])
+        self.gain = float(self.cal["gain"])
+        self.x = None           # 已知/假设的指针位置 (镜像像素); None = 不知道
+        self.y = None
+        self.last_go = 0.0      # 上次定位的时刻 (判空闲: iOS 指针空闲会吸附屏幕边缘)
+        self.fail_until = 0.0   # 失败退避截止时刻 (见 FAIL_RETRY_GAP)
+        self.read_geom()
+
+    # ---------- 几何
+    def read_geom(self):
+        try:
+            with open(GEOM_FILE, encoding="utf-8") as f:
+                v = [float(t) for t in f.read().split()]
+        except (OSError, ValueError):
+            return False
+        if len(v) != 8 or min(v[2], v[3], v[6], v[7]) <= 0:
+            return False
+        if self.geom is not None and tuple(v[6:8]) != tuple(self.geom[6:8]):
+            # 内容尺寸变了 (换手机/换分辨率) ⇒ 已知位置作废, 步长按宽度折算
+            self.x = self.y = None
+            scale = v[6] / float(self.cal.get("calW") or CAL_W)
+            self.steps = sorted([(px * scale, c) for px, c in self.cal["steps"]],
+                                reverse=True)
+        self.geom = tuple(v)
+        return True
+
+    def touch_to_frame(self, tx, ty):
+        """触屏坐标 (0..479/0..799) → 镜像内容像素 (没有几何就返回 None)。"""
+        if not self.geom:
+            return None
+        sx, sy, sw, sh, cx, cy, cw, ch = self.geom
+        fx = cx + (tx - sx) * cw / sw
+        fy = cy + (ty - sy) * ch / sh
+        return min(max(fx, 0.0), cw - 1.0), min(max(fy, 0.0), ch - 1.0)
+
+    def _gain(self):
+        g = float(self.cal.get("gain", 1.0))
+        peer = str(self.hid.stats.get("peer") or "").upper()
+        cfg = (self.cal.get("peers") or {}).get(peer)
+        if isinstance(cfg, dict) and isinstance(cfg.get("gain"), (int, float)):
+            g *= float(cfg["gain"])
+        return g
+
+    # ---------- 移动
+    def _axis(self, delta, axis):
+        sign = 1 if delta > 0 else -1
+        rem = abs(delta)
+        sent = 0.0                  # 实际发出去的报告折回的像素 (表值)
+        gain = self._gain()
+        guard = 0
+        ok = True
+        while rem > 3.0 and guard < 8:
+            guard += 1
+            pick = None
+            for px, cnt in self.steps:
+                p = px * gain
+                if p <= rem + 2.0:          # 允许 2 px 越冲, 免得最后剩一堆凑不齐
+                    pick = (p, cnt)
+                    break
+            if pick is None:
+                break
+            p, cnt = pick
+            # ★ 必须带上当前按键状态: 拖动时按住左键, 若发 buttons=0 等于"先松手再移动",
+            #   iOS 就不认这是拖动 (2026-11-05 真机: 手指在 K230 上滑动, 手机界面根本不跟)。
+            btn = getattr(self.hid, "buttons", 0)
+            if axis == "x":
+                ok = self.hid.mouse(btn, sign * cnt, 0, 0) and ok
+            else:
+                ok = self.hid.mouse(btn, 0, sign * cnt, 0) and ok
+            rem -= p
+            sent += p
+            time.sleep(ABS_CADENCE)
+        return ok, sent
+
+    def clamp(self):
+        """把指针按到内容区左上角 (X/Y 分开发: 斜着一包每轴位移会打折)。
+
+        2026-11-06 修错位: 以前条数按 `cw/186+2` 算 —— 186 px 是标定那台 iPhone
+        在标定跟踪速度下「一条 -127 走多远」。换一台跟踪速度更慢的 iPhone, 一条
+        -127 可能只走 ~100 px, 条数就不够 ⇒ **指针没真的贴到左边界**, 却被记成
+        (0,0)。锚点本身是错的, 后面每一步都带着这个偏移 ⇒ 主人看到的「位置错位」。
+        改成按最保守步长算条数 (宁可多发, 边界会夹住, 多发无害), 并把
+        「一次都发不出去」当成失败立刻停 (手机没连时不要空转 17 条)。
+        """
+        _sx, _sy, _sw, _sh, _cx, _cy, cw, ch = self.geom
+        ok = True
+        btn = getattr(self.hid, "buttons", 0)
+        for _ in range(int(cw / CLAMP_STEP_PX) + 3):
+            if not self.hid.mouse(btn, -127, 0, 0):
+                return False
+            time.sleep(ABS_CADENCE)
+        for _ in range(int(ch / CLAMP_STEP_PX) + 3):
+            if not self.hid.mouse(btn, 0, -127, 0):
+                return False
+            time.sleep(ABS_CADENCE)
+        # 边界会夹住指针: 这里记 (0,0) 是安全的 (不可能冲到负数)
+        self.x = self.y = 0.0
+        self.last_go = time.time()
+        return ok
+
+    def goto(self, tx, ty):
+        """走到镜像像素 (tx,ty); 位置未知先 clamp 锚定。没有几何就什么都不做。
+
+        2026-11-04 修 bug: 控制管道 `tap`/`at` 是直通路径, 以前只判「位置未知」。
+        但 iOS 的辅助触控球**空闲几秒就会吸附到屏幕边缘**, 我们记的坐标随即失真 ——
+        真机上出现过: 空闲 ~40 s 后 tap(200,319) 实际只把球从边缘推到 x=0, 点击落空。
+        所以这里也按 ABS_ANCHOR_IDLE 判空闲, 超时就先 clamp 重锚 (与触摸路径口径一致)。
+        """
+        if not self.read_geom():
+            return False
+        if time.time() < self.fail_until:
+            # 上一条报告刚失败 (手机没连 / 通道断了): 别每帧都去撞 —— 否则一次拖动会
+            # 打出成百上千条失败 (真机见过 被挡=1448) 外加每帧一次 9 条报告的 clamp,
+            # 事件循环被拖死 ⇒ 表现就是"滑动卡顿、位置乱"。
+            return False
+        if (self.x is None or self.y is None
+                or time.time() - self.last_go > ABS_ANCHOR_IDLE):
+            self.clamp()
+        cw, ch = self.geom[6:8]
+        tx = min(max(float(tx), 0.0), cw - 1.0)
+        ty = min(max(float(ty), 0.0), ch - 1.0)
+        dx, dy = tx - self.x, ty - self.y
+        ok = True
+        moved_x = moved_y = 0.0
+        if abs(dx) >= ABS_STEP_MIN:
+            ok, moved_x = self._axis(dx, "x")
+        if abs(dy) >= ABS_STEP_MIN:
+            ok, moved_y = self._axis(dy, "y")
+        # ★ 2026-11-05 修 bug: 以前这里直接 `self.x, self.y = tx, ty` —— 但 `_axis` 在位移
+        #   小于最小档 (~8 px, iOS 对 <8 counts 的位移完全不动) 时**一条报告都不发**,
+        #   位置却照样前进 ⇒ 慢速拖动时"记录跑在真实前面", 越滑越偏、松手位置乱。
+        #   现在只按**真正发出去的位移**更新, 没发出去的残差留到下一帧 (自然累积)。
+        self.x = min(max(self.x + (moved_x if dx >= 0 else -moved_x), 0.0), cw - 1.0)
+        self.y = min(max(self.y + (moved_y if dy >= 0 else -moved_y), 0.0), ch - 1.0)
+        self.last_go = time.time()
+        if not ok:                      # 报告没发出去 ⇒ 位置不可信, 下次重锚
+            self.x = self.y = None
+            self.fail_until = time.time() + FAIL_RETRY_GAP
+        return ok
+
+    def describe(self):
+        if not self.geom:
+            return "几何=(没有 %s: 不是投屏会话) 增益=%.2f" % (GEOM_FILE, self._gain())
+        _sx, _sy, _sw, _sh, cx, cy, cw, ch = self.geom
+        return ("几何=屏(%g,%g %gx%g) 内容(%g,%g %gx%g) 增益=%.2f 位置=%s 步长表=%d 档"
+                % (self.geom[0], self.geom[1], self.geom[2], self.geom[3],
+                   cx, cy, cw, ch, self._gain(),
+                   "未知" if self.x is None else "(%.0f,%.0f)" % (self.x, self.y),
+                   len(self.steps)))
+
+
+class TouchMouse:
+    """FT5x06 绝对多点触摸 → 鼠标移动 / 点击 / 拖动 / 双指滚动。
+
+    两种模式 (K230_BT_HID_MODE / --mode):
+      abs (默认) 归一化绝对定位: 手指在哪, 指针就送到哪 (见 AbsPointer)
+      rel        旧的相对位移 × sens: 只给没有几何信息的老路径/兜底用
+    """
+
+    # 按键状态只有一份: 以 HidDevice.buttons 为准 (FIFO down/up 也改它)。
+    # 2026-11-05 修 bug: 以前 TouchMouse 自己有 buttons=1, 而 AbsPointer._axis 发报告写死 0,
+    #   于是"按住拖动"在手机上变成"松开后再移动", 界面根本不跟手。
+    @property
+    def buttons(self):
+        return getattr(self.hid, "buttons", 0)
+
+    @buttons.setter
+    def buttons(self, v):
+        self.hid.buttons = int(v)
+
+    def __init__(self, hid, sens=SENS, mode="abs"):
+        self.hid = hid
+        self.sens = sens
+        self.mode = mode
+        self.ap = AbsPointer(hid) if mode == "abs" else None
+        # ★ 2026-11-05: 默认走 **HID 绝对触摸** (手机当触摸屏用, 与海奇一致)。
+        #   前提是传输层支持 Report ID 4 (ClassicProfile/BLE 都实现了 touch_report);
+        #   测试里用的 FakeHid 没有这个方法 ⇒ 自动退回鼠标路径, 老回归不受影响。
+        #   关掉用 K230_BT_HID_TOUCH=0 或 FIFO `touch off`。
+        self.tp_on = (mode == "abs") and hasattr(hid, "touch_report") and \
+            os.environ.get("K230_BT_HID_TOUCH", "1").lower() not in ("0", "off", "no")
+        self.last_abs = 0.0
+        self.last_fail_log = 0.0
+        # 最近发出去的触摸报告 (时间, tip0, tip1, x0, y0, 活跃手指数) —— FIFO `tplog` 打印,
+        # 用来量「按下→抬起」真实间隔 (单击变长按 = 这个间隔 > 500 ms)。
+        self.tp_ring = []
+        self._tp_key = None          # 上一条报告的内容指纹 (去重/限频用)
+        self._tp_live = []           # 上一帧"按下"里各触点的 (contact id, x, y) —— 抬手帧沿用
+        self._cid = 0                # Contact ID 轮转计数器 (见 _abs 的 TRACKING_ID 分支)
+        self._last_cids = []         # 最近一次按下用过的 contact id —— 保活按它们发抬起
+        self._tp_t = 0.0
+        self._tp_timer = 0           # 限频后"补发最后一帧"的定时器 (见 _tp_schedule)
+        self._rel_src = 0            # 压后的"抬起"定时器 (见 _tp_release_after)
+        self.loop_ready = False      # 真守护进程起主循环后置 True (见 _tp_release_after)
+        self.pending = None      # 待定位的触摸帧 (见 commit)
+        self.pending_force = False
+        self.pending_press = False
+        self.buttons = 0
+        self.slots = {}
+        self.cur = 0
+        self.acc_dx = 0.0
+        self.acc_dy = 0.0
+        self.last_click = 0.0
+        self.two_y = None
+        self.scroll_acc = 0.0
+        self.using_mt = False
+        # 单点兼容轴 (ABS_X/ABS_Y) 的最新值 —— 面板漏发 MT_X/MT_Y 时给槽 0 兜底 (见 _abs)
+        self.st_abs = [None, None]
+        self.tp_noaxis = 0           # "新触点缺一个轴 ⇒ 整帧没发出去" 的次数 (FIFO tplog 打印)
+        # ★ 2026-11-06 「反控突然没反应」取证用: 以前这些失败是**静默**的 ——
+        #   读不到几何 (投屏会话断了/文件被 O_TRUNC 重写) 时 _tp_commit 直接 return False,
+        #   一条日志一个计数都没有, 现场只能看到"手机不理我"。这三个计数进 FIFO `tpdiag`。
+        self.tp_geom_fail = 0        # 读 /run/wfd-uibc-geom 失败 (没会话/半截文件)
+        self.tp_ev = 0               # 从 evdev 进来的事件条数 (面板是否还在出事件)
+        self.tp_ev_t = 0.0           # 最后一个 evdev 事件的时刻 (monotonic)
+        self.tp_press = 0            # 按下报告条数 (含重复的手指)
+        self.tp_lift = 0             # 抬起报告条数
+
+    # ---------- 运行时切换反控方式 (按对端自动选)
+    def set_tp(self, on, why=""):
+        """切「HID 绝对触摸 / 鼠标指针」并在切换点把手势状态清干净。
+
+        ★ 2026-11-05 主人要求「反控要通用于安卓跟苹果」: 安卓吃绝对触摸屏 (触点=手指),
+          iOS 只吃鼠标指针。切换时如果不清状态, 手机侧会卡住"按住不放"或"手指没抬起"
+          (下一条手势全被当成拖动), 所以这里两条都补一条"全松开"。
+        """
+        on = bool(on) and self.mode == "abs" and hasattr(self.hid, "touch_report")
+        if on == self.tp_on:
+            if why:
+                log("反控方式保持 %s (%s)" % ("HID绝对触摸" if on else "鼠标指针", why))
+            return self.tp_on
+        # 1) 旧的触摸手势: 把所有手指抬起 (tip=0)
+        if self.tp_on:
+            try:
+                self.hid.touch_report((0, 0, 0, 0, 0, 0), (0, 0, 1, 0, 0, 0))
+            except Exception:  # noqa: BLE001
+                pass
+        # 2) 旧的鼠标按键: 松开左键, 别让主机以为还在拖
+        if getattr(self.hid, "buttons", 0):
+            self.hid.buttons = 0
+            try:
+                self.hid.mouse(0, 0, 0, 0)
+            except Exception:  # noqa: BLE001
+                pass
+        self.slots.clear()
+        self.pending = None
+        if self._rel_src:
+            try:
+                GLib.source_remove(self._rel_src)
+            except Exception:  # noqa: BLE001
+                pass
+            self._rel_src = 0
+        self.pending_force = False
+        self.pending_press = False
+        self.two_y = None
+        self.scroll_acc = 0.0
+        self.acc_dx = self.acc_dy = 0.0
+        if self.ap is not None:
+            self.ap.x = self.ap.y = None      # 切到指针模式时位置作废, 下次落手先重锚
+        self._tp_key = None
+        self._tp_live = []
+        self.tp_on = on
+        log("反控方式 → %s%s" % ("HID 绝对触摸" if on else "鼠标指针",
+                                (" (" + why + ")") if why else ""))
+        return on
+
+    # ---------- 事件入口
+    def feed(self, typ, code, value, ts=None):
+        ts = ts if ts is not None else time.time()
+        self.tp_ev += 1
+        self.tp_ev_t = time.monotonic()
+        if typ == EV_ABS:
+            self._abs(code, value, ts)
+        elif typ == EV_KEY and code == BTN_TOUCH and value == 0:
+            for s in list(self.slots):
+                self._lift(s, ts)
+            self.flush()
+        elif typ == EV_SYN and code == SYN_REPORT:
+            self.flush()
+
+    def _abs(self, code, value, ts):
+        if code == ABS_MT_SLOT:
+            self.cur = value
+        elif code == ABS_MT_TRACKING_ID:
+            self.using_mt = True
+            if value == -1 or value == 0xFFFFFFFF:
+                self._lift(self.cur, ts)
+            else:
+                # ★ 2026-11-06: 上一指若还压着"抬起" (TP_MIN_HOLD_MS 兜底), 先补发出去,
+                #   否则两段手势被手机连成同一个 contact ⇒ 这次点击变成拖动/长按。
+                self._tp_release_flush()
+                # ★ 2026-11-05 修「用一会儿位置就飘了」: 绝对定位是**开环**的 —— 我们只
+                #   按实测步长表推算指针走到哪, 手机上没有任何回读; 每次拖动/点击的
+                #   误差 (加速度随速度变、通道排队) 会一点点累加, 几次操作后就整体偏了。
+                #   旧逻辑只在「空闲 > ABS_ANCHOR_IDLE(5 s)」时才重锚, 于是连续使用时
+                #   永不归零 ⇒ 真机上"测试了一会位置就不对了"。
+                #   现在**每次手指落下都重锚** (X/Y 各按到内容区左上角), 一次手势内
+                #   的误差不再跨手势传递。
+                if self.ap is not None and not self.slots.get(self.cur, {}).get("down"):
+                    self.ap.x = self.ap.y = None      # 绝对模式才需要作废位置 (rel 模式无 ap)
+                if getattr(self.hid, "buttons", 0):
+                    # 上一条手势没收到抬起 (事件丢了/被合并) 就会一直"按住",
+                    # 之后每次移动都被手机当成拖动 ⇒ 单击变下拉。这里强制归零。
+                    self.hid.buttons = 0
+                    self.hid.mouse(0, 0, 0, 0)
+                # ★ 2026-11-06 根因修复 (真机: 同一点连点两下, 第二下完全没反应):
+                #   ft5x06 只在**值变化**时才发 ABS_MT_POSITION_X/Y —— 手指落在同一列时,
+                #   新触点的第一帧只带 MT_Y 不带 MT_X (板端原始事件实证:
+                #   `MT_TID 303 / MT_Y 71 / BTN_TOUCH 1 / SYN_REPORT`, 没有 MT_X)。
+                #   老代码这里把 x/y 复位成 None, 于是这个槽永远凑不齐坐标,
+                #   _tp_commit 的 act 过滤把它剔掉 ⇒ 整段手势一条报告都没发
+                #   (手机侧表现: 点了没反应; 重试几次才有一次生效)。
+                #   evdev 的语义本来就是"槽位状态保持": 没发的轴沿用上一次的值,
+                #   所以这里接着上一段的位置用, 不再清空。
+                prev = self.slots.get(self.cur) or {}
+                # ★ 2026-11-06: Contact ID **每次按下轮转**, 不再恒为 0。
+                #   海奇那一路的 ID 取自槽位状态; 我们恒 0 时 iOS 有理由把"新按下"当成
+                #   "旧 contact 还在移动" —— 只要抬起帧丢过一次, 后面每一次点击都会
+                #   累加到同一个 contact 上 ⇒ 触摸时长越来越长 ⇒ 单击变长按, 而且不自愈。
+                self._cid = (self._cid + 1) & 0x1F
+                if CID_MODE == "slot":
+                    # ★ 2026-11-06 真机根因修复: 描述符里 Contact ID 是 5 位 (0..31),
+                    #   但这是一块 **2 指触摸屏** —— 同时存在的 contact 最多 2 个。
+                    #   以前每笔 +1 一路涨到 31 再绕回, iOS 侧等于"每笔都新建一个触点",
+                    #   十几笔后 contact 槽被占满, 后续按下全被忽略, 约 15 s 超时清掉才恢复
+                    #   (现场: 连续 13 笔失效, 报文却一条不缺)。实测对照 40 笔纯左右滑:
+                    #     rotate(0..31) 27/40, 第 18~30 笔连挂;  slot(0/1) 见 WORKLOG。
+                    #   只在 0/1 之间轮转, 与"2 指"的物理事实一致。
+                    self._cid = self._cid & 0x01
+                elif CID_MODE == "fixed":
+                    self._cid = 1          # A/B: 固定 contact id, 不累积新槽位
+                self.slots[self.cur] = {"tid": value,
+                                        "x": prev.get("x"), "y": prev.get("y"),
+                                        "px": 0, "py": 0, "sx": None, "sy": None,
+                                        "t0": ts, "moved": 0.0, "dragged": False,
+                                        "cid": self._cid, "down": True}
+                if (self.tp_on and self.slots[self.cur]["x"] is not None
+                        and self.slots[self.cur]["y"] is not None):
+                    # 连点**同一个像素**时面板可能一个轴都不发 (全部值没变)。
+                    # 直接用沿用下来的坐标先排一条按下报告, 保证这一下不会被吞。
+                    self.pending = self.slots[self.cur]
+        elif code == ABS_MT_POSITION_X:
+            s = self.slots.get(self.cur)
+            if s and s.get("down"):
+                self._pos(s, value, None, ts)
+        elif code == ABS_MT_POSITION_Y:
+            s = self.slots.get(self.cur)
+            if s and s.get("down"):
+                self._pos(s, None, value, ts)
+        elif code in (0x00, 0x01):                        # ABS_X / ABS_Y
+            self.st_abs[code] = value
+            if self.using_mt:
+                # 面板漏发某一轴时用单点兼容轴补齐 (多指时它只代表第一根手指, 够用)
+                s = self.slots.get(0)
+                if s and s.get("down"):
+                    if s.get("x") is None:
+                        s["x"] = self.st_abs[0]
+                    if s.get("y") is None:
+                        s["y"] = self.st_abs[1]
+                    if s.get("x") is not None and s.get("y") is not None:
+                        self._pos(s, None, None, ts)
+            else:
+                self._cid = (self._cid + 1) & 0x1F
+                s = self.slots.setdefault(0, {"x": None, "y": None, "px": 0, "py": 0,
+                                              "sx": None, "sy": None, "t0": ts,
+                                              "moved": 0.0, "dragged": False,
+                                              "cid": self._cid, "down": True})
+                if code == 0x00:
+                    self._pos(s, value, None, ts)
+                else:
+                    self._pos(s, None, value, ts)
+
+    def _pos(self, s, x, y, ts):
+        if x is not None:
+            s["x"] = x
+        if y is not None:
+            s["y"] = y
+        if s["x"] is None or s["y"] is None:
+            return
+
+        if self.tp_on:
+            # 绝对触摸: 手指位置就是坐标, 不用累计位移、不用死区、不用滚轮折算。
+            self.pending = s            # 由 commit() 每批发一条 (见 _tp_commit)
+            return
+
+        act = self.active()
+        # ---- 双指: 上下滑动 ⇒ 滚轮 (绝对模式也走这条: 滚轮不需要坐标)
+        if len(act) >= 2:
+            ys = sorted(o["y"] for o in act[:2] if o["y"] is not None)
+            if len(ys) == 2:
+                if getattr(self.hid, "buttons", 0):
+                    self.hid.buttons = 0
+                    self.hid.mouse(0, 0, 0, 0)
+                yc = (ys[0] + ys[1]) / 2.0
+                if self.two_y is None:
+                    self.two_y = yc
+                self.scroll_acc += (self.two_y - yc)
+                self.two_y = yc
+                steps = int(self.scroll_acc / SCROLL_STEP_PX)
+                if steps:
+                    self.scroll_acc -= steps * SCROLL_STEP_PX
+                    self.hid.mouse(self.buttons, 0, 0, -steps)
+            return
+
+        self.two_y = None
+        if self.ap is not None:              # 绝对模式: 位移由 goto 负责, 不累计
+            self._pos_abs(s, ts)
+            return
+        if s["sx"] is None:
+            s["sx"], s["sy"] = s["x"], s["y"]
+            s["px"], s["py"] = s["x"], s["y"]
+            return
+        dx = s["x"] - s["px"]
+        dy = s["y"] - s["py"]
+        s["px"], s["py"] = s["x"], s["y"]
+        if dx == 0 and dy == 0:
+            return
+        dist = ((s["x"] - s["sx"]) ** 2 + (s["y"] - s["sy"]) ** 2) ** 0.5
+        s["moved"] = max(s["moved"], dist)
+        held = (ts - s["t0"]) * 1000.0
+        if not s["dragged"] and held > DRAG_HOLD_MS and s["moved"] > CLICK_MOVE_PX:
+            s["dragged"] = True
+            self.buttons |= 0x01
+            self.hid.mouse(self.buttons, 0, 0, 0)
+        # 2026-11-04 修 bug: 原来写成 `if not dragged: 累加+发送`, 于是**一旦进入拖动,
+        # 位移就被丢掉** —— 手指按住拖, 指针却纹丝不动 (只有按键没有移动)。
+        # 正确语义: 位移永远要发; dragged 只决定"按不按住左键"。
+        # MOVE_DEADBAND: 点击时手指有 1~2px 抖动, 直接按 sens 放大后每次点都会漂 3~5px;
+        # 所以位移先攒着, 超过死区才真正发出去 (攒的量不会丢, 越过死区一次性发出)。
+        self.acc_dx += dx * self.sens
+        self.acc_dy += dy * self.sens
+        if s["dragged"] or s["moved"] > MOVE_DEADBAND:
+            self.flush()
+
+    # ---------- 绝对定位 (2026-11-05)
+    def _pos_abs(self, s, ts):
+        """手指坐标 = 目标; 按下就送过去, 移动时跟着走 (拖动靠按住左键)。
+
+        ★ 2026-11-05 修「卡顿」根因: 以前**每条**触摸事件都直接 goto() → 一次定位内部
+        要发 1~8 条报告、每条 sleep(ABS_CADENCE=4 ms), 一条事件最坏阻塞 60+ ms。
+        手指 60~120 Hz 产生事件, 主循环根本追不上 ⇒ FIFO/evdev 事件越积越多,
+        最后成批爆出来 (现场: 一整段拖动 20 多条 `at` 全在同一秒执行, 定位自然乱)。
+        现在只记「待定位目标」, 由 commit() 在**一批事件处理完之后**统一发一次。
+        """
+        if s["x"] is None or s["y"] is None:
+            return
+        if s.get("sx") is None:                       # 第一帧: 记起点 → 立即定位
+            s["sx"], s["sy"] = s["x"], s["y"]
+            s["t0"] = s.get("t0") or ts
+            # ★ 2026-11-06 修「iPhone 点不中 / 位置错位」: 以前只有「空闲 > 5 s」才重锚。
+            #   iOS 指针是**开环相对位移**, 唯一可靠的绝对参考是「贴到屏幕左边界被夹住」。
+            #   只要中间有任何一个外部动作挪过指针 —— 用户直接在手机屏上点、辅助触控圆点
+            #   闲置吸附到边缘、来电/通知弹窗、手机自己缩放画面 —— 我们记的位置就废了,
+            #   而 5 s 内的连续点击会**接着错的往上叠**, 越点越偏。
+            #   现在每次手指落下 (新一段手势的第一帧) 都先吸附到 (0,0), 误差不跨手势累积。
+            #   代价: 每段手势多 ~15 条报告 (~60 ms) 的对角吸附, 换来每次点击都是绝对准的。
+            self.ap.x = self.ap.y = None
+            self.pending = s
+            self.pending_force = True
+            self.pending_press = True      # 定位完成后立刻按下 (真鼠标语义)
+            return
+        dist = ((s["x"] - s["sx"]) ** 2 + (s["y"] - s["sy"]) ** 2) ** 0.5
+        s["moved"] = max(s.get("moved", 0.0), dist)
+        # ★ 2026-11-05 改成**真鼠标语义**: 手指落下就按左键, 移动就是拖, 抬起就松开。
+        #   以前用「按住 >200 ms 且移动 >14 px 才算拖动」的阈值去猜 —— 猜测的两头都会错:
+        #     · 想单击却因为手指抖了 15 px 被升格成拖动 ⇒ 真机上"单击变成下拉"
+        #       (在屏幕上方按下再往下拖 = 拉出通知中心);
+        #     · 想拖动却因为没同时满足两个条件 ⇒ 界面不跟手。
+        #   现在不再猜: 按下/移动/抬起原样透传, 由 iOS 自己判"点击还是拖动"(真鼠标就是这样)。
+        self.pending = s
+
+    def commit(self):
+        """把本批事件的最后一个目标真正发出去 (每批只定位一次)。
+
+        顺序很重要: **先定位, 再按左键** —— 反过来就会在旧位置按下 (指针空闲时停在
+        内容区左上角, 在那里按下再拖 = 从屏幕左上角往下拉 ⇒ 真机上把 iOS 的
+        「通知中心」拉下来了)。
+        """
+        if self.tp_on:
+            if self.pending is None:
+                return True
+            self.pending = None
+            return self._tp_commit()
+        s = self.pending
+        if s is None:
+            return
+        self.pending = None
+        force = self.pending_force
+        self.pending_force = False
+        press = self.pending_press
+        self.pending_press = False
+        if not self._abs_go(s, force=force):
+            return                        # 没 geom / 报告没发出去: 别按下 (按了也没位置)
+        if not press or s.get("pressed"):
+            return
+        s["pressed"] = True
+        s["dragged"] = True               # rel 模式/上层统计沿用这个字段
+        self.buttons = 0x01               # 同一份按键状态 (HidDevice.buttons)
+        self.hid.mouse(0x01, 0, 0, 0)     # 落点已就位, 现在按下
+        log("按下 @ (%.0f,%.0f) 手指(%.0f,%.0f)"
+            % (self.ap.x or -1, self.ap.y or -1, s["x"], s["y"]))
+
+    def _tp_commit(self, force=False):
+        """把当前**所有活跃手指**发成一条绝对触摸报告 (最多 2 指)。
+
+        为什么每批发"全量"而不是增量: 触摸屏协议就是"每一帧上报当前所有触点",
+        主机 (iOS) 自己算点击/拖动/手势。这也是海奇 BT 那一路的做法。
+        → 单击不会再被误判成下拉; 底部边缘上滑 (iPhone 控制中心) 就是真手指上滑。
+        """
+        if self.ap is None:
+            return False
+        act = [x for x in self.slots.values()
+               if x.get("down") and x.get("x") is not None and x.get("y") is not None]
+        act.sort(key=lambda x: x.get("t0") or 0.0)
+        f = []
+        release = False
+        if act:
+            # ★ 2026-11-06: 只有**有手指**时才需要几何 (要算坐标)。
+            #   抬手那条是全 0 报告, 不需要几何 —— 以前一起放在 read_geom() 后面,
+            #   geom 偶发读失败 (drmplay 换分辨率时 O_TRUNC 重写) 就连抬起都发不出去,
+            #   iOS 会一直认为手指按着 ⇒ 单击变长按。
+            if not self.ap.read_geom():
+                self.tp_geom_fail += 1
+                return False
+            g = self.ap.geom
+            fw = g[6] or 1.0
+            fh = g[7] or 1.0
+            live = []
+            for i, x in enumerate(act[:TP_MAX_FINGERS]):
+                cx, cy = self.ap.touch_to_frame(x["x"], x["y"])
+                lx = clamp(int(round(cx / fw * TP_LOGICAL_MAX)), 0, TP_LOGICAL_MAX)
+                ly = clamp(int(round(cy / fh * TP_LOGICAL_MAX)), 0, TP_LOGICAL_MAX)
+                cid = int(x.get("cid", i)) & 0x1F
+                # Contact Count 只有 1 bit (描述符是海奇原样), 只能表达"有触点", 给第一指置位
+                f.append((1, 1, cid, 1 if i == 0 else 0, lx, ly))
+                live.append((cid, lx, ly))
+            self._tp_live = live          # 抬手帧要沿用这些坐标/ID (见下)
+            self._last_cids = [c for (c, _x, _y) in live]   # 保活要抬的就是这几个 (见 _keepalive_cb)
+        elif self._tp_live:
+            # ★ 2026-11-06 真机"从中间往下滑, 有时突变到屏幕顶部拉出任务栏"的直接原因:
+            #   抬手帧以前发的是 (0,0)。同一条报告里"tip 1→0 + 坐标跳到 (0,0)",
+            #   iOS 有可能先处理坐标 (触点瞬移到左上角 = 一次猛的上滑) 再处理释放 ⇒
+            #   通知中心被拉下来。真实触摸屏抬手时坐标是**停在原地**的, 这里照做。
+            for i, (cid, lx, ly) in enumerate(self._tp_live[:TP_MAX_FINGERS]):
+                # ★ 2026-11-06 真机"滑十几次后反控突然不动, 十几秒自己好"的根因修复:
+                #   抬手帧以前发 (tip=0, in_range=0)。In Range=0 在 HID 数字化仪里的含义是
+                #   "触点离开感应范围", iOS 会把整个 contact 直接丢掉而不走"抬起"流程;
+                #   连续几十次之后这个触摸 collection 被判失效, 后续按下全被忽略,
+                #   要等 iOS 自己超时 (实测 13~15 s) 才重新接受 —— 与现场表现完全一致。
+                #   真实触摸屏抬手是 "离开屏幕但仍在感应范围内": tip=0, in_range=1。
+                #   实测基线 (40 笔纯左右滑, 同一脚本改前): 第 9~21 笔连续 13 笔失效。
+                f.append((0, 1, cid, 0, lx, ly))
+            release = True
+        while len(f) < TP_MAX_FINGERS:
+            f.append((0, 0, len(f), 0, 0, 0))
+
+        # ★ 2026-11-05 真机"单击偶尔变长按 / 很乱"的两条直接原因都在这里:
+        #   ① 手指停着不动时 evdev 也在刷 SYN (面板照 60~100 Hz 出事件), 我们把
+        #      一模一样的报告反复塞进蓝牙。经典蓝牙中断通道一个间隔只能带一包,
+        #      塞满之后**抬手那条排在队列后面**到达 ⇒ iOS 认为手指还在屏上 ⇒ 长按。
+        #   ② 快速移动时一帧发一条也会把队列顶满。
+        #   ⇒ 内容没变就不发; 只是"移动"(抬起/落下不算) 且距上次 <12 ms 就丢掉中间帧,
+        #     抬手/落下的报告**永远立即发**。
+        now = time.monotonic()
+        key = (f[0], f[1])
+        if key == self._tp_key:
+            return True
+        if (not force
+                and self._tp_key is not None
+                and now - self._tp_t < TP_MIN_INTERVAL
+                and f[0][0] == self._tp_key[0][0] and f[1][0] == self._tp_key[1][0]):
+            # 这一帧被限频丢掉 —— 但**必须补发**: 手指慢慢挪一下就停住时, evdev 之后
+            # 不再产生事件, 手机就会停在旧坐标上 (拖滑块停在半路那种)。12 ms 后补一帧。
+            self._tp_schedule()
+            return True
+        self._tp_key = key
+        self._tp_t = now
+        ok = self.hid.touch_report(f[0], f[1])
+        if ok and release and TP_REL_REPEAT > 1:
+            # 抬起帧冗余发送 (对照海奇的 3 连发): 丢一包也不会让手机"粘住"。
+            for _ in range(TP_REL_REPEAT - 1):
+                time.sleep(0.015)
+                self.hid.touch_report(f[0], f[1])
+        if ok:
+            if release:
+                self._tp_live = []        # 抬手帧真发出去了才清 (被去重挡下就留着下次补)
+                self.tp_lift += 1
+            elif act:
+                self.tp_press += 1
+            self.tp_ring.append((time.time(), f[0][0], f[1][0], f[0][4], f[0][5], len(act)))
+            if len(self.tp_ring) > 400:
+                del self.tp_ring[:len(self.tp_ring) - 400]
+        return ok
+
+    def _tp_schedule(self):
+        """限频丢帧后 12 ms 补发最后一帧 (用 GLib 定时器, 不阻塞)。"""
+        if self._tp_timer:
+            return
+        try:
+            self._tp_timer = GLib.timeout_add(
+                int(TP_MIN_INTERVAL * 1000) + 2, self._tp_timer_cb)
+        except Exception:            # 测试桩里没有 GLib.timeout_add
+            self._tp_timer = 0
+
+    def _tp_timer_cb(self):
+        self._tp_timer = 0
+        try:
+            self._tp_commit(force=True)
+        except Exception:            # noqa: BLE001
+            pass
+        return False
+
+    def _tp_release_after(self, ms):
+        """把「抬起」报告压后 ms 再发, 保证手机看到足够长的接触 (见 TP_MIN_HOLD_MS)。
+
+        返回 False = 这次没排上 (单元测试没有主循环 / 定时器不可用), 调用方立刻自己发。
+        """
+        if self._rel_src:
+            return True
+        if not self.loop_ready:
+            return False
+        try:
+            self._rel_src = GLib.timeout_add(max(1, int(ms)), self._tp_release_cb)
+        except Exception:            # 测试桩里没有 GLib.timeout_add
+            self._rel_src = 0
+            return False
+        return bool(self._rel_src)
+
+    def _tp_release_cb(self):
+        self._rel_src = 0
+        try:
+            self._tp_commit(force=True)
+        except Exception:            # noqa: BLE001
+            pass
+        return False
+
+    def _tp_release_flush(self):
+        """新手指落下前, 把还压着的「抬起」立刻补发。
+
+        不补的话两段手势会被手机连成一次contact ⇒ 第二次点击变成一个拖动/长按。
+        """
+        if not self._rel_src:
+            return
+        try:
+            GLib.source_remove(self._rel_src)
+        except Exception:            # noqa: BLE001
+            pass
+        self._rel_src = 0
+        try:
+            self._tp_commit(force=True)
+        except Exception:            # noqa: BLE001
+            pass
+
+    def _abs_go(self, s, force=False):
+        now = time.time()
+        # 拖动时要跟手: 拖动中每帧都试 (小位移在 _axis 里本来就不发, 代价只有几次比较),
+        # 非拖动仍按 ABS_MIN_GAP 节流, 免得静止手指的抖动刷报告。
+        gap = 0.0 if s.get("dragged") else ABS_MIN_GAP
+        if not force and now - self.last_abs < gap:
+            return True                  # 只是本帧被节流, 不算失败
+        # ★ 服务是常驻的: 启动时可能还没有投屏会话 (geom 不存在), 之后会话才开始。
+        #   所以每次定位都重读几何 —— 读不到 = 现在不是投屏会话 ⇒ 不动, 也不用旧几何。
+        #   (不在这里重读的话, 开机就启动的服务会在整个 AirPlay 会话里完全失效)
+        if not self.ap.read_geom():
+            self.ap.geom = None
+            self.ap.x = self.ap.y = None
+            self.last_abs = now
+            return False                 # 没有投屏会话: 一条都不发
+        tx, ty = self.ap.touch_to_frame(s["x"], s["y"])
+        ok = self.ap.goto(tx, ty)
+        if not ok:
+            if now - self.last_fail_log > 2.0:
+                self.last_fail_log = now
+                log("⚠ 绝对定位报告没发出去 (手机没连 HID? 对端=%s) —— 位置作废, 下次触摸重锚"
+                    % (self.hid.stats.get("peer") or "-"))
+        self.last_abs = now
+        return ok
+
+    def _lift(self, slot, ts):
+        s = self.slots.get(slot)
+        if not s:
+            return
+        if self.tp_on:
+            if not s.get("down"):
+                return                 # 已经抬过了 (TRACKING_ID=-1 与 BTN_TOUCH=0 同帧各来一次)
+            s["down"] = False
+            # ★ 2026-11-06: **不再 pop** —— 面板只在值变化时才发 MT_X/MT_Y, 下一段
+            #   手势落在同一列/同一行时可能整轴不发。槽位的 x/y 必须像 evdev 那样留着,
+            #   否则新触点凑不齐坐标 ⇒ 整段手势被丢 (真机: 点返回点了没反应)。
+            self.pending = None
+            self._tp_key = None        # 清指纹: 下次落在同一坐标也必须发得出去
+            if s.get("x") is None or s.get("y") is None:
+                # 整段手势从头到尾没凑齐坐标 ⇒ 一条按下报告都没发, 手机完全没感觉。
+                # 2026-11-06 修好后正常应该一直是 0; FIFO `tplog` 会打印, 不为 0 就是又有漏。
+                self.tp_noaxis += 1
+            # ★ 2026-11-06: 接触时间太短 (面板快报 35~38 ms) 就压后再发抬起 ——
+            #   iOS 会漏采那一帧, 表现成"点了没反应 / 只留下长按的高亮"。
+            if TP_MIN_HOLD_MS > 0 and not self.active():
+                held_ms = (ts - (s.get("t0") or ts)) * 1000.0
+                if (held_ms < TP_MIN_HOLD_MS
+                        and self._tp_release_after(int(round(TP_MIN_HOLD_MS - held_ms)) + 2)):
+                    return             # 抬起由定时器补发 (_tp_release_cb)
+            self._tp_commit()          # 抬指 = 这条报告里该触点 tip=0
+            if not self.active():
+                self.two_y = None
+                self.scroll_acc = 0.0
+                self.buttons = 0
+            return
+        self.commit()                 # 松手前先把最后一个位置落到位
+        s["down"] = False
+        if self.ap is None:
+            # rel 模式 (没有投屏几何时的兜底): 相对位移只能靠阈值猜点击/拖动, 保持原语义。
+            held = (ts - s.get("t0", ts)) * 1000.0
+            moved = s.get("moved", 0.0)
+            if s.get("dragged"):
+                self.buttons &= ~0x01
+                self.hid.mouse(self.buttons, 0, 0, 0)
+            elif moved <= CLICK_MOVE_PX and held <= CLICK_MAX_MS:
+                # 点一下 = 一次 click (双击/三击让主机按时间间隔自己判, 不补发)
+                self.last_click = time.time()
+                self.hid.mouse(0x01, 0, 0, 0)
+                self.hid.mouse(0x00, 0, 0, 0)
+        elif s.get("pressed"):
+            # 真鼠标语义: 落下时按了, 抬起时就松开。"点击" = 按下 + 抬起 (位置没动),
+            # 不需要另外补一次 click (那会造成三击/双击误判)。
+            s["pressed"] = False
+            self.last_click = time.time()
+            self.buttons = 0
+            self.hid.mouse(0x00, 0, 0, 0)
+        self.slots.pop(slot, None)
+        if not self.active():
+            self.two_y = None
+            self.scroll_acc = 0.0
+            self.buttons = 0
+
+    def active(self):
+        return [s for s in self.slots.values() if s.get("down")]
+
+    def flush(self):
+        """把本帧累计位移发出去, 超过 MAX_DELTA 自动拆包。"""
+        while abs(self.acc_dx) >= 1 or abs(self.acc_dy) >= 1:
+            dx = clamp(int(round(self.acc_dx)), -MAX_DELTA, MAX_DELTA)
+            dy = clamp(int(round(self.acc_dy)), -MAX_DELTA, MAX_DELTA)
+            if dx == 0 and dy == 0:
+                break
+            self.hid.mouse(self.buttons, dx, dy, 0)
+            self.acc_dx -= dx
+            self.acc_dy -= dy
+
+
+# ---------------------------------------------------------------- 守护进程
+class Daemon:
+    def __init__(self, args):
+        self.args = args
+        self.transport = getattr(args, "transport", "classic")
+        self.bus = None
+        self.hid = None
+        self.touch = None
+        self.ev_buf = b""
+        self._send_err_t = {}          # 触摸发送错误限流 (见 _log_send_err)
+        self.ev_fd = None
+        self.fifo_fd = None
+        self.adv = None
+        self.adv_on = False
+        self.registered = False
+        self.touch_enabled = True
+        self.peer_name = ""            # 对端名 (连上时由 _on_peer 填)
+        self.peer_mode = ""            # "touch" / "mouse"
+        self.peer_why = ""             # 选这条通路的依据 (现场一眼可判)
+        self._last_gate = 0.0
+        self.loop = None
+        self._ka_src = None            # 保活定时器 (GLib source id)
+        self._ka_sent = 0              # 保活条数 (观测用)
+        self.ka_ms = KEEPALIVE_MS      # 0 = 关; FIFO `ka` 可现场改
+        self._fifo_cid = 0             # FIFO 直接造手势时的 Contact ID (见 next_tp_cid)
+        self.ev_bad = 0                # 坏 evdev 事件条数 (见 on_evdev)
+        self.ev_watch = 0              # evdev 的 GLib source id (自愈时要重挂)
+        self.ev_seen = 0               # 读到的 evdev 事件条数 (含被门控挡掉的)
+        self.ev_readd = 0              # evdev 监听被摘掉后重挂的次数 (见 _ev_watchdog)
+        self._peer_seen = False        # 本次运行里是否连上过手机 (见 _link_note)
+        self._gone_since = None        # 手机断开的 monotonic 时刻 (None = 连着或还没连过)
+
+    def preflight(self, wait_s=60.0):
+        """等蓝牙栈**真的**就绪, 而不是 `systemctl is-active` 说 active 就冲。
+
+        ★ 2026-11-05 重启后现场根因 4 的修复。以前这里立刻 return False ⇒ 退出码 3
+          ⇒ systemd 5 s 一重启; 板上实测开机到 HID profile 真正注册完花了 **2 分 7 秒**
+          (16:20:35 systemd 起 bt-hid → 16:22:42 profile 注册成功), 而适配器在这段
+          时间里早就 Powered/可被发现了 ⇒ 手机看得见 K230-CAST、点下去 SDP 里没有
+          0x1124 ⇒ iOS 弹「配对不成功」。
+
+        现在改成**原地等** (最多 wait_s 秒): 电源/适配器/BlueZ 对象一个不齐就等,
+        一次把通道建好。配合"profile 注册成功后才开可被发现"(_hid_ready), 空窗归零。
+        """
+        t0 = time.time()
+        last = ""
+        while True:
+            why = ""
+            if not os.path.isdir("/sys/class/bluetooth/hci0"):
+                why = "没有 hci0 节点"
+            else:
+                try:
+                    out = subprocess.run(["systemctl", "is-active", "bluetooth"],
+                                         capture_output=True, text=True, timeout=5)
+                    if out.stdout.strip() != "active":
+                        why = "bluetoothd 未 active"
+                except (OSError, subprocess.SubprocessError):
+                    why = "查 systemd 失败"
+                if not why:
+                    try:
+                        bus = dbus.SystemBus()
+                        om = dbus.Interface(bus.get_object("org.bluez", "/"),
+                                            "org.freedesktop.DBus.ObjectManager")
+                        if ADAPTER not in om.GetManagedObjects():
+                            why = "BlueZ 还没导出 %s" % ADAPTER
+                    except dbus.exceptions.DBusException as e:
+                        why = "BlueZ 未就绪 (%s)" % e.get_dbus_name()
+            if not why:
+                dt = time.time() - t0
+                if dt > 1.0:
+                    log("✓ 蓝牙栈已就绪 (等了 %.1f s)" % dt)
+                return True
+            if time.time() - t0 >= wait_s:
+                log("✗ 蓝牙栈 %.0f s 内没就绪: %s" % (wait_s, why))
+                if why == "没有 hci0 节点":
+                    log("  → 先 modprobe btusb (见 docs/BT_HID_REVERSE_PLAN.md)")
+                return False
+            if why != last:
+                log("⏳ 等蓝牙栈就绪: %s (已等 %.0f s)" % (why, time.time() - t0))
+                last = why
+            time.sleep(1.0)
+
+    # ---------- 经典 HID 设备端 (BR/EDR)
+    def _set_coad(self):
+        """设 Class of Device = 外设/键盘+鼠标。不设手机列表里图标是"未知设备"。
+
+        2026-11-05 现场教训: 光调 `hciconfig hci0 class` **不够** —— BlueZ 在适配器
+        上电时会用 /etc/bluetooth/main.conf 的 Class 再写一次 (默认 0), 两者竞态我们
+        总是输 ⇒ 日志打"✓ 设备类 = 0x0005C0"而 `hciconfig` 回读是 0x000000, 手机把
+        它归成"其他设备"导致配对失败。根治写在 overlay 的
+        `etc/bluetooth/main.conf`(`Class = 0x0005C0`); 这里改成**读回校验 + 重试**
+        (最多 ~4 s), 并且失败要如实报出来, 不许再打假的 ✓。
+        """
+        hci = ADAPTER.rsplit("/", 1)[-1]
+        want = "0x%06x" % COAD
+        last = None
+        for _ in range(8):
+            try:
+                subprocess.run(["hciconfig", hci, "class", "0x%06X" % COAD],
+                               capture_output=True, timeout=5)
+                out = subprocess.run(["hciconfig", hci, "class"],
+                                     capture_output=True, timeout=5)
+                last = (out.stdout or b"").decode("utf-8", "replace")
+            except (OSError, subprocess.SubprocessError) as e:
+                last = str(e)
+                time.sleep(0.5)
+                continue
+            if want in last.lower():
+                log("✓ 设备类 (CoD) = 0x%06X (外设 / 键盘+鼠标, 已回读确认)" % COAD)
+                return True
+            time.sleep(0.5)
+        log("⚠ 设备类 (CoD) 没设成 0x%06X —— 手机可能把本机显示为\"未知设备\"并拒绝配对; "
+            "请确认 overlay 的 /etc/bluetooth/main.conf 里有 `Class = 0x%06X` "
+            "(BlueZ 上电会用它覆盖, 单靠 hciconfig 会被冲掉)。最后一次回读: %s"
+            % (COAD, COAD, (last or "").strip()[:160]))
+        return False
+
+    def setup_classic(self):
+        """经典蓝牙 HID 设备端: 可被发现 + 可配对 + SDP 0x1124 + L2CAP 0x11/0x13。"""
+        self.bus = dbus.SystemBus()
+        try:
+            with open(NAME_FILE, "w", encoding="utf-8") as f:
+                f.write(self.bus.get_unique_name() + "\n")
+        except OSError:
+            pass
+        adapter = self.bus.get_object("org.bluez", ADAPTER)
+        props = dbus.Interface(adapter, "org.freedesktop.DBus.Properties")
+        # DiscoverableTimeout 必须先设 0: BlueZ 默认 180 秒后自动把可发现关掉,
+        # 之后手机就再也搜不到 (2026-11-04 现场吃过这个亏, 日志里
+        # `DiscoverableTimeout: 0x000000b4 (180)` 就是它)。
+        # ★ 2026-11-05 根因 4 (重启后「一直配对不成功」): **Discoverable 必须最后开**。
+        #   bluetoothd 一起来、适配器一上电, 手机就能看见 K230-CAST; 但 HID profile
+        #   (SDP 0x1124) 是后面 RegisterProfile 异步注册的。实测重启后这个空窗
+        #   **2 分 7 秒** (16:20:35 systemd 起 bt-hid → 16:22:42 profile 才注册完),
+        #   手机在这段时间点 K230-CAST ⇒ SDP 里没有 HID 服务 ⇒ iOS 弹「配对不成功」。
+        #   ⇒ 先 Discoverable=False, 等 profile 注册成功的回调里再开 (见 _hid_ready)。
+        self._props = props
+        for k, v in (("Powered", dbus.Boolean(True)),
+                     ("Pairable", dbus.Boolean(True)),
+                     ("PairableTimeout", dbus.UInt32(0)),
+                     ("DiscoverableTimeout", dbus.UInt32(0)),
+                     ("Discoverable", dbus.Boolean(False)),
+                     ("Alias", dbus.String(self.args.name))):
+            try:
+                props.Set("org.bluez.Adapter1", k, v)
+            except dbus.exceptions.DBusException as e:
+                log("适配器 %s 设置失败 (可忽略): %s" % (k, e.get_dbus_name()))
+        self._set_coad()
+
+        self.agent = PairAgent(self.bus, AGENT_PATH)
+        try:
+            mgr = dbus.Interface(self.bus.get_object("org.bluez", "/org/bluez"),
+                                 "org.bluez.AgentManager1")
+            mgr.RegisterAgent(AGENT_PATH, AGENT_CAPABILITY)
+            mgr.RequestDefaultAgent(AGENT_PATH)
+            log("✓ 配对代理已注册 (%s)" % AGENT_CAPABILITY)
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 配对代理注册失败: %s" % e)
+
+        self.loop = GLib.MainLoop()
+        self.hid = ClassicHidDevice(self.bus, self.args.name,
+                                   on_ready=self._hid_ready)
+        self.hid.on_peer = self._on_peer
+        self.hid.on_hup = self._on_peer_gone
+        # ★ 2026-11-05: 这两个标志**不能**在这里置 True —— profile 的注册是
+        #   `RegisterProfile` 的**异步**回调, 这里置 True 会让 /run/k230-bt-hid.status
+        #   提前报 `注册=是`, 上游脚本 (k230-ui-mode.sh 的 bt_wait_hid_ready) 据此
+        #   误判"HID 已就绪"而提前开可被发现 ⇒ 又回到"手机看得见但配不上"。
+        #   现在真正在 _hid_ready() (注册成功回调) 里置位。
+        self.registered = False
+        self.adv_on = False
+        return True
+
+    def _on_peer(self, addr):
+        """对端连上 HID 中断通道 ⇒ 按机型选反控通路 (安卓触摸 / 苹果鼠标)。
+
+        现场依据 (2026-11-05): 同一个描述符里两套接口, 安卓把 Report ID 4 当触摸屏
+        (点哪是哪, 边缘手势原生可用), iOS 只把鼠标报告变成辅助触控球 (需要相对位移
+        + 每次重锚)。写死任何一种都会让另一半不能用, 所以连上时按对端判一次。
+        """
+        props = self._device_props(addr)
+        name = str(props.get("Name") or props.get("Alias") or "")
+        modalias = str(props.get("Modalias") or "")
+        klass = int(props.get("Class") or 0)
+        mode, why = classify_peer(name=name, modalias=modalias, klass=klass, addr=addr)
+        self.peer_name, self.peer_mode, self.peer_why = name, mode, why
+        self._peer_seen = True
+        self._gone_since = None
+        self._keepalive_start()
+        if self.touch is None:
+            log("对端 %s → %s (%s), 但没接触摸屏" % (name or addr, mode, why))
+            return
+        # 环境变量仍可强制 (自测/现场应急), 但只作为覆盖, 不是默认行为
+        force = os.environ.get("K230_BT_HID_TOUCH", "")
+        if force.lower() in ("0", "off", "no"):
+            mode, why = "mouse", "K230_BT_HID_TOUCH=%s 强制鼠标" % force
+        elif force.lower() in ("1", "on", "yes", "touch"):
+            mode, why = "touch", "K230_BT_HID_TOUCH=%s 强制触摸" % force
+        log("对端 %s (Class 0x%06x%s) ⇒ 反控走 %s: %s"
+            % (name or addr, klass,
+               (" / " + modalias) if modalias else "",
+               "HID绝对触摸" if mode == "touch" else "鼠标指针", why))
+        self.touch.set_tp(mode == "touch", why)
+        self.dump_status()
+
+    def _on_peer_gone(self):
+        """对端断开中断通道 ⇒ 停保活 + 刷新状态文件 (别留着上一台的 `对端=`)。"""
+        self._keepalive_stop()
+        if self._gone_since is None:
+            self._gone_since = time.monotonic()
+            log("📴 链路断了: 手机侧挂断, 我们只能等它重连 (不主动重连的原因见 _link_note)")
+        self.peer_name, self.peer_mode, self.peer_why = "", "", ""
+        if self.hid is not None:
+            self.hid.stats["peer"] = ""      # `对端=` 取自这里, 不清就一直是上一台
+        self.dump_status()
+
+    def _keepalive_start(self):
+        """连上之后开始"空转"保活: 每 KEEPALIVE_MS 发一条无操作报告。
+
+        手机侧空闲 ~4 s 就把链路降进 Sniff / Subrating, 后果实测有两条:
+        ① 第一下触摸要等链路醒来 (24 ms, 建立 subrating 后 223 ms);
+        ② 彻底没流量约 3 min 后手机以 reason=8 (Connection Timeout) 断链 ——
+           现场表现就是"用着用着就不动了"。慢一点的固定心跳比"断链 + 重连"划算。
+        """
+        ms = int(getattr(self, "ka_ms", KEEPALIVE_MS) or 0)
+        if ms <= 0 or getattr(self, "_ka_src", None) is not None:
+            return
+        self._ka_src = GLib.timeout_add(ms, self._keepalive_cb)
+
+    def _keepalive_stop(self):
+        if getattr(self, "_ka_src", None) is not None:
+            try:
+                GLib.source_remove(self._ka_src)
+            except Exception:  # noqa: BLE001
+                pass
+            self._ka_src = None
+
+    def _keepalive_cb(self):
+        h = self.hid
+        if h is None or getattr(h, "int_conn", None) is None:
+            self._ka_src = None       # 对端没了: 停表, 下次连上再起
+            return False
+        t = getattr(self, "touch", None)
+        # 手势进行中 / 还有没发完的位移 ⇒ 这一轮跳过, 绝不往手势里插报告
+        if t is not None and (t.active() or getattr(t, "pending", None)
+                              or abs(getattr(t, "acc_dx", 0)) >= 1
+                              or abs(getattr(t, "acc_dy", 0)) >= 1):
+            return True
+        try:
+            if t is not None and getattr(t, "tp_on", False):
+                # 触摸模式: 全抬指 (= 没有任何手指) 是无操作; 发鼠标报告会让安卓多出一个指针。
+                # ★ 2026-11-06: 抬起帧要发**最近用过的那两个 Contact ID**, 不能写死 0/1 ——
+                #   cid 现在轮转了, 手势卡在 cid=17 时, 「保活一直抬 0/1」只会让 iOS 更加
+                #   确信 17 号触点还按着; 每 500 ms 抬一次真正用过的 cid 才能自愈。
+                ids = list(getattr(t, "_last_cids", []) or [])[:2]
+                while len(ids) < 2:
+                    ids.append(len(ids))
+                h.touch_report((0, 0, ids[0], 0, 0, 0),
+                               (0, 0, ids[1], 0, 0, 0), kind="ka")
+            else:
+                h.mouse(0, 0, 0, 0)
+            self._ka_sent = getattr(self, "_ka_sent", 0) + 1
+        except Exception as e:  # noqa: BLE001
+            log("⚠ 保活发送失败: %s" % e)
+        return True
+
+    def _device_props(self, addr):
+        """读 BlueZ 里这台设备的属性 (Name/Class/Modalias); 读不到就返回空。"""
+        if not self.bus or not addr:
+            return {}
+        path = "/org/bluez/hci0/dev_" + str(addr).upper().replace(":", "_")
+        try:
+            p = dbus.Interface(self.bus.get_object("org.bluez", path),
+                               "org.freedesktop.DBus.Properties")
+            d = p.GetAll("org.bluez.Device1")
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 读对端属性失败 (%s): %s" % (path, e.get_dbus_name()))
+            return {}
+        return {str(k): (v if not isinstance(v, dbus.Boolean) else bool(v))
+                for k, v in d.items()}
+
+    def _hid_ready(self):
+        """HID profile 真的注册完之后, 才把"可被发现"打开 (2026-11-05 根因 4)。
+
+        顺序反了的现场代价: 重启后适配器先上电广播 2 分 7 秒, 手机点 K230-CAST
+        时 SDP 里还没有 0x1124 ⇒ iOS 弹「配对不成功」。所以宁可晚几秒被发现。
+        """
+        self.registered = True
+        self.adv_on = True
+        self.dump_status()      # 立刻落一次真实状态 (别让上游等 3 s 那个定时 tick)
+        try:
+            self._props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
+            self._props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
+            self._props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
+            self._props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+            self._props.Set("org.bluez.Adapter1", "Alias",
+                            dbus.String(self.args.name))
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 开可发现失败 (手机可能搜不到): %s" % e.get_dbus_name())
+            return
+        log("✓ HID 已就绪, 现在才开放可被发现 (此刻手机点 %s 才配得上)" % self.args.name)
+
+    # ---------- GATT + 广播 + 配对
+    def setup_bluetooth(self):
+        self.bus = dbus.SystemBus()
+        try:
+            with open(NAME_FILE, "w", encoding="utf-8") as f:
+                f.write(self.bus.get_unique_name() + "\n")
+        except OSError:
+            pass
+        adapter = self.bus.get_object("org.bluez", ADAPTER)
+        props = dbus.Interface(adapter, "org.freedesktop.DBus.Properties")
+        for k, v in (("Powered", dbus.Boolean(True)),
+                     ("Pairable", dbus.Boolean(True)),
+                     ("PairableTimeout", dbus.UInt32(0)),
+                     ("Alias", dbus.String(self.args.name))):
+            try:
+                props.Set("org.bluez.Adapter1", k, v)
+            except dbus.exceptions.DBusException as e:
+                log("适配器 %s 设置失败 (可忽略): %s" % (k, e.get_dbus_name()))
+
+        app = GattApp(self.bus)
+        self.app = app
+        self.hid = HidDevice(self.bus, app, self.args.name,
+                             encrypt=not self.args.no_encrypt)
+
+        # 配对代理
+        self.agent = PairAgent(self.bus, AGENT_PATH)
+        try:
+            mgr = dbus.Interface(self.bus.get_object("org.bluez", "/org/bluez"),
+                                 "org.bluez.AgentManager1")
+            mgr.RegisterAgent(AGENT_PATH, AGENT_CAPABILITY)
+            mgr.RequestDefaultAgent(AGENT_PATH)
+            log("✓ 配对代理已注册 (%s)" % AGENT_CAPABILITY)
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 配对代理注册失败: %s" % e)
+
+        self.loop = GLib.MainLoop()
+        gatt = dbus.Interface(adapter, "org.bluez.GattManager1")
+
+        def ok():
+            log("✓ GATT 应用已注册: %d 服务 / %d 特征 / %d 描述符"
+                % (len(app.services), len(app.chars), len(app.descs)))
+            self.registered = True
+            self.register_adv()
+
+        def err(e):
+            log("✗ GATT 应用注册失败: %s" % e)
+            if self.loop:
+                GLib.timeout_add(500, self.loop.quit)
+
+        gatt.RegisterApplication(APP_PATH, {}, reply_handler=ok, error_handler=err)
+        return True
+
+    def register_adv(self):
+        # ★ 2026-11-04 现场抓 HCI 发现: 原来广播数据里**没有 Flags AD (0x01)** ——
+        #   btmon 里只有 0x1812 / Appearance / TX power 三段。
+        #   BLE 规范里 "可被发现" 就是靠 Flags 的 bit1 (LE General Discoverable Mode);
+        #   手机/PC 的蓝牙列表会据此过滤, 没有这一段的设备**不会出现在列表里** (或要点
+        #   "显示所有设备" 才看得到)。本板控制器/BlueZ 都不会自动补, 必须显式要求。
+        #   两处一起给 (缺一不可):
+        #     ① "Discoverable": True  → BlueZ 在该广告的 AD 里补 02 01 06
+        #     ② adapter 的 Discoverable → 让它同时满足 BR/EDR + LE 的可见性语义
+        adv_props = {
+            "Type": dbus.String("peripheral"),
+            "ServiceUUIDs": dbus.Array([UUID_HID], signature="s"),
+            "LocalName": dbus.String(self.args.name),
+            "Appearance": dbus.UInt16(0x03C2),       # Mouse
+            "Includes": dbus.Array(["tx-power"], signature="s"),
+            "Discoverable": dbus.Boolean(True),
+        }
+        try:
+            props = dbus.Interface(
+                self.bus.get_object("org.bluez", ADAPTER),
+                "org.freedesktop.DBus.Properties")
+            # ⚠ 必须 **False**: 一旦 classic 可被发现, 手机 (Android) 会按
+            # "经典蓝牙 HID" 去连 (logcat: `BTA_HH_OPN_EVT status=7` 失败), 而 Linux
+            # 内核只有经典 HID host 端, 我们提供不了 classic HID SDP 记录 ⇒ 配对成功
+            # 但永远订阅不到报备。保持 False, 让手机只能通过 LE 广播发现我们,
+            # 从而走 bta_hh_le (HOGP) 这条正确路径。
+            props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(False))
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 适配器 Discoverable 设置失败: %s" % e)
+        self.adv = Adv(self.bus, ADV_PATH, adv_props)
+        mgr = dbus.Interface(self.bus.get_object("org.bluez", ADAPTER),
+                             "org.bluez.LEAdvertisingManager1")
+
+        def ok():
+            self.adv_on = True
+            log("✓ 广播已开: 名字=%s (手机上蓝牙列表里找它配对)" % self.args.name)
+
+        def err(e):
+            log("✗ 广播注册失败: %s" % e)
+            # 2026-11-04 实测: fake CSR 被残留广播卡住时就是 Busy (-16 / EBUSY),
+            # 手机端完全扫不到; 必须重载 btusb 才能清掉 → 直接把下一步告诉操作员。
+            log("   → 若提示 Busy/Failed to register advertisement: 跑 "
+                "`k230-bt-hid reset` 然后 systemctl restart k230-bt-hid")
+
+        mgr.RegisterAdvertisement(ADV_PATH, {}, reply_handler=ok, error_handler=err)
+
+    # ---------- 触摸
+    def open_evdev(self):
+        if self.args.no_input:
+            log("--no-input: 不读触摸屏")
+            return
+        try:
+            self.ev_fd = os.open(self.args.evdev, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            log("⚠ 打不开触摸 %s: %s (只跑控制管道)" % (self.args.evdev, e))
+            return
+        self.touch = TouchMouse(self.hid, sens=self.args.sens, mode=self.args.mode)
+        # 真守护进程 (含 SINK 自测) 都会跑 GLib 主循环 ⇒ 压后的"抬起"定时器才发得出去。
+        # 单元测试直接 new TouchMouse, 这个标志保持 False, 抬起仍是同步发 (老行为)。
+        self.touch.loop_ready = True
+        self.ev_watch = GLib.io_add_watch(self.ev_fd, GLib.PRIORITY_DEFAULT,
+                                          GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP, self.on_evdev)
+        log("✓ 触摸已接: %s (模式=%s%s%s)"
+            % (self.args.evdev, self.args.mode,
+               "" if self.args.mode == "abs" else " 灵敏度 x%.1f" % self.args.sens,
+               " 反控=按对端自动 (iOS/安卓绝对触摸, macOS 鼠标指针)"))
+        # ★ 2026-11-06 「用一阵子突然反控不了」的自愈: GLib 的回调只要抛一次异常,
+        #   对应的 source 就会被**自动摘掉**, 而服务本身照样 active、状态行照样好看 ——
+        #   之后 evdev 再没人读, 表现就是"突然全没了" (2026-11-05 00:13:44 就是这么死的)。
+        #   这里每 5 s 确认 source 还在, 不在了就重挂, 并把次数记进 tpdiag。
+        self.ev_watch = self.ev_watch
+        GLib.timeout_add(5000, self._ev_watchdog)
+
+    def _ev_watchdog(self):
+        try:
+            alive = GLib.MainContext.default().find_source_by_id(self.ev_watch) is not None
+        except Exception:            # noqa: BLE001
+            alive = True             # 老版本 GLib 没有这个 API: 不折腾
+        if not alive:
+            self.ev_readd += 1
+            log("⚠ evdev 监听被摘掉了 (第 %d 次) —— 重新挂上 %s"
+                % (self.ev_readd, self.args.evdev))
+            try:
+                self.ev_watch = GLib.io_add_watch(
+                    self.ev_fd, GLib.PRIORITY_DEFAULT,
+                    GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP, self.on_evdev)
+            except Exception as e:   # noqa: BLE001
+                log("✗ 重挂 evdev 失败: %s" % e)
+        return True
+
+    def on_evdev(self, fd, cond):
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            return True
+        if not data:
+            return True
+        self.ev_buf += data
+        n = len(self.ev_buf) // EV_SZ
+        for i in range(n):
+            # ★ 2026-11-05 修复: 原来写死 struct.unpack("<IIHHi", 24 B 切片),
+            #   而 "<IIHHi" 只有 16 B —— K230 是 riscv64, kernel struct input_event
+            #   的 timeval 是 2×8 B ⇒ 每条事件 24 B。切片 24 B 喂给 16 B 格式,
+            #   struct 直接抛 "unpack requires a buffer of 16 bytes", 而且
+            #   ev_buf 在异常后不会截断 ⇒ 触摸反控从此全死 (现场 00:13:44 那一条)。
+            # ★ 2026-11-06: 再套一层 try —— 任何一条坏事件都**只丢这一条**。
+            #   裸抛会让异常冲出 GLib 回调, io_add_watch 被自动摘掉: 服务还 active、
+            #   状态行一切正常, 但 evdev 从此没人读 ⇒ "用着用着突然就失控了"。
+            try:
+                sec, usec, typ, code, value = struct.unpack(
+                    EV_FMT, self.ev_buf[i * EV_SZ:(i + 1) * EV_SZ])
+            except struct.error as e:
+                self.ev_bad += 1
+                self._log_send_err("unpack", e)
+                continue
+            ts = sec + usec / 1e6
+            if self.touch_gate():
+                try:
+                    self.touch.feed(typ, code, value, ts)
+                except Exception as e:  # noqa: BLE001
+                    self._log_send_err("feed", e)
+        self.ev_buf = self.ev_buf[n * EV_SZ:]
+        self.ev_seen += n
+        # ★ 一批事件处理完才真正定位一次 (见 TouchMouse._pos_abs 的注释)
+        # ⚠ 2026-11-05 板上实测: 这里以前裸调, 一旦发报告抛异常 (当时是 stats 少了
+        #   'touch' 键 → KeyError), 异常就冲出 GLib 回调 —— 抬手那条报告发不出去,
+        #   手机侧触点永远卡在"按下", 30 s 后 iOS 直接把中断通道重置 (反控彻底失效)。
+        #   发送是"尽力而为": 出错只记一次日志, 绝不中断事件循环。
+        try:
+            self.touch.commit()
+        except Exception as e:  # noqa: BLE001
+            self._log_send_err("commit", e)
+        return True
+
+    def _log_send_err(self, where, e):
+        """限流记错误 (同一类错误 10 s 最多一条), 避免触摸时刷爆日志。"""
+        now = time.time()
+        key = "%s:%s" % (where, type(e).__name__)
+        if now - self._send_err_t.get(key, 0.0) < 10.0:
+            return
+        self._send_err_t[key] = now
+        log("⚠ 触摸发送出错 (%s): %s: %s" % (where, type(e).__name__, e))
+
+    # ---------- 控制管道
+    def open_fifo(self):
+        d = os.path.dirname(FIFO) or "/tmp"
+        os.makedirs(d, exist_ok=True)
+        if not os.path.exists(FIFO):
+            os.mkfifo(FIFO, 0o666)
+        os.chmod(FIFO, 0o666)
+        self.fifo_fd = os.open(FIFO, os.O_RDWR | os.O_NONBLOCK)
+        GLib.io_add_watch(self.fifo_fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.on_fifo)
+        log("✓ 控制管道: %s" % FIFO)
+
+    def on_fifo(self, fd, cond):
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            return True
+        for line in data.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self.exec_cmd(line)
+            except Exception as e:  # noqa: BLE001
+                log("命令失败 (%s): %s" % (line, e))
+        return True
+
+    def exec_cmd(self, line):
+        p = line.split()
+        op = p[0].lower()
+        h = self.hid
+        if op == "move" and len(p) >= 3:
+            h.mouse(getattr(h, "buttons", 0), float(p[1]), float(p[2]), 0)
+        elif op == "wheel" and len(p) >= 2:
+            h.mouse(0, 0, 0, int(float(p[1])))
+        elif op == "click":
+            btn = {"left": 1, "right": 2, "middle": 4}.get(p[1] if len(p) > 1 else "left", 1)
+            n = int(p[2]) if len(p) > 2 else 1
+            for _ in range(max(1, n)):
+                h.mouse(btn, 0, 0, 0)
+                h.mouse(0, 0, 0, 0)
+        elif op in ("down", "up"):
+            btn = {"left": 1, "right": 2, "middle": 4}.get(p[1] if len(p) > 1 else "left", 1)
+            if op == "down":
+                h.buttons = getattr(h, "buttons", 0) | btn
+            else:
+                h.buttons = getattr(h, "buttons", 0) & ~btn
+            h.mouse(h.buttons, 0, 0, 0)
+        elif op == "key" and len(p) >= 2:
+            usage = int(p[1], 0)
+            act = p[2] if len(p) > 2 else "tap"
+            mod = int(p[3], 0) if len(p) > 3 else 0      # 0x08=Cmd 0x02=Shift ...
+            if act == "tap":
+                h.key_tap(usage, mod)
+            elif act == "down":
+                h.key(mod, [usage])
+            else:
+                h.key(0, [])
+        elif op == "touch" and len(p) >= 2:
+            # touch on|off|auto —— 运行时切换「HID 绝对触摸 / 鼠标指针」
+            #   on   = 强制触摸 (安卓/Windows)
+            #   off  = 强制鼠标指针 (iOS)
+            #   auto = 按当前对端重新判定 (默认行为, 一般不用手动叫)
+            if self.touch is None:
+                raise ValueError("没有触摸屏 (--no-input)")
+            arg = p[1].lower()
+            if arg in ("auto", "1a"):
+                addr = str((h.stats or {}).get("peer") or "")
+                if not addr or addr == "?":
+                    raise ValueError("现在没有对端 (HID 没连上), 没法自动判定")
+                self._on_peer(addr)
+                return
+            on = arg in ("on", "1", "yes", "true")
+            self.touch.set_tp(on, "FIFO touch %s" % arg)
+        elif op in ("tptap", "tpmove") and len(p) >= 3:
+            # tptap <u> <v> 归一化绝对触摸单击 | tpmove <px> <py> 只落触点
+            ap = self.abs_ptr()
+            if not ap.read_geom():
+                raise ValueError("没有 %s (现在不是投屏会话?)" % GEOM_FILE)
+            cw, ch = ap.geom[6:8]
+            if op == "tptap":
+                tu, tv = float(p[1]), float(p[2])
+            else:
+                tu, tv = float(p[1]) / cw, float(p[2]) / ch
+            lx = int(round(clamp(tu, 0.0, 1.0) * TP_LOGICAL_MAX))
+            ly = int(round(clamp(tv, 0.0, 1.0) * TP_LOGICAL_MAX))
+            cid = self.next_tp_cid()
+            other = (cid + 1) & 0x1F
+            h.touch_report((1, 1, cid, 1, lx, ly), (0, 0, other, 0, 0, 0))
+            if op == "tptap":
+                time.sleep(0.06)
+                # 抬起帧坐标停在原地 (不是 0,0): 报告里"坐标跳回左上角 + 同时释放"
+                # 可能被 iOS 当成一次猛的上滑 (真机表现: 拉出通知中心)。
+                for _ in range(TP_REL_REPEAT):
+                    h.touch_report((0, 0, cid, 0, lx, ly), (0, 0, other, 0, lx, ly))
+                    time.sleep(0.015)
+        elif op == "tprelease":
+            # tprelease [n] —— 把所有 Contact ID (0..31) 各发一遍"抬起", 共 n 轮 (默认 2)。
+            # 用途: 手机已经"以为手指还按着"(单击变长按) 时强行结束掉所有可能的 contact。
+            # 关键点是**逐个 ID 发**: 只发 cid=0 的抬起, 对"卡在 cid=7"的手势毫无作用
+            # (2026-11-06 试过, 弹窗纹丝不动)。不发任何按下, 不会误触。
+            rounds = int(float(p[1])) if len(p) > 1 else 2
+            rounds = max(1, min(8, rounds))
+            for _ in range(rounds):
+                for i in range(0, 32, 2):
+                    h.touch_report((0, 0, i, 0, 0, 0), (0, 0, i + 1, 0, 0, 0), kind="rel")
+                    time.sleep(0.012)
+            log("[tprelease] 已清空全部 32 个 Contact ID × %d 轮 (总发送=%d)"
+                % (rounds, h.stats.get("touch", 0)))
+        elif op == "tpev":
+            # tpev tap <u> <v> [按住ms] —— 把一次点击**从 evdev 事件入口**灌进去。
+            # 与 tptap 的关键区别: tptap 直接 fwrite 报告, 走不到 TouchState 的那套
+            # 时序逻辑 (TP_MIN_INTERVAL 限频 / TP_MIN_HOLD_MS 压后抬起 / 指纹去重 /
+            # 槽位沿用坐标)。真机手指走的是后者。
+            # ⇒ 同一个目标分别用 tptap 和 tpev 打, 就能判定问题出在
+            #   "报告内容/协议" 还是 "事件→报告的时序"。
+            if self.touch is None:
+                raise ValueError("没有触摸屏 (--no-input)")
+            if len(p) < 4 or p[1].lower() != "tap":
+                raise ValueError("用法: tpev tap <u> <v> [按住ms]")
+            ap = self.abs_ptr()
+            if not ap.read_geom():
+                raise ValueError("没有 %s (现在不是投屏会话?)" % GEOM_FILE)
+            # 面板坐标系 (geom 的前 4 个数) 才是 evdev 的坐标空间, 不是内容区
+            g = ap.geom
+            pw, ph = (g[2] or 480.0), (g[3] or 800.0)
+            px = int(round(clamp(float(p[2]), 0.0, 1.0) * pw))
+            py = int(round(clamp(float(p[3]), 0.0, 1.0) * ph))
+            hold_ms = float(p[4]) if len(p) > 4 else 80.0
+            t = self.touch
+            ts = time.time()
+            t.feed(EV_ABS, ABS_MT_TRACKING_ID, 100, ts)
+            t.feed(EV_ABS, ABS_MT_POSITION_X, px, ts)
+            t.feed(EV_ABS, ABS_MT_POSITION_Y, py, ts)
+            t.feed(EV_KEY, BTN_TOUCH, 1, ts)
+            t.feed(EV_SYN, SYN_REPORT, 0, ts)
+            time.sleep(max(0.005, hold_ms / 1000.0))
+            ts = time.time()
+            t.feed(EV_ABS, ABS_MT_TRACKING_ID, -1, ts)
+            t.feed(EV_KEY, BTN_TOUCH, 0, ts)
+            t.feed(EV_SYN, SYN_REPORT, 0, ts)
+            log("[tpev] 模拟面板点击 面板=(%d,%d) 按住=%.0f ms (总发送=%d)"
+                % (px, py, hold_ms, h.stats.get("touch", 0)))
+        elif op == "tpdiag":
+            # tpdiag —— 一次把触摸这条路的内部状态全打出来。现场"突然反控不了"时先跑它:
+            #   面板还有没有在出事件 / 几何读不读得到 / 有没有卡住的触点 / 报告发没发出去。
+            t = self.touch
+            if t is None:
+                log("[tpdiag] 没有触摸屏 (--no-input)")
+                raise ValueError("没有触摸屏")
+            st = h.stats
+            go = "无"
+            try:
+                with open(GEOM_FILE, encoding="utf-8") as f:
+                    go = f.read().strip()
+            except OSError as e:
+                go = "读不到 (%s)" % e
+            now = time.monotonic()
+            idle = (now - t.tp_ev_t) if t.tp_ev_t else -1.0
+            log("[tpdiag] 触摸=%s 反控=%s 对端=%s 端=%s"
+                % ("开" if t.tp_on else "关",
+                   "HID绝对触摸" if t.tp_on else "鼠标指针",
+                   st.get("peer") or "-", st.get("peer_name") or "-"))
+            log("[tpdiag] 几何=%s" % go)
+            log("[tpdiag] 面板事件=%d 最后事件=%.1f s 前 坏事件=%d 重挂监听=%d"
+                % (t.tp_ev, idle, self.ev_bad, self.ev_readd))
+            log("[tpdiag] 报告: 按下=%d 抬起=%d 总=%d 被挡=%d 慢发=%d 缺轴=%d 几何失败=%d"
+                % (t.tp_press, t.tp_lift, st.get("touch", 0), st.get("blocked", 0),
+                   st.get("slow", 0), t.tp_noaxis, t.tp_geom_fail))
+            if not t.slots:
+                log("[tpdiag] 槽位: 空")
+            for k in sorted(t.slots):
+                s = t.slots[k]
+                age = (time.time() - (s.get("t0") or 0)) if s.get("t0") else 0.0
+                log("[tpdiag] 槽%d down=%s cid=%s xy=(%s,%s) 按住=%.1f s tid=%s"
+                    % (k, "是" if s.get("down") else "否", s.get("cid"),
+                       s.get("x"), s.get("y"), age, s.get("tid")))
+            log("[tpdiag] 待发=%s 抬起压后=%s 去重指纹=%s 存活触点=%s"
+                % ("有" if t.pending is not None else "无",
+                   ("定时器#%d" % t._rel_src) if t._rel_src else "无",
+                   "有" if t._tp_key is not None else "无", t._tp_live))
+            log("[tpdiag] 保活=%d 间隔=%d ms 传输=%s 注册=%s"
+                % (st.get("ka", 0), self.ka_ms,
+                   "经典" if self.transport == "classic" else "BLE",
+                   "是" if self.registered else "否"))
+        elif op == "tplog":
+            # tplog [n] —— 打印最近 n 条触摸报告 (默认 40) 和每次手势的按下→抬起间隔。
+            # 用途: 真机说"单击变长按"时, 直接看间隔是不是 >500 ms。
+            n = int(float(p[1])) if len(p) > 1 else 40
+            ring = getattr(self.touch, "tp_ring", []) if self.touch else []
+            sel = ring[-max(2, min(400, n)):]
+            down_t = None
+            down_xy = (0, 0)          # ★ 摘要行要打**按下**那条的坐标 (以前打了抬手那条的全 0)
+            prev = None
+            for (tt, t0, t1, x0, y0, nf) in sel:
+                dt = 0.0 if prev is None else (tt - prev) * 1000.0
+                prev = tt
+                if t0 == 1 and down_t is None:
+                    down_t = tt
+                    down_xy = (x0, y0)
+                elif t0 == 0 and down_t is not None:
+                    log("[tplog] 手势 %5.0f ms  (%d,%d) → 抬手  间隔=%4.0f ms"
+                        % ((tt - down_t) * 1000.0, down_xy[0], down_xy[1], dt))
+                    down_t = None
+                log("[tplog] +%4.0f ms tip=%d/%d 触点=(%d,%d) 手指=%d"
+                    % (dt, t0, t1, x0, y0, nf))
+            st = h.stats
+            log("[tplog] 总发送=%d 慢发(>30ms)=%d 最长=%d ms 被挡=%d 缺轴丢帧=%d"
+                % (st.get("touch", 0), st.get("slow", 0), st.get("slowms", 0),
+                   st.get("blocked", 0), getattr(self.touch, "tp_noaxis", 0)))
+        elif op == "tpswipe" and len(p) >= 5:
+            # tpswipe <u> <v0> <v1> [步数] —— 归一化竖直滑动 (测边缘手势: 底部上滑)
+            ap = self.abs_ptr()
+            if not ap.read_geom():
+                raise ValueError("没有 %s (现在不是投屏会话?)" % GEOM_FILE)
+            u, v0, v1 = float(p[1]), float(p[2]), float(p[3])
+            n = int(float(p[4])) if len(p) > 4 else 14
+            n = max(2, min(60, n))
+            cid = self.next_tp_cid()
+            other = (cid + 1) & 0x1F
+
+            def _tp(uu, vv):
+                lx = int(round(clamp(uu, 0.0, 1.0) * TP_LOGICAL_MAX))
+                ly = int(round(clamp(vv, 0.0, 1.0) * TP_LOGICAL_MAX))
+                h.touch_report((1, 1, cid, 1, lx, ly), (0, 0, other, 0, 0, 0))
+            _tp(u, v0)
+            time.sleep(0.05)
+            for i in range(1, n + 1):
+                _tp(u, v0 + (v1 - v0) * i / float(n))
+                time.sleep(0.016)
+            time.sleep(0.05)
+            lx = int(round(clamp(u, 0.0, 1.0) * TP_LOGICAL_MAX))
+            ly = int(round(clamp(v1, 0.0, 1.0) * TP_LOGICAL_MAX))
+            for _ in range(TP_REL_REPEAT):
+                h.touch_report((0, 0, cid, 0, lx, ly), (0, 0, other, 0, lx, ly))
+                time.sleep(0.015)
+        elif op in ("tap", "at") and len(p) >= 3:
+            # tap <u> <v> 归一化 (0~1) 定位并点击 | at <px> <py> 只定位不点
+            ap = self.abs_ptr()
+            if not ap.read_geom():
+                raise ValueError("没有 %s (现在不是投屏会话?)" % GEOM_FILE)
+            cw, ch = ap.geom[6:8]
+            if op == "tap":
+                tx, ty = float(p[1]) * cw, float(p[2]) * ch
+            else:
+                tx, ty = float(p[1]), float(p[2])
+            ap.goto(tx, ty)
+            if op == "tap":
+                time.sleep(0.02)
+                h.mouse(0x01, 0, 0, 0)
+                h.mouse(0x00, 0, 0, 0)
+            log("定位%s → (%.0f, %.0f) px | %s"
+                % ("+点击" if op == "tap" else "", tx, ty, ap.describe()))
+        elif op == "reanchor":
+            ap = self.abs_ptr()
+            if not ap.read_geom():
+                raise ValueError("没有 %s (现在不是投屏会话?)" % GEOM_FILE)
+            ap.clamp()
+            log("已重新锚定指针到内容区左上角 | %s" % ap.describe())
+        elif op == "dc":
+            # dc —— 主动断开所有"BlueZ 标着 Connected"的蓝牙连接。
+            # 2026-11-05 现场: 服务 restart 后手机 ACL 还挂着, BlueZ 的 dev->connected
+            # 一直是 true ⇒ 手机再点连接会被 device_add_connection() 直接忽略
+            # ("already marked as connected"), 表现就是"连不上蓝牙"。
+            self._drop_stale_links("手动 dc")
+        elif op == "cal":
+            log(("绝对定位: " + self.touch.ap.describe()) if (self.touch and self.touch.ap)
+                else "绝对定位未启用 (mode=%s)" % (self.touch.mode if self.touch else "无触摸"))
+        elif op == "cidmode" and len(p) >= 2:
+            # cidmode fixed|rotate —— 运行时切 Contact ID 策略 (A/B 用, 不用重启断链)
+            global CID_MODE
+            arg = p[1].lower()
+            CID_MODE = arg if arg in ("fixed", "slot", "rotate") else "slot"
+            log("Contact ID 策略 = %s" % CID_MODE)
+        elif op == "ka" and len(p) >= 2:
+            # ka <ms|off|on> —— 现场调保活间隔 (默认 2000 ms), 不改代码
+            arg = p[1].lower()
+            if arg in ("off", "0", "no"):
+                self._keepalive_stop()
+                self.ka_ms = 0
+                log("保活: 已关闭")
+            else:
+                self.ka_ms = 500 if arg in ("on", "yes") else max(200, int(float(arg)))
+                self._keepalive_stop()
+                self._keepalive_start()
+                log("保活: 每 %d ms 一条 (已发送 %d 条)"
+                    % (self.ka_ms, getattr(self, "_ka_sent", 0)))
+        elif op == "consumer" and len(p) >= 2:
+            h.consumer(int(p[1], 0))
+        elif op == "text":
+            self.type_text(line[len("text"):].strip())
+        elif op == "status":
+            log("状态: " + self.status_line())
+        else:
+            log("未知命令: %s" % line)
+
+    def next_tp_cid(self):
+        """FIFO 直接造手势时用的 Contact ID —— 每次按下换一个。
+
+        真手指的 cid 由 TouchState._abs 轮转分配; tptap/tpswipe 绕过它直接写报告。
+        以前这里恒用 0, 连续两次 tptap 在 iOS 眼里就是"同一个 contact 在移动" ⇒
+        自测会把"工具没换 ID"误判成"iOS 触摸已经卡死" (2026-11-06 实际踩过)。
+        """
+        self._fifo_cid = (self._fifo_cid + 1) & 0x1F
+        return self._fifo_cid
+
+    def abs_ptr(self):
+        """取绝对定位对象; 没启用就抛错 (FIFO 里会打成一行日志)。"""
+        if not self.touch:
+            raise ValueError("触摸没开 (--no-input?)")
+        if self.touch.ap is None:
+            raise ValueError("绝对定位没启用 (mode=%s)" % self.touch.mode)
+        return self.touch.ap
+
+    def type_text(self, text):
+        for ch in text:
+            low = ch.lower()
+            usage = _ASCII_USAGE.get(low if ch.isalpha() else ch)
+            if usage is None:
+                continue
+            mod = 0x02 if (ch in _SHIFT_CHARS or ch.isupper()) else 0
+            self.hid.key_tap(usage, mod)
+            time.sleep(0.01)
+
+    # ---------- 闸门: Miracast 会话说走 UIBC, 别重复
+    def miracast_session_active(self):
+        """Miracast 会话是不是正在进行 —— 判据是 WFD RTSP 端口 (默认 7236) 上有
+        ESTABLISHED 连接, **不是** `systemctl is-active k230-miracast`
+        (那个 unit 是常驻监听, 开机就一直 active, 拿它当判据会让触摸反控被永久关掉;
+        2026-11-04 自测抓到, 改成直接读 /proc/net/tcp{,6})。
+        """
+        port = int(os.environ.get("K230_WFD_RTSP_PORT", "7236"))
+        for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(f, encoding="ascii") as fh:
+                    next(fh, None)
+                    for line in fh:
+                        p = line.split()
+                        if len(p) < 4 or p[3] != "01":     # 01 = TCP_ESTABLISHED
+                            continue
+                        for addr in (p[1], p[2]):
+                            try:
+                                if int(addr.split(":")[1], 16) == port:
+                                    return True
+                            except (IndexError, ValueError):
+                                continue
+            except OSError:
+                continue
+        return False
+
+    def touch_gate(self):
+        mode = self.args.gate
+        if mode == "always":
+            return True
+        if mode == "off":
+            return False
+        now = time.time()
+        if now - self._last_gate < 2.0:
+            return self.touch_enabled
+        self._last_gate = now
+        ok = not self.miracast_session_active()
+        if ok != self.touch_enabled:
+            log("触摸反控%s" % ("打开" if ok else "让给 Miracast 的 UIBC"))
+        self.touch_enabled = ok
+        return ok
+
+    def status_line(self):
+        s = self.hid.stats if self.hid else {}
+        tp = bool(getattr(getattr(self, "touch", None), "tp_on", False))
+        return ("传输=%s 注册=%s 广播=%s 鼠标=%d 触摸报告=%d 慢发=%d/%dms 键盘=%d 多媒体=%d 被挡=%d 保活=%d 触摸=%s 反控=%s 对端=%s 端=%s 链路=%s"
+                % ("经典" if self.transport == "classic" else "BLE",
+                   "是" if self.registered else "否",
+                   "是" if self.adv_on else "否",
+                   s.get("mouse", 0), s.get("touch", 0),
+                   s.get("slow", 0), s.get("slowms", 0),
+                   s.get("key", 0),
+                   s.get("consumer", 0), s.get("blocked", 0),
+                   getattr(self, "_ka_sent", 0),
+                   "开" if self.touch_enabled else "关",
+                   "HID绝对触摸" if tp else "鼠标指针",
+                   s.get("peer") or "-",
+                   self.peer_name or "-",
+                   self._link_note()))
+
+    def _link_note(self):
+        """状态行末尾的「链路=」—— 现场一眼分清三种"反控不了"。
+
+        2026-11-06 排查「挂一会儿突然反控不了」时的结论: 用户看到的现象只有一个
+        (点不动), 但底下有三种完全不同的原因, 以前状态行一律显示正常:
+          ① 控制器死了 (ncmd=0 / hci0 不见) —— 要拔插 dongle;
+          ② 手机单方面挂了 HID (Reason 0x13 Remote User Terminated) —— 只能等手机重连;
+          ③ 链路还连着、报告也在发, 但 iOS 不消费 —— 触摸这条路自己的问题。
+        三种的处理办法完全不同, 所以必须写在状态里, 不能只写日志。
+        """
+        if not self.registered:
+            return "未就绪"
+        if getattr(self.hid, "int_conn", None) is None:
+            if not self._peer_seen and self._gone_since is None:
+                return "等手机连接"
+            secs = int(time.monotonic() - (self._gone_since or time.monotonic()))
+            if secs >= 20:
+                # 手机不会自己回来时全靠这行 —— 主人看 UI 状态行就知道要点手机
+                return "手机已断开%d s(需在手机点%s)" % (secs, self.args.name)
+            return "手机已断开"
+        return "正常"
+
+    def dump_status(self):
+        try:
+            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                f.write(self.status_line() + "\n")
+        except OSError:
+            pass
+
+    def watch_devices(self):
+        try:
+            om = dbus.Interface(self.bus.get_object("org.bluez", "/"),
+                                "org.freedesktop.DBus.ObjectManager")
+            om.connect_to_signal("InterfacesAdded", self._iface_added)
+            om.connect_to_signal("InterfacesRemoved", self._iface_removed)
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 设备事件监听失败: %s" % e)
+
+    def _iface_added(self, path, ifaces):
+        if "org.bluez.Device1" in ifaces and self.hid:
+            p = ifaces["org.bluez.Device1"]
+            name = str(p.get("Name", p.get("Address", path)))
+            self.hid.stats["peer"] = name
+            log("📱 手机出现: %s (%s)" % (name, path))
+
+    def _iface_removed(self, path, ifaces):
+        if "org.bluez.Device1" in ifaces:
+            log("📴 手机移除: %s" % path)
+
+    # ---------- 主循环
+    def _drop_stale_links(self, why=""):
+        """把 BlueZ 里仍标着 Connected 的设备主动断开 (2026-11-05 真根因之一)。
+
+        现场: 15:08 手机连上正常工作; 之后服务被反复 stop/restart (改版频繁),
+        **ACL 没跟着断** —— 手机以为 HID 还连着, BlueZ 的 dev->connected 也一直是 true。
+        15:21~15:23 手机点了 3 次连接, 每次都走 device_add_connection() 的
+        "already marked as connected" 分支被**直接忽略** ⇒ 我们这侧日志一个字都没有,
+        主人看到的就是"连不上蓝牙"。
+
+        所以启动时和退出前都主动断一次: 手机立刻看到"已断开", 下一次点连接才是干净的。
+        """
+        if not self.bus:
+            return
+        try:
+            om = dbus.Interface(self.bus.get_object("org.bluez", "/"),
+                                "org.freedesktop.DBus.ObjectManager")
+            objs = om.GetManagedObjects()
+        except dbus.exceptions.DBusException as e:
+            log("⚠ 清陈旧连接: 取设备列表失败 %s" % e.get_dbus_name())
+            return
+        n = 0
+        for path, ifaces in objs.items():
+            if "/dev_" not in path or "org.bluez.Device1" not in ifaces:
+                continue
+            props = ifaces.get("org.bluez.Device1") or {}
+            if not props.get("Connected"):
+                continue
+            addr = props.get("Address", "?")
+            try:
+                dbus.Interface(self.bus.get_object("org.bluez", path),
+                               "org.bluez.Device1").Disconnect()
+                n += 1
+                log("已断开陈旧连接 %s (%s) —— 手机侧会看到已断开, 可以重新连"
+                    % (addr, why or "?"))
+            except dbus.exceptions.DBusException as e:
+                log("⚠ 断开 %s 失败: %s" % (addr, e.get_dbus_name()))
+        if not n:
+            log("没有陈旧蓝牙连接需要清理 (%s)" % (why or "?"))
+
+    def run(self):
+        if SINK:
+            # 自测模式: 不检查适配器/不碰 BlueZ (板上真守护进程可以同时在跑)。
+            self.bus = None
+            self.hid = ClassicHidDevice(None, self.args.name)
+            self.loop = GLib.MainLoop()
+            self.registered = True
+            self.adv_on = True
+            self.open_evdev()
+            self.open_fifo()
+            log("就绪(自测): 报告只落盘 %s" % SINK)
+            GLib.timeout_add_seconds(3, lambda: True)
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
+                                     lambda *_: (self.loop.quit(), False)[1])
+            self.loop.run()
+            return 0
+        if not self.preflight():
+            return 3
+        if self.transport == "classic":
+            if not self.setup_classic():
+                return 3
+        elif not self.setup_bluetooth():
+            return 3
+        self.open_evdev()
+        self.open_fifo()
+        self.watch_devices()
+        self._drop_stale_links("启动时")
+        log("就绪: 传输=%s 名=%s 反控=%s 闸门=%s (Ctrl-C 退出)"
+            % ("经典(BR/EDR)" if self.transport == "classic" else "BLE(HOGP)",
+               self.args.name,
+               ("HID绝对触摸" if getattr(getattr(self, "touch", None), "tp_on", False)
+                else "绝对定位(abs)" if self.args.mode == "abs"
+                else "相对x%.1f(rel)" % self.args.sens),
+               self.args.gate))
+
+        def tick():
+            self.dump_status()
+            self.touch_gate()
+            return True
+
+        GLib.timeout_add_seconds(3, tick)
+
+        def bye(*_a):
+            log("退出中…")
+            # 退出前把 ACL 也断干净: 否则手机以为还连着, 下次点连接会被 BlueZ 忽略
+            # (见 _drop_stale_links 的说明), 现场 2026-11-05 15:21 就是这么"连不上"的。
+            try:
+                self._drop_stale_links("退出前")
+            except Exception as e:  # noqa: BLE001
+                log("⚠ 退出前断开连接失败: %s" % e)
+            # 状态文件必须删: 否则上游脚本 (k230-ui-mode.sh) 会读到上一轮的
+            # `注册=是` 并据此提前开可被发现 ⇒ "手机看得见但配不上"。
+            try:
+                os.unlink(STATUS_FILE)
+            except OSError:
+                pass
+            if self.loop:
+                self.loop.quit()
+            return False
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, bye)
+        self.loop.run()
+        return 0
+
+
+# ---------------------------------------------------------------- 子命令
+def cmd_run(args):
+    return Daemon(args).run()
+
+
+def cmd_status(_args):
+    try:
+        print("状态文件:", open(STATUS_FILE, encoding="utf-8").read().strip())
+    except OSError:
+        print("状态文件: 无 (%s) —— 服务没跑" % STATUS_FILE)
+    for cmd in (["systemctl", "is-active", "bluetooth"],
+                ["systemctl", "is-active", "k230-bt-hid.service"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            print("%s: %s" % (cmd[-1], out.stdout.strip()))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        out = subprocess.run(["bluetoothctl", "show"], capture_output=True,
+                             text=True, timeout=5)
+        for ln in out.stdout.splitlines():
+            if any(k in ln for k in ("Powered", "Discoverable", "Pairable",
+                                     "Name", "Roles")):
+                print(ln.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.run(["bluetoothctl", "devices"], capture_output=True,
+                             text=True, timeout=5)
+        print("已知设备:")
+        print(out.stdout.strip() or "  (无)")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
+def cmd_send(args):
+    cmd = " ".join(args.cmd).strip()
+    if not cmd:
+        return 2
+    if not os.path.exists(FIFO):
+        print("✗ 管道不存在 (%s): 服务没跑?" % FIFO, file=sys.stderr)
+        return 3
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        print("✗ 打不开管道: %s" % e, file=sys.stderr)
+        return 3
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    finally:
+        os.close(fd)
+    return 0
+
+
+def cmd_selftest(_args):
+    if not os.path.exists(FIFO):
+        print("✗ 服务没跑, 先 k230-bt-hid run", file=sys.stderr)
+        return 3
+    seq = ["move 20 0"] * 20 + ["move 0 20"] * 20
+    seq += ["move -20 0"] * 20 + ["move 0 -20"] * 20
+    seq += ["click", "wheel 2", "wheel -2", "text hi", "status"]
+    for c in seq:
+        cmd_send(argparse.Namespace(cmd=[c]))
+        time.sleep(0.03)
+    print("已发 %d 条自检命令 (手机没订阅时会记 被挡++)" % len(seq))
+    return 0
+
+
+def cmd_dump(_args):
+    bus = dbus.SystemBus()
+    # GATT 对象是 k230-bt-hid 自己 export 的, 挂在**它**那条 system bus 连接上:
+    # 查 org.bluez 的根对象只会看到 bluetoothd 自己的对象 (结果恒为 0)。
+    # 所以先读守护进程落盘的唯一名 (:1.NNN), 再问它要 GetManagedObjects。
+    try:
+        with open(NAME_FILE, encoding="utf-8") as f:
+            owner = f.read().strip()
+    except OSError:
+        print("✗ 读不到 %s —— 服务没跑过? (systemctl status k230-bt-hid)" % NAME_FILE,
+              file=sys.stderr)
+        return 3
+    print("守护进程 bus 名: %s" % owner)
+    obj = bus.get_object(owner, APP_PATH)
+    om = dbus.Interface(obj, "org.freedesktop.DBus.ObjectManager")
+    try:
+        tree = om.GetManagedObjects()
+    except dbus.exceptions.DBusException as e:
+        print("取 GATT 表失败: %s" % e, file=sys.stderr)
+        return 1
+    n = {"svc": 0, "chr": 0, "desc": 0}
+    for path, ifaces in tree.items():
+        if not path.startswith(APP_PATH):
+            continue
+        for iface, props in ifaces.items():
+            if iface == "org.bluez.GattService1":
+                n["svc"] += 1
+                print("SVC  %s  %s" % (str(props.get("UUID"))[:8], path))
+            elif iface == "org.bluez.GattCharacteristic1":
+                n["chr"] += 1
+                print("  CHR %s  flags=%s  %s"
+                      % (str(props.get("UUID"))[:8],
+                         ",".join(str(x) for x in props.get("Flags", [])), path))
+            elif iface == "org.bluez.GattDescriptor1":
+                n["desc"] += 1
+    print("\n合计: %d 服务 / %d 特征 / %d 描述符" % (n["svc"], n["chr"], n["desc"]))
+    return 0
+
+
+def cmd_diag(args):
+    """现场排障: 广播开没开 / 控制器干净不干净 / 手机在不在附近 (RSSI)。
+
+    为什么需要它: BLE 是短距链路, 板子与手机隔着几堵墙时**广播发得再好也扫不到**,
+    现场最容易误判成"代码有问题"。这里直接把周围 LE 设备的最强 RSSI 打出来:
+      ≥ -80 dBm → 射频和距离都 OK, 扫不到就是手机端问题
+      ≤ -90 dBm → 手机离板子太远 (或天线差), 先把手机拿到板子旁边再试
+    """
+    rc = 0
+    print("=== 1) 控制器 ===")
+    if not os.path.isdir("/sys/class/bluetooth/hci0"):
+        print("✗ 没有 hci0 —— 先 modprobe btusb (/etc/modules-load.d/btusb.conf)")
+        return 3
+    try:
+        out = subprocess.run(["hciconfig", "hci0"], capture_output=True, text=True,
+                             timeout=5).stdout
+        for ln in out.splitlines()[:4]:
+            print("  " + ln.strip())
+    except (OSError, subprocess.SubprocessError) as e:
+        print("  hciconfig 失败: %s" % e)
+
+    print("=== 2) 适配器 / 广播 ===")
+    try:
+        out = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True,
+                             timeout=6).stdout
+        for ln in out.splitlines():
+            if any(k in ln for k in ("Name:", "Alias:", "Powered:", "Pairable:",
+                                     "Discoverable:", "ActiveInstances",
+                                     "SupportedInstances")):
+                print("  " + ln.strip())
+    except (OSError, subprocess.SubprocessError) as e:
+        print("  bluetoothctl 失败: %s" % e)
+
+    try:
+        st = open(STATUS_FILE, encoding="utf-8").read().strip()
+        print("  服务状态: %s" % st)
+    except OSError:
+        print("  服务状态: 无 (k230-bt-hid 没跑)")
+
+    print("=== 3) 广播参数 (debugfs) ===")
+    for f in ("adv_min_interval", "adv_max_interval"):
+        p = "/sys/kernel/debug/bluetooth/hci0/" + f
+        try:
+            v = open(p).read().strip()
+            print("  %-16s %s  (%.0f ms)" % (f, v, int(v) * 0.625))
+        except (OSError, ValueError):
+            print("  %-16s 读不到" % f)
+
+    print("=== 4) 周围设备信号 (判断手机在不在附近) ===")
+    best, found = None, {}
+    try:
+        bus = dbus.SystemBus()
+        om = dbus.Interface(bus.get_object("org.bluez", "/"),
+                            "org.freedesktop.DBus.ObjectManager")
+        ad = dbus.Interface(bus.get_object("org.bluez", ADAPTER),
+                            "org.bluez.Adapter1")
+
+        def collect():
+            try:
+                tree = om.GetManagedObjects()
+            except dbus.exceptions.DBusException:
+                return
+            for _path, ifs in tree.items():
+                d = ifs.get("org.bluez.Device1")
+                if not d or "RSSI" not in d:
+                    continue
+                addr = str(d.get("Address"))
+                found[addr] = (str(d.get("Name") or "-"), int(d.get("RSSI")),
+                               bool(d.get("Connected", False)))
+
+        started = True
+        try:
+            ad.StartDiscovery()
+        except dbus.exceptions.DBusException as e:
+            started = False
+            print("  ⚠ 启动扫描失败: %s → 跑 k230-bt-hid reset 复位控制器"
+                  % e.get_dbus_name())
+            rc = 1
+        if started:
+            t0 = time.time()
+            while time.time() - t0 < args.seconds:
+                collect()
+                time.sleep(1.0)
+            try:
+                ad.StopDiscovery()
+            except dbus.exceptions.DBusException:
+                pass
+            collect()
+    except dbus.exceptions.DBusException as e:
+        print("  D-Bus 失败: %s" % e)
+        return 3
+
+    for addr, (_name, rssi, _c) in found.items():
+        if best is None or rssi > best:
+            best = rssi
+    print("  扫到 %d 个设备, 最强 RSSI = %s dBm"
+          % (len(found), best if best is not None else "无"))
+    for addr, (name, rssi, conn) in sorted(found.items(), key=lambda kv: -kv[1][1])[:6]:
+        print("    %-18s %-20s %4d dBm %s" % (addr, name[:20], rssi,
+                                              "已连接" if conn else ""))
+    if best is None:
+        print("  ✗ 一个都没扫到: 射频/驱动有问题 (dmesg | grep -i blue)")
+        rc = 1
+    elif best <= -90:
+        print("  ⚠ 最强只有 %d dBm —— 周围设备/手机都在很远的地方 (或天线太差),"
+              " 先把手机拿到板子旁边 (≤1 m) 再测配对" % best)
+        rc = 1
+    elif best <= -80:
+        print("  ○ 信号偏弱 (%d dBm): 能扫到但配对可能不稳, 建议靠近一些" % best)
+    else:
+        print("  ✓ 信号正常 (%d dBm): 手机上蓝牙列表里应该能看到 %s"
+              % (best, DEVICE_NAME))
+    return rc
+
+
+def cmd_reset(_args):
+    """把控制器从"广播 EBUSY / 命令 Disallowed"的死锁里救出来。
+
+    背景 (2026-11-04 实测): 这块 fake CSR (Barrot) 一旦被 ext adv 或裸 HCI 广播
+    留在 enable 状态, 之后 LE Set Ext Adv Params 一律返回 -16 (EBUSY),
+    BlueZ 侧表现就是 `Failed to register advertisement` + ActiveInstances 0x00,
+    连 `LE Set Scan Parameters` 都会 0x0C Command Disallowed。
+    只有 USB 层重载 btusb 才能彻底清掉, power off/on 不够。
+    """
+    steps = [
+        "pkill -f 'k230-bt-hid run'",
+        "systemctl stop bluetooth",
+        "sleep 2",
+        "rmmod btusb",
+        "sleep 2",
+        "modprobe btusb",
+        "sleep 4",
+        "systemctl start bluetooth",
+        "sleep 4",
+    ]
+    for s in steps:
+        r = subprocess.run(["sh", "-c", s], capture_output=True, text=True)
+        note = (r.stdout + r.stderr).strip()
+        print("  $ %-28s %s" % (s, note.splitlines()[-1] if note else "ok"))
+    try:
+        out = subprocess.run(["hciconfig", "hci0"], capture_output=True, text=True,
+                             timeout=5).stdout
+        print("  → " + (out.splitlines()[2].strip() if len(out.splitlines()) > 2 else "?"))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    print("复位完成: 现在重新 k230-bt-hid run (systemctl restart k230-bt-hid)")
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="k230-bt-hid", description="K230 当 BLE HID 外设 (鼠标+键盘) 给手机反控")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("run", help="前台跑 (注册 GATT + 广播 + 读触摸)")
+    p.add_argument("--name", default=DEVICE_NAME)
+    p.add_argument("--evdev", default=EVDEV)
+    p.add_argument("--sens", type=float, default=SENS)
+    p.add_argument("--transport", choices=["classic", "ble"],
+                   default=os.environ.get("K230_BT_HID_TRANSPORT", "classic"),
+                   help="classic=经典蓝牙 HID 设备端 (默认; 本板这支克隆 dongle 的"
+                        " LE 广播是坏的, 只有这条路能通) / ble=BLE HOGP (需要能正常广播的 dongle)")
+    p.add_argument("--no-input", action="store_true", help="不读触摸屏 (只跑控制管道)")
+    p.add_argument("--no-encrypt", action="store_true", help="HID 特征不要求加密 (调试)")
+    p.add_argument("--gate", choices=["unit", "always", "off"], default="unit",
+                   help="触摸闸门: unit=Miracast 在跑就让给 UIBC / always / off")
+    p.add_argument("--mode", choices=["abs", "rel"],
+                   default=os.environ.get("K230_BT_HID_MODE", "abs"),
+                   help="触摸反控模式: abs=归一化绝对定位 (默认; 手指在哪指针就送到哪, "
+                        "需要 /run/wfd-uibc-geom) / rel=相对位移 x sens (老路径, 会漂)")
+    p.set_defaults(func=cmd_run)
+
+    sub.add_parser("status", help="看状态").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("send", help="往控制管道发命令")
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_send)
+
+    sub.add_parser("selftest", help="不用手机的连通性自检").set_defaults(func=cmd_selftest)
+    sub.add_parser("dump", help="打印 BlueZ 侧看到的 GATT 结构").set_defaults(func=cmd_dump)
+
+    p = sub.add_parser("diag", help="现场排障: 广播状态 + 周围 LE RSSI (判断手机在不在附近)")
+    p.add_argument("--seconds", type=int, default=8, help="LE 扫描时长 (默认 8s)")
+    p.set_defaults(func=cmd_diag)
+
+    sub.add_parser("reset", help="广播 EBUSY 急救: 重载 btusb 复位控制器").set_defaults(func=cmd_reset)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

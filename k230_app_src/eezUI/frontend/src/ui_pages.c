@@ -1,17 +1,14 @@
 /**
- * ui_pages.c — 4 个服务二级画布的实现 (中文说明 + 重新连接 + 返回)
+ * ui_pages.c — 4 个服务二级画布的实现 (中文说明 + 开始投屏 + 返回)
  *
- * 交互 (2026-11-07 改版):
- *   主界面点 Miracast  -> pages_show(PAGE_MIRACAST) + be_select("miracast")
- *                         (服务立刻起, 但屏仍归本画布, 不刷黑)
- *   真正出帧           -> 后端停 k230ui, 屏交给 drmplay 刷视频流
- *   视频流断开         -> 后端重新拉起 k230ui, pages_restore() 自动回到本画布
- *   画布「返回主界面」 -> be_stop_session() + pages_show_main() (清页面记忆)
+ * 交互:
+ *   主界面点 Miracast  ->  pages_show(PAGE_MIRACAST)   (只换画布, 不启动服务)
+ *   画布「开始投屏」    ->  be_select(service)          (后端让屏, 投屏画面顶替画布)
+ *   画布「返回」        ->  正在投屏就先 STOP, 再回主界面
  *
- * 为什么不再有「开始投屏」:
- *   主人要求点主界面按钮就直接自动起服务、一直停在这个界面; 后端在 waiting 态
- *   只起服务不让屏, 所以画布能一直显示, 不需要第二次点击。原按钮改成「重新连接」
- *   (后端对同一路重复 SELECT 幂等), 只在服务异常时手动补一刀用。
+ * 为什么点按钮不直接启动:
+ *   后端的 `select` 会立刻停掉 k230-ui 把屏让给 drmplay。如果点主界面按钮就启动,
+ *   用户根本来不及看画布上的连接说明 —— 所以启动动作放在画布里的「开始投屏」。
  *
  * 中文: 字体来自 font_cjk_20 / font_cjk_28 (lv_font_conv 子集, 见 tools/make-cjk-font.py)。
  */
@@ -25,10 +22,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-
-/* 页面记忆文件: 后端从 video 回到 waiting 会重启 k230ui, 靠它回到刚才那个按钮 */
-#define ACTIVE_PAGE_FILE "/run/k230-ui/active-page"
 
 extern objects_t objects;
 
@@ -167,15 +160,13 @@ static lv_obj_t *make_button(lv_obj_t *parent, const char *text, int x, int y,
 }
 
 /* ------------------------------------------------------------------ 回调 */
-/* 「重新连接」: 再发一次 SELECT。后端在 waiting/running 态对同一路幂等,
- * 只有服务意外挂了才有意义 (此时后端会重新 spawn wait 模式把服务拉回来)。 */
-static void on_retry_clicked(lv_event_t *e)
+static void on_start_clicked(lv_event_t *e)
 {
     page_t *p = (page_t *)lv_event_get_user_data(e);
 
     if (!p) return;
     p->started = 1;
-    set_status(p, "正在重新连接投屏服务，请稍候…", COL_WARN);
+    set_status(p, "正在启动投屏服务，请稍候…", COL_WARN);
     be_select(p->service);
 }
 
@@ -183,9 +174,11 @@ static void on_back_clicked(lv_event_t *e)
 {
     page_t *p = (page_t *)lv_event_get_user_data(e);
 
-    (void)p;
-    /* 自动起服务后画布背后一直有服务在跑, 返回主界面必须收掉它 */
-    be_stop_session();
+    if (!p) return;
+    if (p->started) {
+        be_stop_session();      /* 启动到一半/正在跑, 都要收掉 */
+        p->started = 0;
+    }
     pages_show_main();
 }
 
@@ -227,15 +220,15 @@ static void page_create(page_t *p)
     }
 
     /* 状态行 */
-    p->lbl_status = make_label(scr, "正在等待设备连接…", 24, 536, 432, 66,
+    p->lbl_status = make_label(scr, "准备就绪，点击「开始投屏」", 24, 536, 432, 66,
                                &font_cjk_20, COL_MUTED);
     lv_obj_set_style_text_line_space(p->lbl_status, 4, 0);
 
-    /* 重新连接 (服务已在后台自动起, 这个按钮只是异常时的手动补刀) */
-    p->btn_start = make_button(scr, "重新连接", 24, 614, 432, 82, p->accent, 0);
-    lv_obj_add_event_cb(p->btn_start, on_retry_clicked, LV_EVENT_CLICKED, p);
+    /* 开始投屏 */
+    p->btn_start = make_button(scr, "开始投屏", 24, 614, 432, 82, p->accent, 0);
+    lv_obj_add_event_cb(p->btn_start, on_start_clicked, LV_EVENT_CLICKED, p);
 
-    /* 返回 (不点就一直停在这个画布, 包括等待投屏和投屏结束之后) */
+    /* 返回 (不点就一直停在这个画布) */
     {
         lv_obj_t *btn_back = make_button(scr, "返回主界面", 24, 710, 432, 66,
                                          COL_BTN2, 1);
@@ -283,25 +276,6 @@ void pages_apply_main_texts(void)
     }
 }
 
-/* 把当前画布记到 /run, 后端重启 k230ui 后靠它回到同一个按钮的二级页 */
-static void remember_page(const char *service)
-{
-    FILE *f = fopen(ACTIVE_PAGE_FILE, "w");
-    if (!f) return;
-    fputs(service, f);
-    fclose(f);
-}
-
-/* 服务名 -> 页面下标 (和 s_pages[].service 对应) */
-static int page_index_of(const char *service)
-{
-    int i;
-    if (!service || !*service || !strcmp(service, "none")) return -1;
-    for (i = 0; i < PAGE_COUNT; i++)
-        if (!strcmp(s_pages[i].service, service)) return i;
-    return -1;
-}
-
 void pages_show(int index)
 {
     page_t *p;
@@ -311,45 +285,16 @@ void pages_show(int index)
     page_create(p);
 
     p->started = 0;
-    set_status(p, "正在等待设备连接，请在手机上操作…", COL_WARN);
-    remember_page(p->service);
+    set_status(p, "准备就绪，点击「开始投屏」", COL_MUTED);
 
     s_active = index;
-    fprintf(stderr, "[k230ui] pages_show: %s (index=%d)\n", p->service, index);
     lv_scr_load_anim(p->scr, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
 }
 
 void pages_show_main(void)
 {
-    unlink(ACTIVE_PAGE_FILE);       /* 回主界面 = 忘掉刚才那个按钮 */
     s_active = -1;
-    fprintf(stderr, "[k230ui] pages_show_main\n");
     loadScreen(SCREEN_ID_MAIN);
-}
-
-void pages_restore(void)
-{
-    char buf[32] = { 0 };
-    FILE *f = fopen(ACTIVE_PAGE_FILE, "r");
-    int idx;
-
-    if (!f) {                       /* 首次开机 / 主界面态: 没有记忆, 留在主界面 */
-        fprintf(stderr, "[k230ui] pages_restore: none (主界面)\n");
-        return;
-    }
-    if (fgets(buf, sizeof(buf), f)) {
-        char *nl = strchr(buf, '\n');
-        if (nl) *nl = '\0';
-    }
-    fclose(f);
-
-    idx = page_index_of(buf);
-    if (idx < 0) {                  /* 内容不认识: 不去猜, 留主界面 */
-        fprintf(stderr, "[k230ui] pages_restore: 未知页面 '%s', 留主界面\n", buf);
-        return;
-    }
-    fprintf(stderr, "[k230ui] pages_restore: 回到上次按钮的二级页 %s\n", buf);
-    pages_show(idx);               /* 只显示画布, 不再发 SELECT (后端已经在 waiting) */
 }
 
 int pages_active(void)
@@ -370,41 +315,24 @@ void pages_update_status(const be_status_t *st)
         return;
     }
 
-    /* 后端在别的路上: 提示一下, 但画布不动 (除非用户点返回主界面) */
-    if ((st->state == BE_STATE_WAITING || st->state == BE_STATE_RUNNING ||
-         st->state == BE_STATE_STARTING) &&
-        strcmp(st->service, p->service) != 0) {
-        snprintf(buf, sizeof(buf), "后端正在处理 %s，可返回主界面重新选择", st->service);
-        set_status(p, buf, COL_WARN);
-        return;
-    }
-
-    switch (st->state) {
-    case BE_STATE_STARTING:
+    if (st->state == BE_STATE_STARTING && !strcmp(st->service, p->service)) {
         snprintf(buf, sizeof(buf), "正在启动 %s 投屏服务…", p->btn_name);
         set_status(p, buf, COL_WARN);
-        break;
-    case BE_STATE_WAITING:
-        snprintf(buf, sizeof(buf), "%s 服务已就绪，正在等待设备连接…", p->btn_name);
-        set_status(p, buf, COL_WARN);
-        break;
-    case BE_STATE_RUNNING:
+    } else if (st->state == BE_STATE_RUNNING && !strcmp(st->service, p->service)) {
         set_status(p, "已连接，正在投屏…", COL_OK);
-        break;
-    case BE_STATE_STOPPING:
+    } else if (st->state == BE_STATE_STOPPING) {
         set_status(p, "正在停止…", COL_WARN);
-        break;
-    case BE_STATE_ERROR:
+    } else if (st->state == BE_STATE_ERROR) {
         snprintf(buf, sizeof(buf), "启动失败：%s",
                  st->message[0] ? st->message : "未知错误");
         set_status(p, buf, COL_ERR);
-        break;
-    case BE_STATE_IDLE:
-        set_status(p, "服务已停止，可点「重新连接」或返回主界面", COL_MUTED);
-        break;
-    default:
-        set_status(p, "后端状态未知", COL_WARN);
-        break;
+    } else if (st->state == BE_STATE_RUNNING || st->state == BE_STATE_STARTING) {
+        snprintf(buf, sizeof(buf), "上一路投屏还没停：%s", st->service);
+        set_status(p, buf, COL_WARN);
+    } else if (p->started) {
+        set_status(p, "没有检测到投屏会话，可以重试或返回", COL_WARN);
+    } else {
+        set_status(p, "准备就绪，点击「开始投屏」", COL_MUTED);
     }
 }
 

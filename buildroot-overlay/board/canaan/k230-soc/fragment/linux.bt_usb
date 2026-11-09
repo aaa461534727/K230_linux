@@ -1,0 +1,11 @@
+# K230 蓝牙 (USB dongle) — 2026-11-04 主人要「AirPlay 反控」
+#
+# 背景: 板上插着 CSR8510 (0a12:0001) USB 蓝牙 dongle, 但主内核配置没编 btusb,
+#       /lib/modules/6.6.36 里没有 btusb.ko ⇒ 一直没有 hci0 (见 docs/BOARD_HARDWARE.md 老记录)。
+# 用途: 让 K230 当 BLE HID 外设 (HOGP 鼠标/键盘), 给 iPhone AirPlay 投屏做反控
+#       (AirPlay 镜像协议本身没有回控通道, 方案见 docs/BT_HID_REVERSE_PLAN.md)。
+# 依赖: CONFIG_BT=y / CONFIG_BT_LE=y (主 defconfig 已有), 这里只补 USB 传输 + 厂商协议解析。
+CONFIG_BT_HCIBTUSB=m
+CONFIG_BT_INTEL=m
+CONFIG_BT_BCM=m
+CONFIG_BT_RTL=m

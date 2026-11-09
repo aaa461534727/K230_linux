@@ -1,0 +1,35 @@
+#!/bin/sh
+# k230-bt-watch — 盯一次手机配对/连接全过程 (只读, 不改任何状态)
+#
+# 为什么要有它: 手机"连不上 / 连上但指针不动"时, 现场需要同时看 journal 与
+#   适配器/配对/设备/反控四组状态, 手敲七八条命令容易漏时刻。这个脚本把
+#   journal 跟随 + 每 3 s 采样固化成一条命令, 输出追加进 /tmp/bt-watch.log。
+#
+# 用法 (板上, root):
+#   k230-bt-watch                 # 只看状态
+#   k230-bt-watch AA:BB:CC:DD:EE:FF   # 额外盯一台设备 (配对/连接)
+#   tail -f /tmp/bt-watch.log     # 另开一个终端看
+# 停止: Ctrl-C (journalctl 子进程一起退出)
+DEVG="$1"
+
+exec >>/tmp/bt-watch.log 2>&1
+echo "=== watch start $(date) dev=${DEVG:--} ==="
+
+journalctl -u bluetooth -u k230-bt-agent -u k230-bt-hid -f -o cat &
+JP=$!
+trap 'kill $JP 2>/dev/null; exit 0' INT TERM
+
+while true; do
+    echo "--- $(date +%H:%M:%S) 模式=$(cat /run/k230-ui-mode.state 2>/dev/null)" \
+         "hid=$(systemctl is-active k230-bt-hid)" \
+         "agent=$(systemctl is-active k230-bt-agent)"
+    hciconfig hci0 2>/dev/null | sed -n 3p
+    bluetoothctl show 2>/dev/null | grep -Ei 'powered|pairable|discoverable'
+    if [ -n "$DEVG" ]; then
+        bluetoothctl info "$DEVG" 2>/dev/null \
+            | grep -Ei '^[[:space:]]*(name|paired|bonded|trusted|connected):'
+    fi
+    hcitool con 2>/dev/null | grep -i 'ACL' | sed 's/^/  /'
+    echo "  st: $(cat /run/k230-bt-hid.status 2>/dev/null)"
+    sleep 3
+done

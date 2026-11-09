@@ -149,8 +149,86 @@ else
 fi
 
 # 7) 装入 extras (distribution.sh 随后 cp -a extras -> rootfs)
+#    原则 (2026-11-04 §23.10): **镜像里"我们的"文件一律从 src/K230-cast 生成**,
+#    不在 SDK 里手放。以前这些 unit/配置/脚本是直接躺在 extras 里的, 结果:
+#      · 换机器 clone 主仓拿不到 (源码只在这台机器的 SDK 里);
+#      · extras 副本和 src 长期不同步 —— 实测 zz-debug.conf 里还留着
+#        DEC_BIN=/usr/local/bin/v4l2_dec (AirPlay 黑屏那个 bug), 重编镜像会把它带回来。
 echo "=== [k230_extras_build] install -> $EXTRAS/usr/bin ==="
-mkdir -p "$EXTRAS/usr/bin"
+# 目标目录先建好 (install 不会自己建父目录; 缺一个就整段中断, 实测过)
+mkdir -p "$EXTRAS/usr/bin" "$EXTRAS/usr/local/bin" \
+         "$EXTRAS/root" "$EXTRAS/root/carlife/docs" "$EXTRAS/root/usbmirror/tools" \
+         "$EXTRAS/etc/systemd/system"
+
+# 7.0) 板端 overlay (systemd 单元 / 网络 / sysctl 配置) —— 真相 = src/K230-cast/overlay/
+if [ -d "$SRC/K230-cast/overlay" ]; then
+    cp -a "$SRC/K230-cast/overlay/." "$EXTRAS/"
+fi
+
+# 7.1) 板端脚本 (/root, /usr/local/bin) + 自写 python 工具 (/usr/bin)
+install -m 0755 "$SRC/K230-cast/airplay/k230-airplay"           "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/common/k230-screen.sh"          "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/common/k230-cast"               "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/common/k230-audio.sh"           "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/common/k230-fallback.py"        "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/common/k230-dhcp-simple.py"     "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/arbiter/k230-source-arbiter.sh" "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/miracast/sink/wfd-p2p.sh"       "$EXTRAS/root/"
+install -m 0755 "$SRC/K230-cast/carlife/carlife-ap.sh"          "$EXTRAS/usr/local/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-hid"            "$EXTRAS/usr/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-hid-logic-test" "$EXTRAS/usr/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-hid-abs-test.py" "$EXTRAS/usr/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-hid-int-test.py" "$EXTRAS/usr/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-hid-tp-test.py"  "$EXTRAS/usr/bin/"
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-watch"          "$EXTRAS/usr/bin/"
+# 蓝牙反控基线工具: 板上入口固定叫 /root/k230-bt-restore (缺省行为 = 还原最新基线)
+# 只带工具不带基线目录 —— 基线是"这台机器当前这版"的现场快照, 刷完新固件后自己 snapshot 一次。
+install -m 0755 "$SRC/K230-cast/airplay/k230-bt-golden.sh"      "$EXTRAS/root/k230-bt-restore"
+# 整机基线工具: 板上入口 /root/k230-system-restore (缺省 = 还原最新整机基线并回主界面)
+# 覆盖 62 件 (UI 四按钮 + 屏幕层 + 四路后端 + 仲裁热点 + 蓝牙), 是 k230-bt-restore 的超集。
+# 同样只带工具不带基线目录 —— 刷完固件自己 snapshot 一次。
+install -m 0755 "$SRC/K230-cast/k230-system-golden.sh"          "$EXTRAS/root/k230-system-restore"
+install -m 0755 "$SRC/K230-cast/miracast/tools/wfd-autotune"    "$EXTRAS/usr/bin/"
+
+# 7.2) CarLife: 脚本 / 文档 / 单元 (二进制 carlife_sink 见上)
+mkdir -p "$EXTRAS/root/carlife/docs"
+install -m 0755 "$SRC/K230-cast/carlife/build.sh" "$SRC/K230-cast/carlife/carlife-ap.sh" "$EXTRAS/root/carlife/"
+install -m 0644 "$SRC/K230-cast/carlife/README.md" "$EXTRAS/root/carlife/"
+install -m 0644 "$SRC/K230-cast/carlife/docs/PROTOCOL.md" "$SRC/K230-cast/carlife/docs/WIRELESS.md" \
+    "$EXTRAS/root/carlife/docs/"
+install -m 0644 "$SRC/K230-cast/carlife/k230-carlife.service" "$SRC/K230-cast/carlife/k230-carlife-wifi.service" \
+    "$EXTRAS/root/carlife/"
+
+# 7.3) UsbMirror: 源码 / 脚本 / 文档 / 单元 (二进制 usb_mirror 见上)
+mkdir -p "$EXTRAS/root/usbmirror/tools"
+install -m 0644 "$SRC/K230-cast/usbmirror/README.md" "$SRC/K230-cast/usbmirror/k230-usbmirror.service" \
+    "$EXTRAS/root/usbmirror/"
+install -m 0755 "$SRC/K230-cast/usbmirror/build.sh" "$SRC/K230-cast/usbmirror/run.sh" "$EXTRAS/root/usbmirror/"
+cp -a "$SRC/K230-cast/usbmirror/tools/." "$EXTRAS/root/usbmirror/tools/"
+
+# 7.4) systemd 单元 (源码真相 = src/K230-cast/{airplay,carplay}/)
+install -m 0644 "$SRC/K230-cast/airplay/k230-bt-hid.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/carplay/systemd/carplay-airplayd.service" \
+    "$SRC/K230-cast/carplay/systemd/carplay-arbiter.service" \
+    "$SRC/K230-cast/carplay/systemd/carplay-wireless.service" "$EXTRAS/etc/systemd/system/"
+
+# 7.5) 其余 systemd 单元 / 配置 (源码真相 = src/K230-cast / src/eezUI)
+install -m 0644 "$SRC/K230-cast/airplay/k230-airplay.service" \
+                "$SRC/K230-cast/airplay/k230-usbnet.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/common/k230-audio.service" "$SRC/K230-cast/common/k230-cast.service" \
+                "$SRC/K230-cast/common/k230-fallback.service" "$SRC/K230-cast/common/k230-miracast-go.service" \
+                "$SRC/K230-cast/common/k230-screen.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/miracast/k230-miracast.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/arbiter/k230-shared-ap.service" \
+                "$SRC/K230-cast/arbiter/k230-source-arbiter.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/usbmirror/k230-usbmirror.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/eezUI/backend/systemd/k230-ui.service" \
+                "$SRC/eezUI/backend/systemd/k230-ui-backend.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/carlife/k230-carlife.service" \
+                "$SRC/K230-cast/carlife/k230-carlife-wifi.service" "$EXTRAS/etc/systemd/system/"
+install -m 0644 "$SRC/K230-cast/arbiter/k230-arbiter.conf" "$SRC/eezUI/backend/k230-ui.conf" "$EXTRAS/etc/"
+install -m 0755 "$SRC/eezUI/backend/k230-ui-mode.sh" "$EXTRAS/usr/bin/"
+
 install -m 0755 "$SRC/K230-cast/miracast/sink/wfd-sink"        "$EXTRAS/usr/bin/"
 install -m 0755 "$SRC/K230-cast/miracast/sink/drmplay"         "$EXTRAS/usr/bin/"
 install -m 0755 "$SRC/K230-cast/miracast/sink/pcmplay"         "$EXTRAS/usr/bin/"

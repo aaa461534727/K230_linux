@@ -1,16 +1,14 @@
 /**
  * ui_actions.c — 主界面 4 个按钮 + 状态标签的业务逻辑
  *
- * 交互约定 (2026-11-07 改版):
- *   - 点某个服务按钮   -> 进该服务的画布 **并立刻自动起服务** (be_select)
- *                        后端 waiting 态只起服务不让屏, 画布一直在, 不刷黑
- *   - 画布「重新连接」 -> 后端对同一路幂等, 仅异常时用
- *   - 画布「返回主界面」-> STOP, 回主界面
- *   - 真正出帧时后端停 k230ui 把屏交给 drmplay; 视频流断开再拉起 k230ui,
- *     pages_restore() 自动回到刚才那个按钮的画布
+ * 交互约定 (2026-11-05 起加二级画布, 见 src/ui_pages.c):
+ *   - 点某个服务按钮       -> 进入该服务的画布 (中文说明 + 开始投屏 + 返回)
+ *   - 画布「开始投屏」     -> 才真正启动那一路 (后端负责停掉其它路、让出屏幕)
+ *   - 画布「返回」         -> 停掉正在启动/运行的那一路, 回主界面
+ *   - 底部标签实时显示后端状态; 后端没起来就显示 "后端未连接"
  *
- * 为什么点按钮就能直接启动: 后端新增 waiting 模式 —— 起服务但**不碰 DRM**,
- *   LVGL 继续占屏, 所以不需要「开始投屏」那一次额外点击, 也不存在刷黑等待。
+ * 为什么点按钮不直接启动: 后端的 select 会立刻让屏给投屏 (UI 被停掉),
+ *   直接启动的话用户来不及看画布上的连接说明。
  */
 #include "ui_actions.h"
 #include "backend_client.h"
@@ -80,17 +78,14 @@ static void set_status_text(const char *text, uint32_t color)
                                 LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
-/* 点主界面按钮: 进该服务的画布 + 立刻自动起对应服务 (不再需要「开始投屏」) */
-static void show_and_start(int index, const char *service)
-{
-    pages_show(index);
-    be_select(service);
-}
+/* 点按钮的统一处理已移到二级画布 (src/ui_pages.c):
+ * 主界面只负责跳转, 真正启动/停止在画布上的「开始投屏」/「返回」里。 */
 
-void action_on_miracast_click(lv_event_t *e) { (void)e; show_and_start(PAGE_MIRACAST, "miracast"); }
-void action_on_airplay_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_AIRPLAY,  "airplay"); }
-void action_on_carlife_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_CARLIFE,  "carlife"); }
-void action_on_carplay_click(lv_event_t *e)  { (void)e; show_and_start(PAGE_CARPLAY,  "carplay"); }
+/* 点主界面按钮: 进该服务的画布 (启动动作在画布里的「开始投屏」) */
+void action_on_miracast_click(lv_event_t *e) { (void)e; pages_show(PAGE_MIRACAST); }
+void action_on_airplay_click(lv_event_t *e)  { (void)e; pages_show(PAGE_AIRPLAY); }
+void action_on_carlife_click(lv_event_t *e)  { (void)e; pages_show(PAGE_CARLIFE); }
+void action_on_carplay_click(lv_event_t *e)  { (void)e; pages_show(PAGE_CARPLAY); }
 
 void action_on_main_loaded(lv_event_t *e)
 {
@@ -124,13 +119,6 @@ static void poll_status_cb(lv_timer_t *t)
         set_status_text(buf, COL_WARN);
         break;
 
-    case BE_STATE_WAITING:
-        set_highlight(button_for_service(st.service));
-        snprintf(buf, sizeof(buf), "%s 已就绪，等待设备连接…",
-                 service_label(st.service));
-        set_status_text(buf, COL_WARN);
-        break;
-
     case BE_STATE_RUNNING:
         set_highlight(button_for_service(st.service));
         snprintf(buf, sizeof(buf), "%s 投屏中",
@@ -161,8 +149,6 @@ static void poll_status_cb(lv_timer_t *t)
 void app_init(const char *backend_sock)
 {
     be_start(backend_sock);
-    /* 后端从 video 回到 waiting 会重启本进程; 靠状态文件自动回到刚才那个按钮的画布 */
-    pages_restore();
     if (!s_poll_timer)
         s_poll_timer = lv_timer_create(poll_status_cb, 500, NULL);
     poll_status_cb(NULL);

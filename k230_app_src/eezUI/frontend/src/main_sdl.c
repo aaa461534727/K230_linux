@@ -13,6 +13,7 @@
  */
 #include "lvgl/lvgl.h"
 #include "ui_actions.h"
+#include "ui_pages.h"
 #include "ui.h"
 #include "screens.h"   /* EEZ 生成: extern objects_t objects; 各控件指针 */
 
@@ -51,6 +52,8 @@ int main(int argc, char **argv)
     const char *env;
     unsigned long exit_ms = 0;
     int clicked = 0;
+    int started = 0;
+    int want_start;
     lv_display_t *disp;
 
     (void)argc;
@@ -77,6 +80,9 @@ int main(int argc, char **argv)
     if ((env = getenv("K230UI_SIM_EXIT_MS")) && *env)
         exit_ms = (unsigned long)strtoul(env, NULL, 10);
 
+    /* 自动点「开始投屏」: 只为截图验证画布上的按钮/状态行 */
+    want_start = getenv("K230UI_SIM_START") != NULL;
+
     g_start_ms = (unsigned long)lv_tick_get();
 
     for (;;) {
@@ -87,6 +93,14 @@ int main(int argc, char **argv)
         if (!clicked && (unsigned long)lv_tick_get() - g_start_ms > 1500) {
             clicked = 1;
             maybe_auto_click();
+        }
+
+        if (want_start && !started && clicked &&
+            (unsigned long)lv_tick_get() - g_start_ms > 3000) {
+            int idx = pages_active();
+            started = 1;
+            fprintf(stderr, "[sim] auto-click start on page %d\n", idx);
+            if (idx >= 0) pages_sim_click_start(idx);
         }
 
         if (exit_ms && (unsigned long)lv_tick_get() - g_start_ms > exit_ms)

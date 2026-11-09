@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""k230-bt-agent — 蓝牙配对 agent (自动接受 SSP / Just Works)。
+
+干什么: 在本机 system bus 上注册一个 org.bluez.Agent1 (capability=NoInputNoOutput),
+        并把所有配对交互直接答应: 手机点「K230-CAST」→ 无需在板子上确认 → 直接配对成功。
+为什么需要: k230-bt-hid 只是 HID **设备端** (注册 SDP/profile), 它不当配对 agent。
+        板上默认没有任何 agent 进程 (2026-11-05 实测 `ps aux | grep bluetoothctl` 为空),
+        手机第一次配对/「忽略后重配」时, SSP 确认没人应答 ⇒ 表现为
+        "点 K230-CAST 连不上 / 连上立刻断"。本脚本补上这一环。
+怎么用: k230-bt-agent            # 前台跑 (systemd 管)
+        k230-bt-agent --once     # 自检: 注册完就退出 (退出码 0 = 能注册)
+依赖:   python3-dbus + python3-gi (k230-bt-hid 同款, 板上已有)
+在哪跑: 板子 (需要 system dbus + bluetoothd 在跑)
+产出:   stdout 一行行日志; systemd 单元 k230-bt-agent.service
+"""
+
+import os
+import sys
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+AGENT_PATH = "/k230/agent"
+AGENT_IFACE = "org.bluez.Agent1"
+# 2026-11-06 改: NoInputNoOutput → DisplayYesNo。
+#   为什么要改: 安卓手机重新配对时会要求 MITM 保护 (IO Capability Response 里
+#   `Authentication: Dedicated Bonding - MITM required`), 走 Numeric Comparison。
+#   而 NoInputNoOutput 的 agent **只能 Just Works**, BlueZ 收到 User Confirmation Request
+#   后 1.2 ms 内直接回 HCI `User Confirmation Request Neg Reply` ⇒ 手机报"配对失败",
+#   表现就是"任何手机都连不上"。btmon 实测 (2026-11-06 09:44)。
+#   DisplayYesNo 允许 Numeric Comparison, 本 agent 仍然自动确认 (车机场景无人值守),
+#   换来的是能生成 authenticated link key, 满足手机的 MITM 要求。
+#   兼容性: 对端只要 MITM 不要求时, DisplayYesNo 照样走 Just Works, 不做退化。
+CAPABILITY = "DisplayYesNo"
+
+
+def log(msg):
+    sys.stdout.write("agent: %s\n" % msg)
+    sys.stdout.flush()
+
+
+class Agent(dbus.service.Object):
+    """org.bluez.Agent1 —— 所有请求一律同意 (这块板子是"被连"的一方, 不需要保密)。"""
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Release(self):
+        log("Release")
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
+    def AuthorizeService(self, device):
+        log("AuthorizeService %s → 同意" % device)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        log("DisplayPinCode %s %s" % (device, pincode))
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
+    def DisplayPasskey(self, device, passkey):
+        log("DisplayPasskey %s %06d" % (device, int(passkey)))
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        log("RequestConfirmation %s %06d → 同意" % (device, int(passkey)))
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        log("RequestAuthorization %s → 同意" % device)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        log("RequestPinCode %s → 0000" % device)
+        return "0000"
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        log("RequestPasskey %s → 0" % device)
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        log("Cancel")
+
+
+def main():
+    once = "--once" in sys.argv
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    Agent(bus, AGENT_PATH)
+
+    mgr = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"),
+                         "org.bluez.AgentManager1")
+    try:
+        mgr.RegisterAgent(AGENT_PATH, CAPABILITY)
+        log("已注册 agent (%s)" % CAPABILITY)
+    except dbus.exceptions.DBusException as e:
+        # 同一个 path 重复注册会报 AlreadyExists; 视为正常
+        if "AlreadyExists" not in str(e):
+            log("✗ 注册 agent 失败: %s" % e)
+            return 2
+    try:
+        mgr.RequestDefaultAgent(AGENT_PATH)
+        log("已设为默认 agent")
+    except dbus.exceptions.DBusException as e:
+        log("⚠ 设默认 agent 失败 (不影响配对): %s" % e)
+
+    if once:
+        log("--once: 注册成功, 退出")
+        return 0
+
+    log("就绪, 等待手机配对请求…")
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    sys.exit(main())

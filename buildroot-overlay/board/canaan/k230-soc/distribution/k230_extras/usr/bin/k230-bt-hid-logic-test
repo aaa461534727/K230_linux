@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""k230-bt-hid-logic-test — 触摸 → BLE HID 报告的**纯逻辑**自测 (不需要手机)。
+
+干什么: 把 k230-bt-hid 里的 TouchMouse 状态机挖出来, 用合成的 evdev 事件喂进去,
+        再用一个假的 HID 接收器记录它发出的鼠标报告, 断言「点按/拖动/双击/双指滚动」
+        四种手势的结果正确。
+怎么用: python3 k230-bt-hid-logic-test          (带班板上跑, 依赖 dbus/gi 只是为了 import)
+依赖:   无 (不需要蓝牙、不需要手机、不需要 GATT 注册)
+在哪跑: K230 班板上 (本机缺 python3-dbus; 只 import 模块不连总线)
+产出:   控制台表格 + 退出码 (0 全过 / 1 有失败)
+
+为什么需要它 (2026-11-04): 现场板子与手机距离远, 手机扫不到 BLE 广播, 射频链路
+只能等主人在场再验; 但「触摸坐标 → 相对位移/点击/滚轮」这段换算完全可以在本机
+离线验证, 免得明天现场把两个问题混在一起查。
+"""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.environ.get("K230_BT_HID_BIN",
+                    os.path.join(HERE, "k230-bt-hid") if os.path.exists(
+                        os.path.join(HERE, "k230-bt-hid")) else "/usr/bin/k230-bt-hid")
+
+spec = importlib.util.spec_from_loader(
+    "bthid", importlib.machinery.SourceFileLoader("bthid", SRC))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class FakeHid:
+    """记录 mouse() 发出去的每一条报告。"""
+
+    def __init__(self):
+        self.events = []
+
+    def mouse(self, buttons=0, dx=0, dy=0, wheel=0):
+        self.events.append((int(buttons), int(dx), int(dy), int(wheel)))
+        return True
+
+    def key(self, *_a, **_k):
+        return True
+
+    def key_tap(self, *_a, **_k):
+        return True
+
+    def consumer(self, *_a, **_k):
+        return True
+
+    # ---- 汇总
+    def sum_dx(self):
+        return sum(e[1] for e in self.events)
+
+    def sum_dy(self):
+        return sum(e[2] for e in self.events)
+
+    def sum_wheel(self):
+        return sum(e[3] for e in self.events)
+
+    def clicks(self):
+        """按下 (buttons 含 bit0 但上一条没有) 的次数。"""
+        n, prev = 0, 0
+        for b, _x, _y, _w in self.events:
+            if (b & 1) and not (prev & 1):
+                n += 1
+            prev = b
+        return n
+
+    def clear(self):
+        self.events = []
+
+
+class Feed:
+    """把「手指动作」翻译成 evdev 事件序列喂给 TouchMouse。"""
+
+    def __init__(self, tm, start=time.time()):
+        self.tm = tm
+        self.t = start
+
+    def down(self, x, y, slot=0, tid=100):
+        self.tm.feed(m.EV_ABS, m.ABS_MT_SLOT, slot, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_TRACKING_ID, tid, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_X, x, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_Y, y, self.t)
+        self.tm.feed(m.EV_SYN, m.SYN_REPORT, 0, self.t)
+
+    def move(self, x, y, dt=0.01, slot=0):
+        self.t += dt
+        self.tm.feed(m.EV_ABS, m.ABS_MT_SLOT, slot, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_X, x, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_Y, y, self.t)
+        self.tm.feed(m.EV_SYN, m.SYN_REPORT, 0, self.t)
+
+    def up(self, dt=0.05, slot=0):
+        self.t += dt
+        self.tm.feed(m.EV_ABS, m.ABS_MT_SLOT, slot, self.t)
+        self.tm.feed(m.EV_ABS, m.ABS_MT_TRACKING_ID, -1, self.t)
+        self.tm.feed(m.EV_SYN, m.SYN_REPORT, 0, self.t)
+
+
+results = []
+
+
+def check(name, cond, detail):
+    results.append((name, bool(cond), detail))
+
+
+def case_tap():
+    """短按不动 ⇒ 一次左键点击 (按下 + 抬起)。"""
+    hid = FakeHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="rel")
+    f = Feed(tm)
+    f.down(400, 400)
+    f.up(dt=0.06)
+    check("单击: 产生 1 次左键按下", hid.clicks() == 1,
+          "clicks=%d events=%s" % (hid.clicks(), hid.events))
+    check("单击: 抬起后按键为 0", hid.events[-1][0] == 0 if hid.events else False,
+          "last=%s" % (hid.events[-1] if hid.events else None,))
+    check("单击: 没有位移", hid.sum_dx() == 0 and hid.sum_dy() == 0,
+          "dx=%d dy=%d" % (hid.sum_dx(), hid.sum_dy()))
+
+
+def case_double_tap():
+    """340ms 内连点两下 ⇒ 两次点击 (双击)。"""
+    hid = FakeHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="rel")
+    f = Feed(tm)
+    f.down(400, 400)
+    f.up(dt=0.05)
+    f.down(400, 400)
+    f.up(dt=0.05)
+    check("双击: 两下点按 = 2 次左键按下 (不能变三击)", hid.clicks() == 2,
+          "clicks=%d" % hid.clicks())
+
+
+def case_drag():
+    """移动超过阈值 ⇒ 拖动 (先按住, 有位移, 松开)。"""
+    hid = FakeHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="rel")
+    f = Feed(tm)
+    f.down(300, 500)
+    x = 300
+    for _ in range(10):           # 10 帧, 每帧 +20px, 共 200px
+        x += 20
+        f.move(x, 500, dt=0.04)   # 累计 0.4s > DRAG_HOLD_MS(200ms)
+    f.up(dt=0.02)
+    dx = hid.sum_dx()
+    check("拖动: 有正向位移", dx > 0, "sum_dx=%d (sens 2.2 × 200px ≈ 440)" % dx)
+    check("拖动: 出现按住 (buttons=1) 的报告",
+          any(b & 1 for b, _x, _y, _w in hid.events), "events=%s" % hid.events[:3])
+    check("拖动: 松开后按键为 0", hid.events[-1][0] == 0,
+          "last=%s" % (hid.events[-1],))
+    check("拖动: 不被误判成点击", hid.clicks() == 1, "clicks=%d (拖动只按下一次)" % hid.clicks())
+
+
+def case_two_finger_scroll():
+    """双指同向上滑 ⇒ 滚轮。"""
+    hid = FakeHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="rel")
+    f = Feed(tm)
+    # 两指落下
+    f.down(300, 600, slot=0, tid=1)
+    f.tm.feed(m.EV_ABS, m.ABS_MT_SLOT, 1, f.t)
+    f.tm.feed(m.EV_ABS, m.ABS_MT_TRACKING_ID, 2, f.t)
+    f.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_X, 500, f.t)
+    f.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_Y, 600, f.t)
+    f.tm.feed(m.EV_SYN, m.SYN_REPORT, 0, f.t)
+    # 两指一起往上 60px (分 6 帧)
+    y = 600
+    for _ in range(6):
+        y -= 10
+        f.t += 0.02
+        for slot, xx in ((0, 300), (1, 500)):
+            f.tm.feed(m.EV_ABS, m.ABS_MT_SLOT, slot, f.t)
+            f.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_X, xx, f.t)
+            f.tm.feed(m.EV_ABS, m.ABS_MT_POSITION_Y, y, f.t)
+        f.tm.feed(m.EV_SYN, m.SYN_REPORT, 0, f.t)
+    check("双指滚动: 产生滚轮事件", hid.sum_wheel() != 0,
+          "sum_wheel=%d (60px / 26px ≈ 2 格)" % hid.sum_wheel())
+    # 方向按触控板"自然滚动"语义: 两指上滑 = 内容上移 = 向下滚 (wheel 为负),
+    # 和手指直接划手机屏一致 (手机上两指上滑就是往下翻页)。
+    check("双指滚动: 方向是自然滚动 (上滑 → 向下滚)",
+          hid.sum_wheel() < 0, "sum_wheel=%d" % hid.sum_wheel())
+    check("双指滚动: 不产生左键点击", hid.clicks() == 0, "clicks=%d" % hid.clicks())
+
+
+def case_long_press_no_move():
+    """长按不动 (没有位移) ⇒ 点击, 不是拖动。"""
+    hid = FakeHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="rel")
+    f = Feed(tm)
+    f.down(400, 400)
+    f.up(dt=0.5)                  # 500ms > CLICK_MAX_MS(280)
+    check("长按不动: 不误触发拖动", not any(b & 1 for b, _x, _y, _w in hid.events),
+          "events=%s" % hid.events)
+
+
+def case_report_map():
+    """HID Report Map 位级校验: 描述符声明的位宽必须和实际发的报告字节数一致。
+
+    为什么必须机器验: 报告映射写错 (少一个 Report ID / 位宽不对) 时, BlueZ 注册照样
+    成功 (它不解析 map), 但要等**手机连上**才暴露 —— 现场最难查的那类问题。
+    """
+    import struct as _s
+
+    d = m.REPORT_MAP
+    i, rid, rs, rc = 0, 0, 0, 0
+    bits = {}
+    # main item 的 tag 取 (b>>4)&0x0F: 0x81→8 Input / 0x91→9 Output / 0xB1→0xB Feature
+    names = {0x8: "input", 0x9: "output", 0xB: "feature"}
+    # global tag: 0x75→7 Report Size / 0x85→8 Report ID / 0x95→9 Report Count
+    TAG_RSIZE, TAG_RID, TAG_RCOUNT = 0x7, 0x8, 0x9
+    while i < len(d):
+        b = d[i]
+        if b == 0xFE:                       # long item: 跳过
+            size = d[i + 1]
+            i += 3 + size
+            continue
+        size = (0, 1, 2, 4)[b & 0x03]
+        typ = (b >> 2) & 0x03               # 0=main 1=global 2=local
+        tag = (b >> 4) & 0x0F
+        val = 0
+        for k in range(size):
+            val |= d[i + 1 + k] << (8 * k)
+        if typ == 1:
+            if tag == TAG_RSIZE:
+                rs = val
+            elif tag == TAG_RCOUNT:
+                rc = val
+            elif tag == TAG_RID:
+                rid = val
+        elif typ == 0 and tag in names:     # Input / Output / Feature
+            key = (rid, names[tag])
+            bits[key] = bits.get(key, 0) + rs * rc
+        i += 1 + size
+
+    for (rid, kind), n in sorted(bits.items()):
+        print("    报告 ID %d %-7s %3d bit = %d 字节" % (rid, kind, n, n // 8))
+
+    # 鼠标: 5 键 + 3 bit 填充 + X/Y/Wheel 各 8 bit = 32 bit
+    # 键盘: 8 修饰键 + 8 保留 + 6 键 ×8 = 64 bit; LED 输出: 5+3 = 8 bit
+    # 多媒体: 16 bit usage
+    # 绝对触摸 (Report ID 4, 2026-11-05): 每指 标志 8 + X16 + Y16 = 40 bit, 两指 80 bit
+    exp = {(1, "input"): 32, (2, "input"): 64, (2, "output"): 8, (3, "input"): 16,
+           (4, "input"): 80}
+    check("ReportMap: 位宽与预期一致 (鼠标4B/键盘8B/LED1B/多媒体2B/触摸10B)",
+          bits == exp, "解析=%s" % bits)
+
+    # 实际发出去的 struct 长度 = 1 (Report ID) + 描述符位宽
+    pairs = ((m.FMT_MOUSE, (1, "input")), (m.FMT_KEY, (2, "input")),
+             (m.FMT_CONS, (3, "input")), (m.FMT_TP, (4, "input")))
+    for fmt, key in pairs:
+        need = 1 + bits.get(key, 0) // 8
+        got = _s.calcsize(fmt)
+        check("ReportMap: %s 长度 %dB 与描述符一致 (ID %d %s)"
+              % (fmt, got, key[0], key[1]), got == need,
+              "calcsize=%d 需要=%d" % (got, need))
+
+
+def case_peer_mode():
+    """按对端选反控通路 (2026-11-05「通用于安卓跟苹果」): 分类 + 运行时切换。"""
+    cases = [
+        # (name, modalias, class, 期望)
+        ("nubia Z17 miniS", "", 0x005A020C, "touch"),
+        ("REDMI K80 Ultra", "", 0x005A020C, "touch"),
+        ("iPhone", "", 0x7A020C, "touch"),
+        ("iPad Pro", "", 0x7A020C, "touch"),
+        ("Justtinfo的MacBook Pro", "", 0x7A020C, "mouse"),
+        ("Pixel 8", "usb:v18D1p4EE7d0100", 0x5A020C, "touch"),
+        ("Pixel 8", "usb:v05ACp1234d0100", 0x5A020C, "mouse"),   # Apple VID 优先
+    ]
+    for name, ma, klass, want in cases:
+        got, why = m.classify_peer(name=name, modalias=ma, klass=klass)
+        check("分类: %-22s → %s" % (name[:22] + ("" if len(name) <= 22 else "…"), want),
+              got == want, "得到 %s (%s)" % (got, why))
+
+    # 手工指定 (per-peer) 优先级最高: 名字被改过也能救
+    import json as _json
+    import tempfile
+    old = m.PEERS_FILE
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"dc:f0:90:26:36:c0": "touch"}, f)
+            tmp = f.name
+        m.PEERS_FILE = tmp
+        got, why = m.classify_peer(name="iPhone", modalias="", klass=0,
+                                   addr="dc:f0:90:26:36:c0")
+        check("分类: 对端指定文件可覆盖 (mac 小写也认)", got == "touch",
+              "得到 %s (%s)" % (got, why))
+        got2, _ = m.classify_peer(name="iPhone", modalias="", klass=0,
+                                  addr="11:22:33:44:55:66")
+        check("分类: 指定文件只影响列出的那台", got2 == "touch", "得到 %s" % got2)
+    finally:
+        m.PEERS_FILE = old
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
+
+    # 运行时切换: 切模式必须补"全松开", 否则主机侧卡按住
+    hid = FakeTpHid()
+    tm = m.TouchMouse(hid, sens=2.2, mode="abs")
+    tm.tp_on = True
+    hid.buttons = 1                      # 模拟上一手势"按住没松"
+    tm.set_tp(False, "测试切到鼠标")
+    check("切换: 鼠标模式 = False", tm.tp_on is False, "tp_on=%s" % tm.tp_on)
+    check("切换: 切走触摸时补发全 0 触摸报告 (抬指)",
+          bool(hid.tp), "tp=%d 条" % len(hid.tp))
+    check("切换: 切到鼠标时松开左键", hid.buttons == 0, "buttons=%d" % hid.buttons)
+    tm.set_tp(True, "测试切回触摸")
+    check("切换: 触摸模式 = True", tm.tp_on is True, "tp_on=%s" % tm.tp_on)
+    check("切换: 指针位置作废 (下次落手重锚)",
+          tm.ap.x is None and tm.ap.y is None, "x=%s y=%s" % (tm.ap.x, tm.ap.y))
+
+
+def case_keepalive():
+    """空闲保活: 没对端要停表, 触摸模式发"全抬指", 鼠标模式发零位移, 手势中绝不插。"""
+    hid = FakeTpHid()
+    d = m.Daemon.__new__(m.Daemon)          # 只要 _keepalive_cb, 不走 __init__ (会连总线)
+    d.hid = hid
+    d.touch = m.TouchMouse(hid, sens=2.2, mode="abs")
+    d.touch.tp_on = True
+
+    hid.int_conn = None
+    got = d._keepalive_cb()
+    check("保活: 没连对端 → 停表且不发", got is False and not hid.tp,
+          "返回=%s 触摸=%d" % (got, len(hid.tp)))
+
+    hid.int_conn = object()                 # 假装中断通道在
+    got = d._keepalive_cb()
+    sent = hid.tp[-1] if hid.tp else None
+    check("保活: 触摸模式发全抬指 (无手指)",
+          got is True and sent == ((0, 0, 0, 0, 0, 0), (0, 0, 1, 0, 0, 0)),
+          "发的是 %s" % (sent,))
+    check("保活: 触摸模式不掺鼠标报告", not hid.events, "mouse=%d 条" % len(hid.events))
+    check("保活: 统计分流, 不污染 触摸报告 计数", hid.tp_kinds[-1] == "ka",
+          "kind=%s" % (hid.tp_kinds[-1] if hid.tp_kinds else "-"))
+
+    d.touch.tp_on = False
+    n0 = len(hid.tp)
+    got = d._keepalive_cb()
+    last = hid.events[-1] if hid.events else None
+    check("保活: 鼠标模式发零位移零按键",
+          got is True and last == (0, 0, 0, 0) and len(hid.tp) == n0,
+          "mouse=%s 新增触摸=%d" % (last, len(hid.tp) - n0))
+
+    # 手势进行中不许插报告 (会打断拖动)
+    d.touch.tp_on = True
+    d.touch.slots[0] = {"down": True}
+    n_tp, n_m = len(hid.tp), len(hid.events)
+    got = d._keepalive_cb()
+    check("保活: 手势进行中跳过",
+          got is True and len(hid.tp) == n_tp and len(hid.events) == n_m,
+          "触摸 +%d 鼠标 +%d" % (len(hid.tp) - n_tp, len(hid.events) - n_m))
+
+
+class FakeTpHid(FakeHid):
+    """带绝对触摸 (Report ID 4) 的假 HID, 记录 touch_report 调用。"""
+
+    def __init__(self):
+        FakeHid.__init__(self)
+        self.tp = []
+        self.tp_kinds = []
+
+    def touch_report(self, f0, f1, kind="touch"):
+        self.tp.append((f0, f1))
+        self.tp_kinds.append(kind)
+        return True
+
+
+def case_peer_gone():
+    """断开回调: 停保活 + 清 `对端=`, 别让状态文件留着上一台手机。"""
+    hid = FakeTpHid()
+    d = m.Daemon.__new__(m.Daemon)
+    d.hid = hid
+    d.touch = m.TouchMouse(hid, sens=2.2, mode="abs")
+    d.peer_name, d.peer_why = "nubia Z17 miniS", "非 Apple 设备"
+    hid.stats = {"peer": "DC:F0:90:26:36:C0"}
+    d._ka_src = 12345                      # 假装保活定时器在跑
+    d._peer_seen = True                    # 本次运行连上过 (__new__ 不走 __init__)
+    d._gone_since = None                   # 还没断过
+    stopped = []
+    d._keepalive_stop = lambda: stopped.append(1) or setattr(d, "_ka_src", None)
+    d.dump_status = lambda: stopped.append("status")
+    d._on_peer_gone()
+    check("断开: 停保活", stopped and stopped[0] == 1, "调用序列=%s" % (stopped,))
+    check("断开: 刷新状态文件", "status" in stopped, "调用序列=%s" % (stopped,))
+    check("断开: 清空 对端/端", (hid.stats.get("peer"), d.peer_name) == ("", ""),
+          "对端=%r 端=%r" % (hid.stats.get("peer"), d.peer_name))
+    # 断开时刻必须记下来: 状态行靠它算"断了多少秒", 也是"要不要提示用户去点手机"的依据
+    check("断开: 记下断开时刻", isinstance(d._gone_since, float), "gone_since=%r" % (d._gone_since,))
+
+
+def main():
+    print("被测文件: %s" % SRC)
+    print("参数: SENS=%.1f DRAG_HOLD=%dms CLICK_MAX=%dms 死区=%dpx SCROLL_STEP=%dpx"
+          % (m.SENS, m.DRAG_HOLD_MS, m.CLICK_MAX_MS, m.MOVE_DEADBAND,
+             m.SCROLL_STEP_PX))
+    for fn in (case_report_map, case_tap, case_double_tap, case_drag,
+               case_two_finger_scroll, case_long_press_no_move, case_peer_mode,
+               case_keepalive, case_peer_gone):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            check(fn.__name__, False, "异常: %r" % (e,))
+    print()
+    bad = 0
+    for name, ok, detail in results:
+        print("  %s %-28s %s" % ("✓" if ok else "✗", name, detail))
+        if not ok:
+            bad += 1
+    print("\n合计 %d 项, 通过 %d, 失败 %d" % (len(results), len(results) - bad, bad))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

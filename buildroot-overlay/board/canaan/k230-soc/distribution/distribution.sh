@@ -121,9 +121,11 @@ get_image_last_name() {
 
 
 # ---------------------------------------------------------------------------
-# K230 本地补丁 (2026-10-20): 发行版 rootfs 内置常用命令 + 板载 WiFi 预配置
-#   文件: distribution/k230_extras/ (20-wlan0.network / wpa_supplicant-wlan0.conf / setup_wifi.sh)
-#   凭证: distribution/k230_extras/root/wifi.secret (build 机本地文件, 不入 git)
+# K230 本地补丁 (2026-10-20): 发行版 rootfs 内置常用命令 + 投屏栈
+#   文件: distribution/k230_extras/ (投屏二进制/服务/脚本)
+#   ★ 2026-11-04: **不再预置 station WiFi** (主人: "WiFi 只用于投屏") ——
+#     删了 20-wlan0.network / wpa_supplicant-wlan0.conf / setup_wifi.sh,
+#     并 mask 掉 wpa_supplicant.service 与 wpa_supplicant@wlan0.service。
 #   说明: K230/docs/ROOTFS_UBUNTU.md §9
 # ---------------------------------------------------------------------------
 k230_chroot_install() {
@@ -226,30 +228,26 @@ k230_apply_extras() {
         "${K230_SDK_ROOT}/buildroot-overlay/board/canaan/k230-soc/distribution/k230_extras_build.sh" \
         || { print_red "K230 extras: 源码编译失败"; exit 1; }
 
-    print_blue "K230 extras: 覆盖 network / wpa_supplicant / setup_wifi.sh ..."
+    print_blue "K230 extras: 覆盖 network / 投屏栈 (station WiFi 已按主人要求移除) ..."
     cp -a "${extras}/." "${rootfs}/"
 
-    # 可选: build 机本地 WiFi 凭证 (SSID|PASS), 烧进镜像即上电自连
-    local secret="${extras}/root/wifi.secret"
-    local wpa_conf="${rootfs}/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"
-    if [ -f "${secret}" ] && command -v wpa_passphrase >/dev/null 2>&1; then
-        local w_ssid w_pass
-        w_ssid="$(cut -d'|' -f1 "${secret}")"
-        w_pass="$(cut -d'|' -f2- "${secret}")"
-        if [ -n "${w_ssid}" ] && [ -n "${w_pass}" ]; then
-            print_blue "K230 extras: 预置 WiFi 凭证 (SSID=${w_ssid})"
-            if printf '%s' "${w_pass}" | grep -Eq '^[0-9a-fA-F]{64}$'; then
-                # 第二段已是 64 位 hex PSK (与 SSID 绑定), 直接写
-                printf 'network={\n\tssid="%s"\n\tpsk=%s\n}\n' "${w_ssid}" "${w_pass}" >> "${wpa_conf}"
-            else
-                wpa_passphrase "${w_ssid}" "${w_pass}" >> "${wpa_conf}"
-                sed -i '/^[[:space:]]*#psk=/d' "${wpa_conf}"
-            fi
-        fi
-    else
-        print_yellow "K230 extras: 无 ${secret}, 镜像不含 WiFi 凭证 (上板跑 /root/setup_wifi.sh <PASS>)"
-    fi
-    chmod 600 "${wpa_conf}"
+    # ★ 2026-11-04 主人定: 「我的 WiFi 只用于投屏, 不是这些」⇒ 镜像**不再预置 station (sta) 配置**。
+    #   已删三件套 (备份在 K230/archive/bak-20261104-sta-removed/):
+    #     etc/wpa_supplicant/wpa_supplicant-wlan0.conf   (连 AP 的凭证)
+    #     etc/systemd/network/20-wlan0.network           (让 networkd 用 wlan0 跑 DHCP)
+    #     root/setup_wifi.sh                             (上板配 STA 的脚本)
+    #   并 mask 掉两个单元 (见 k230_extras/etc/systemd/system/ 里的 /dev/null 软链):
+    #     wpa_supplicant.service / wpa_supplicant@wlan0.service
+    #   ⇒ wlan0 只归 wfd-p2p.sh 自己拉起的 P2P supplicant 使用, 不会再出现两个 supplicant 抢网卡。
+    #   要临时把 wlan0 当 STA 用 (连 AP 上网/调试), 手动: unmask 两单元 + 放回 conf (见备份目录)。
+    print_blue "K230 extras: station WiFi 已移除 (WiFi 只给 P2P 投屏); 兜底 mask 两个 supplicant 单元"
+    for u in wpa_supplicant.service "wpa_supplicant@wlan0.service"; do
+        rm -f "${rootfs}/etc/systemd/system/multi-user.target.wants/${u}" 2>/dev/null || true
+        ln -sfn /dev/null "${rootfs}/etc/systemd/system/${u}"
+    done
+    rm -f "${rootfs}/etc/wpa_supplicant/wpa_supplicant-wlan0.conf" \
+          "${rootfs}/etc/systemd/network/20-wlan0.network" \
+          "${rootfs}/root/setup_wifi.sh" 2>/dev/null || true
 
     if [ "${distname}" = "ubuntu" ]; then
         k230_chroot_install "${rootfs}" \

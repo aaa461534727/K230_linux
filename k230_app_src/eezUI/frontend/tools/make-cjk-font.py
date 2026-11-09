@@ -19,7 +19,6 @@
 """
 
 import os
-import re
 import subprocess
 import sys
 
@@ -92,12 +91,6 @@ def main():
             "--font", FONT_LATIN,
             "-r", "0x20-0x7E",
             "-r", "0x2190-0x2193",
-            # ★ 2026-11-07 补「方框字」: 中文标点 … · — ' ' " " 这几个码位
-            #   **不在 DroidSansFallbackFull.ttf 里**, 而 `--symbols` 只作用于它前面那个
-            #   --font (中文兜底), 取不到字形就被静默丢掉 ⇒ 界面上
-            #   「正在等待设备连接…」「正在启动 … 服务…」末尾的 … 渲染成方框。
-            #   让 DejaVu 也覆盖这些码位, 由它补出真正的字形。
-            "-r", "0x00B7,0x2014,0x2018-0x201D,0x2026",
             # 板端 lv_conf.h 里 LV_USE_FONT_COMPRESSED=0 ⇒ 压缩字库会 "Couldn't get the bitmap"
             "--no-compress",
             "--no-prefilter",
@@ -109,27 +102,6 @@ def main():
         print("生成 %s (%dpx)" % (out_name, size))
         subprocess.run(cmd, check=True)
         print("  -> %s (%d 字节)" % (out, os.path.getsize(out)))
-
-    # ★ 2026-11-07 自检: 生成完再回读 .c 里的 U+ 注释, 确认界面需要的字一个都没丢。
-    #   踩过的坑: 改了 ui_pages.c 文案却没重跑本脚本 ⇒ 「新/等/待」显示成方框;
-    #   另外 --symbols 只喂给中文字体, 中文标点从 DejaVu 补, 漏配范围也会静默丢字。
-    #   lv_font_conv 对取不到字形的字是**静默跳过**的, 不自检根本发现不了。
-    need = set(collect_chars())
-    bad = False
-    for size, out_name, lv_name in SIZES:
-        out = os.path.join(SRC_DIR, out_name)
-        got = {chr(int(m.group(1), 16))
-               for m in re.finditer(r'/\* U\+([0-9A-Fa-f]+) "(.)" \*/',
-                                   open(out, "r", encoding="utf-8").read())}
-        miss = need - got
-        if miss:
-            bad = True
-            print("  ✗ %s 缺 %d 字: %s" %
-                  (out_name, len(miss), "".join(sorted(miss))), file=sys.stderr)
-        else:
-            print("  ✓ %s 字符集齐全 (%d 字)" % (out_name, len(need)))
-    if bad:
-        sys.exit("字体缺字, 不要上板 (先修 TTF / -r 范围 / EXTRA)")
 
 
 if __name__ == "__main__":

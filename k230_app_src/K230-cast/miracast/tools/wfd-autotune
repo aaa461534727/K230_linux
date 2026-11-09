@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""wfd-autotune — 按手机自适应选 Miracast 帧率档 (720p30 / 720p60), 不写死机型.
+
+背景 (K230/docs/QUIRKS.md §6): 同一块板、同一份 sink, 两台手机在 60fps 档的板端
+数字完全相同, 差别全在手机侧, 而且是两个相反的结论:
+  · 恒定码率机 (努比亚类): 30fps 平稳; 升 60 后码率不涨 ⇒ 每帧比特砍半 (糊),
+    编码器 16.7 ms 预算吃满 ⇒ 丢包/自己掐会话 ⇒ 60fps 更差。
+  · 突发出帧机 (K80 类): 30fps 平均够但 max 120~150 ms ⇒ 60 Hz 屏上 2/3/4 vblank
+    混排 (judder); 升 60 后被逼成 16.67 ms 均匀节拍 ⇒ 反而顺。
+
+WFD 协议里**没有"帧率"字段**, 只有 M3 的 CEA 位图, 而且每次会话开头就定死
+(中途改不了) ⇒ 自适应的最小粒度只能是「本次会话测量, 下次会话生效」:
+
+  1. 陌生手机 → 先给 0x20 (720p30, WFD 强制档, 所有手机都支持, 60 Hz 屏上容错最大);
+  2. 会话结束 (或超时) 采样: 出帧节奏 (源端 avg/max、3+vbl 占比) / 实测 fps /
+     总码率 / 每帧字节 / 丢包;
+  3. 30fps 档确实在抖 (3+vbl ≥10% 或源端 max >100 ms), 且没丢包 ⇒ 下次用
+     **0x60 (两档都广告, native 指 60)** 试一次:
+       · 用 0x60 而不是 0x40, 是因为「只广告 60」对不支持 60 的手机会没档可选;
+         0x60 时 native/preferred 已指向 bit6, 支持 60 的手机一律挑 60 (= 强制),
+         不支持的自己退 720p30, 不会黑屏。
+  4. 试完 (0x60 那次会话) 看码率有没有跟着涨、每帧字节是不是砍半:
+       · 涨了 (≥10%) 且没丢包 ⇒ 锁 0x40 (只广告 60, 稳);
+       · 没涨 (恒定码率机) / 出不到 50 fps / 丢包 >1% ⇒ 退回 0x20 并锁 30。
+  5. 锁定后不再自动改 (手机换代/换机想重测: wfd-autotune reset)。
+
+⚠ 为什么不能只凭 30fps 的 judder 直接判「该升 60」: 实测两台参考机在 30fps 档
+  **都有 judder** (努比亚 28% / K80 25% 左右) —— 30fps 在 60 Hz 屏上天生占 2 vblank,
+  多跳一点就 3+。真正的分水岭是「升 60 后码率能不能跟着涨」, 只能试一次才知道。
+
+数据库: 默认 /var/lib/wfd-autotune/profiles.json (可用 WFD_AUTOTUNE_DB 覆盖),
+按 P2P 对端 go_dev_addr (优先) 或组 SSID 分条 —— 同一台手机下次连回来直接命中。
+
+用法:
+  wfd-autotune select [--peer KEY] [--db PATH]        # 打印该给 sink 的 CEA (如 0x20)
+  wfd-autotune record --peer KEY --cea 0x20 \
+      [--log /var/log/miracast.log] [--offset N]      # 会话结束采样入库
+  wfd-autotune status [--db PATH]                     # 看已学到的机型表
+  wfd-autotune reset [--peer KEY|--all]               # 忘掉学到的结论
+  wfd-autotune replay --peer KEY --cea 0x20 \
+      --stats FILE [--cadence FILE] [--db PATH]       # 离线回放历史日志 (测试用)
+
+退出码: 0 正常; select 在数据库不可用时仍打印默认档 (0x20) 并返回 0 (不让投屏因它失败)。
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+DEFAULT_DB = os.environ.get("WFD_AUTOTUNE_DB", "/var/lib/wfd-autotune/profiles.json")
+SAFE = 0x20        # 1280x720p30 —— WFD 强制档, 所有手机都支持
+FAST = 0x40        # 只广告 1280x720p60 (已确认扛得住的手机用这个)
+PROBE = 0x60       # 720p60|720p30 双档, native 指向 60 —— 试探用 (不支持 60 的能退回 30)
+HEX = {SAFE: "0x20", FAST: "0x40", PROBE: "0x60"}
+
+# 判定阈值 (集中放这里, 现场想调只改这些数字)
+JUDDER_RATIO = 0.10      # 60 帧里 >=6 帧跳 3+ vblank ⇒ 判 judder
+JUDDER_MAX_MS = 100.0    # 源端单帧间隔 >100 ms ⇒ 判 judder (即使平均值正常)
+MIN_FPS_30 = 27.0        # 30fps 档至少要真的出到 27 帧
+MIN_FPS_60 = 50.0        # 60fps 档出不到 50 帧 ⇒ 手机扛不住
+MAX_LOSS = 0.01          # 丢包率 >1% ⇒ 这一档不合格
+BITRATE_GAIN = 1.10      # (仅用于日志/参考: 60fps 档码率涨幅, 受内容影响, 不单独判死)
+BPF_RATIO = 0.75         # 每帧字节掉到 30fps 基线的 75% 以下 ⇒ 在拿画质换帧数
+BPF_FLOOR = 6144         # 720p60 每帧 <6 KB 视为画面明显发糊 (需与 BPF_RATIO 同时成立)
+MAX_HISTORY = 6
+
+RE_STAT = re.compile(
+    r"统计:\s*rtp=(\d+)\s+bytes=(\d+)\s+frames=(\d+)\b.*?\blost=(\d+)")
+RE_TS = re.compile(r"\[(\d{1,2}):(\d{2}):(\d{2})\]")
+RE_CAD = re.compile(r"帧间隔\s*avg\s*([\d.]+)\s*ms\s*max\s*([\d.]+)")
+RE_VBL = re.compile(r"同vbl\s*(\d+)\s*/\s*1vbl\s*(\d+)\s*/\s*2vbl\s*(\d+)\s*/\s*3\+vbl\s*(\d+)")
+RE_JFPS = re.compile(r"⇒\s*实测\s*([\d.]+)\s*fps")
+
+
+# ---------------------------------------------------------------- 小工具
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2.0
+
+
+def parse_hex(s):
+    try:
+        v = int(str(s).strip(), 0)
+    except (TypeError, ValueError):
+        return None
+    return v if v in HEX else None
+
+
+def load_db(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict) or not isinstance(d.get("peers"), dict):
+            raise ValueError("bad schema")
+        return d
+    except (OSError, ValueError):
+        return {"version": 1, "default": HEX[SAFE], "peers": {}}
+
+
+def save_db(path, db):
+    d = os.path.dirname(path) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".wfd-autotune.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=1, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        print("wfd-autotune: 写数据库失败 (%s): %s" % (path, e), file=sys.stderr)
+
+
+# ---------------------------------------------------------------- 采样解析
+
+def parse_stats(text):
+    """从 sink 的 `[HH:MM:SS] 统计: rtp=.. bytes=.. frames=.. lost=..` 行算稳态指标."""
+    rows = []
+    for line in text.splitlines():
+        m = RE_STAT.search(line)
+        if not m:
+            continue
+        t = RE_TS.search(line)
+        ts = None
+        if t:
+            ts = int(t.group(1)) * 3600 + int(t.group(2)) * 60 + int(t.group(3))
+        rows.append({"ts": ts, "rtp": int(m.group(1)), "bytes": int(m.group(2)),
+                     "frames": int(m.group(3)), "lost": int(m.group(4))})
+    deltas = []
+    for a, b in zip(rows, rows[1:]):
+        if a["ts"] is None or b["ts"] is None:
+            continue
+        dt = b["ts"] - a["ts"]
+        if dt <= 0 or dt > 120:
+            continue
+        df = b["frames"] - a["frames"]
+        db_ = b["bytes"] - a["bytes"]
+        drtp = b["rtp"] - a["rtp"]
+        dlost = b["lost"] - a["lost"]
+        if df <= 0 or db_ <= 0:
+            continue
+        deltas.append({
+            "fps": df / float(dt),
+            "bitrate": db_ * 8.0 / dt / 1e6,          # Mbit/s
+            "bpf": db_ / float(df),                    # 每帧字节
+            "loss": (dlost / float(drtp)) if drtp > 0 else 0.0,
+        })
+    if not deltas:
+        return None
+    use = deltas[-3:]
+    dur = None
+    if len(rows) > 1 and rows[0]["ts"] is not None and rows[-1]["ts"] is not None:
+        dur = rows[-1]["ts"] - rows[0]["ts"]
+    return {
+        "fps": median([d["fps"] for d in use]),
+        "bitrate": median([d["bitrate"] for d in use]),
+        "bpf": median([d["bpf"] for d in use]),
+        "loss": median([d["loss"] for d in use]),
+        "dur_s": dur,
+        "samples": len(deltas),
+    }
+
+
+def parse_cadence(text):
+    """从 drmplay 的 `源端节拍` / `显示节拍` 行算 judder 指标."""
+    cad, vbl, jfps = [], [], []
+    for line in text.splitlines():
+        m = RE_CAD.search(line)
+        if m:
+            cad.append((float(m.group(1)), float(m.group(2))))
+        m = RE_VBL.search(line)
+        if m:
+            same, v1, v2, v3 = (int(g) for g in m.groups())
+            tot = same + v1 + v2 + v3
+            if tot > 0:
+                vbl.append(v3 / float(tot))
+        m = RE_JFPS.search(line)
+        if m:
+            jfps.append(float(m.group(1)))
+    if not cad and not vbl and not jfps:
+        return {}
+    use_cad = cad[-3:]
+    return {
+        "cad_avg": median([c[0] for c in use_cad]),
+        "cad_max": max((c[1] for c in use_cad), default=None),
+        "judder": median(vbl[-3:]),
+        "disp_fps": median(jfps[-3:]),
+    }
+
+
+def journal_cadence(lines=400):
+    """读 k230-screen 的 journal 尾部 (drmplay 的节拍行打在它下面)."""
+    for cmd in (["journalctl", "-u", "k230-screen", "-o", "cat", "-n", str(lines)],
+                ["journalctl", "-o", "cat", "-n", str(lines)]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and ("节拍" in out.stdout):
+            return out.stdout
+    return ""
+
+
+def read_slice(path, offset):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if offset > 0:
+                f.seek(offset)
+            return f.read()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- 决策
+
+def evaluate(sess, prof):
+    """返回 (新 cea, 新 state, 理由). 纯函数, 便于离线回放测试."""
+    cea = prof.get("cea", HEX[SAFE])
+    state = prof.get("state", "unknown")
+    if str(state).startswith("manual"):
+        return cea, state, "手动指定 %s (不再自动改; 恢复自动: wfd-autotune reset)" % cea
+    fps = sess.get("fps") or 0.0
+    loss = sess.get("loss") or 0.0
+    judder = sess.get("judder")
+    cad_max = sess.get("cad_max")
+
+    if cea == HEX[SAFE]:
+        # 30fps 档: 只判断"要不要试 60", 绝不在这里判差 (30 是安全档)
+        if state in ("locked30", "locked60"):
+            return cea, state, "已锁定 %s" % cea
+        if fps < MIN_FPS_30:
+            return cea, state, "30fps 档实际只出 %.1f fps ⇒ 手机本身就这样, 保持 30" % fps
+        if loss > MAX_LOSS:
+            return cea, state, "30fps 档丢包 %.2f%% ⇒ 先保 30, 不试 60" % (loss * 100)
+        if os.environ.get("WFD_AUTOTUNE_PROBE", "1") == "0":
+            return cea, state, "探测已关 (WFD_AUTOTUNE_PROBE=0) ⇒ 保持 30"
+        why = "30fps 稳定 (%.1f fps, 丢包 %.2f%%)" % (fps, loss * 100)
+        if judder is not None or cad_max is not None:
+            why += ", 节奏 3+vbl %s / max %s ms" % (
+                "%.0f%%" % (judder * 100) if judder is not None else "-",
+                "%.0f" % cad_max if cad_max else "-")
+        return HEX[PROBE], "probe60", why + " ⇒ 下次用 0x60 试一次 720p60 (每台只试一次)"
+
+    # 60fps 档 (0x40 已锁定 / 0x60 试探): 只在"手机真扛得住"时留下
+    b30 = prof.get("baseline30") or {}
+    if fps < MIN_FPS_60:
+        return HEX[SAFE], "locked30", "60fps 档只出 %.1f fps ⇒ 手机没用 60 (或扛不住), 退回 720p30" % fps
+    if loss > MAX_LOSS:
+        return HEX[SAFE], "locked30", "60fps 档丢包 %.2f%% ⇒ 退回 720p30" % (loss * 100)
+    # 画质判据: 60fps 下每帧数据掉太多 ⇒ 这一档是在牺牲画质换帧数。
+    # 两条同时成立才判 (单看绝对值会被"静态画面天然小帧"误伤):
+    #   ① 每帧字节 < BPF_FLOOR (720p60 低于这个量, 画面明显发糊)
+    #   ② 只有 30fps 时的一半上下
+    bpf = sess.get("bpf") or 0
+    floor = float(os.environ.get("WFD_AUTOTUNE_BPF_FLOOR", str(BPF_FLOOR)))
+    if bpf and bpf < floor and b30.get("bpf") and bpf / b30["bpf"] < BPF_RATIO:
+        gain = ((sess.get("bitrate") or 0) / b30["bitrate"]) if b30.get("bitrate") else 0
+        return HEX[SAFE], "locked30", (
+            "60fps 每帧只有 %.1f KB (30fps 时 %.1f KB, 剩 %.0f%%; 码率 %+.0f%%) "
+            "⇒ 这一档在拿画质换帧数, 退回 720p30"
+            % (bpf / 1024.0, b30["bpf"] / 1024.0, bpf / b30["bpf"] * 100,
+               (gain - 1) * 100 if gain else 0))
+    return HEX[FAST], "locked60", "60fps 稳定 (%.1f fps, 丢包 %.2f%%, 每帧 %.1f KB) ⇒ 锁定 720p60" % (
+        fps, loss * 100, (sess.get("bpf") or 0) / 1024.0)
+
+
+# ---------------------------------------------------------------- 子命令
+
+def cmd_select(args):
+    db = load_db(args.db)
+    cea = parse_hex((db.get("peers", {}).get(args.peer or "", {}) or {}).get("cea"))
+    if cea is None:
+        cea = parse_hex(db.get("default")) or SAFE
+    print(HEX[cea])
+    return 0
+
+
+def cmd_record(args):
+    cea = parse_hex(args.cea)
+    if cea is None:
+        print("wfd-autotune: --cea 必须是 0x20 / 0x40 / 0x60", file=sys.stderr)
+        return 2
+    if not args.peer:
+        print("wfd-autotune: 没有对端标识, 跳过学习", file=sys.stderr)
+        return 0
+
+    stats_text = args.stats_text if args.stats_text is not None else \
+        read_slice(args.log, args.offset)
+    sess = parse_stats(stats_text)
+    if not sess:
+        print("wfd-autotune: 本次会话没采到 统计 行, 跳过", file=sys.stderr)
+        return 0
+    cad_text = args.cadence_text if args.cadence_text is not None else journal_cadence()
+    sess.update(parse_cadence(cad_text))
+
+    # 管线会并发触发多次 record (重连/重试), 读改写要串行, 否则档案会互相覆盖
+    d = os.path.dirname(args.db) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        lock = open(args.db + ".lock", "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        lock = None
+    try:
+        db = load_db(args.db)
+        peers = db.setdefault("peers", {})
+        prof = peers.setdefault(args.peer, {"cea": HEX[SAFE], "state": "unknown"})
+        prof.setdefault("sessions", 0)
+        prof["sessions"] += 1
+        if args.name:
+            prof["name"] = args.name
+        if cea == SAFE:
+            prof["baseline30"] = {"fps": sess.get("fps"), "bitrate": sess.get("bitrate"),
+                                  "bpf": sess.get("bpf")}
+        new_cea, new_state, why = evaluate(sess, prof)
+        prof.update({"cea": new_cea, "state": new_state,
+                     "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "last": {k: (round(v, 4) if isinstance(v, float) else v)
+                              for k, v in sess.items()}})
+        hist = prof.setdefault("history", [])
+        hist.append({"ts": prof["updated"], "cea": HEX[cea], "state": new_state,
+                     "fps": sess.get("fps"), "judder": sess.get("judder")})
+        del hist[:-MAX_HISTORY]
+        save_db(args.db, db)
+    finally:
+        if lock is not None:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+    if not args.quiet:
+        print("[autotune] %s: %s → %s (%s)" % (args.peer, HEX[cea], new_cea, why))
+        print("[autotune]   采样: fps=%.1f 码率=%.2f Mbit/s 每帧=%.0f B 丢包=%.2f%% "
+              "3+vbl=%s 源端max=%s ms" % (
+                  sess.get("fps") or 0, sess.get("bitrate") or 0, sess.get("bpf") or 0,
+                  (sess.get("loss") or 0) * 100,
+                  "%.0f%%" % (sess["judder"] * 100) if sess.get("judder") is not None else "-",
+                  "%.1f" % sess["cad_max"] if sess.get("cad_max") else "-"))
+    return 0
+
+
+def cmd_prefer(args):
+    """手动指定某台手机的档位 (自动判决不合意时用; 之后不再自动改)."""
+    cea = parse_hex(args.cea)
+    if cea is None:
+        print("wfd-autotune: --cea 必须是 0x20 / 0x40 / 0x60", file=sys.stderr)
+        return 2
+    if not args.peer:
+        print("wfd-autotune: prefer 需要 --peer", file=sys.stderr)
+        return 2
+    db = load_db(args.db)
+    prof = db.setdefault("peers", {}).setdefault(
+        args.peer, {"sessions": 0, "cea": HEX[SAFE], "state": "unknown"})
+    prof.update({"cea": HEX[cea], "state": "manual",
+                 "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    save_db(args.db, db)
+    print("%s → %s (手动, 不再自动调整)" % (args.peer, HEX[cea]))
+    return 0
+
+
+def cmd_status(args):
+    db = load_db(args.db)
+    peers = db.get("peers", {})
+    print("数据库: %s   默认档: %s" % (args.db, db.get("default", HEX[SAFE])))
+    print("%-20s %-8s %-9s %5s %8s %9s %8s  %s" %
+          ("对端", "档位", "状态", "会话", "fps", "Mbit/s", "丢包", "名称"))
+    for key, p in sorted(peers.items(), key=lambda kv: -kv[1].get("sessions", 0)):
+        last = p.get("last") or {}
+        print("%-20s %-8s %-9s %5s %8.1f %9.2f %7.2f%%  %s" % (
+            key[:20], p.get("cea", "?"), p.get("state", "?"), p.get("sessions", 0),
+            last.get("fps") or 0, last.get("bitrate") or 0,
+            (last.get("loss") or 0) * 100, p.get("name", "-")))
+    if not peers:
+        print("(还没学到任何机型: 所有陌生手机都按默认档 %s 走)" % db.get("default"))
+    return 0
+
+
+def cmd_reset(args):
+    db = load_db(args.db)
+    if args.all:
+        db["peers"] = {}
+    elif args.peer:
+        db.get("peers", {}).pop(args.peer, None)
+    else:
+        print("wfd-autotune: reset 需要 --peer 或 --all", file=sys.stderr)
+        return 2
+    save_db(args.db, db)
+    print("已清除 (数据库 %s)" % args.db)
+    return 0
+
+
+def cmd_replay(args):
+    """离线回放: 把历史日志当成一次会话喂进决策, 打印结论 (测试/审计用)."""
+    stats_text = read_slice(args.stats, 0)
+    cad_text = read_slice(args.cadence, 0) if args.cadence else stats_text
+    sess = parse_stats(stats_text)
+    if not sess:
+        print("replay: %s 里没有 统计 行" % args.stats, file=sys.stderr)
+        return 2
+    sess.update(parse_cadence(cad_text))
+    db = load_db(args.db)
+    peers = db.setdefault("peers", {})
+    prof = peers.setdefault(args.peer, {"cea": HEX[SAFE], "state": "unknown"})
+    prof.setdefault("sessions", 0)
+    prof["sessions"] += 1
+    cea = parse_hex(args.cea) or SAFE
+    if cea == SAFE:
+        prof["baseline30"] = {"fps": sess["fps"], "bitrate": sess["bitrate"],
+                              "bpf": sess["bpf"]}
+    new_cea, new_state, why = evaluate(sess, prof)
+    prof.update({"cea": new_cea, "state": new_state})
+    save_db(args.db, db)
+    print("%s  cea=%s → %s  [%s]" % (args.peer, HEX[cea], new_cea, why))
+    print("    fps=%.1f 码率=%.2f Mbit/s 每帧=%.0f B 丢包=%.2f%% 3+vbl=%s 源端avg/max=%s/%s ms"
+          % (sess["fps"], sess["bitrate"], sess["bpf"], sess["loss"] * 100,
+             "%.0f%%" % (sess["judder"] * 100) if sess.get("judder") is not None else "-",
+             "%.2f" % sess["cad_avg"] if sess.get("cad_avg") else "-",
+             "%.1f" % sess["cad_max"] if sess.get("cad_max") else "-"))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="wfd-autotune", description="按手机自适应 Miracast 帧率档")
+    ap.add_argument("--db", default=DEFAULT_DB)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("select", help="给 sink 用的 CEA 档位")
+    p.add_argument("--peer", default=os.environ.get("WFD_PEER", ""))
+    p.set_defaults(func=cmd_select)
+
+    p = sub.add_parser("record", help="会话结束采样入库")
+    p.add_argument("--peer", default=os.environ.get("WFD_PEER", ""))
+    p.add_argument("--name", default="")
+    p.add_argument("--cea", required=True)
+    p.add_argument("--log", default="/var/log/miracast.log")
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_record, stats_text=None, cadence_text=None)
+
+    p = sub.add_parser("status", help="看已学到的机型表")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("prefer", help="手动指定某台手机的档位 (覆盖自动判决)")
+    p.add_argument("--peer", required=True)
+    p.add_argument("--cea", required=True)
+    p.set_defaults(func=cmd_prefer)
+
+    p = sub.add_parser("reset", help="忘掉学到的结论")
+    p.add_argument("--peer", default="")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("replay", help="离线回放历史日志 (测试)")
+    p.add_argument("--peer", required=True)
+    p.add_argument("--cea", required=True)
+    p.add_argument("--stats", required=True)
+    p.add_argument("--cadence", default="")
+    p.set_defaults(func=cmd_replay)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
