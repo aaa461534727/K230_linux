@@ -7,7 +7,8 @@
 # 想先确认 unit 名字: systemctl list-unit-files | grep -E 'k230|carplay'
 
 # Miracast (安卓无线投屏, 走 wlan0 的 P2P)
-UNITS_miracast="k230-miracast"
+# ★ 2026-11-10: current product form = board GO + phone client ⇒ goneg unit.
+UNITS_miracast="k230-miracast-goneg"
 
 # AirPlay (iOS 镜像, uxplay 在 7100/7101)
 UNITS_airplay="k230-airplay"

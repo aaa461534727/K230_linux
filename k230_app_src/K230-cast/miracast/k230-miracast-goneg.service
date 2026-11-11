@@ -1,0 +1,27 @@
+[Unit]
+Description=K230 Miracast GO-negotiation mode (P2P listen + intent 15, peer joins as client)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Environment=WFD_GO_INTENT=15
+Environment=WFD_DEVICE_NAME=K230-CAST
+Environment=WFD_IFACE=wlan0
+Environment=WFD_GO_FREQ=2437
+Environment=WFD_FORCE_OPER_CH=1
+Environment=WFD_PERSISTENT_RECONNECT=1
+Environment=WFD_DEC_LAT=1
+Environment=WFD_SHM=/run/wfd-frame
+Environment=WFD_CEA=0x20
+# 2026-11-10: 开机时 8189fs 可能 probe 失败 (rtw_os_ndev_register WARNING ⇒ 无 wlan0),
+# 等接口; 12 s 仍没有就重载一次模块 (带 modprobe.d 的 k230_group_capab=-1)。
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 40); do [ -e /sys/class/net/wlan0 ] && exit 0; if [ "$i" = "12" ]; then /usr/sbin/modprobe -r 8189fs 2>/dev/null; /usr/sbin/modprobe 8189fs 2>/dev/null; fi; sleep 1; done; exit 1'
+ExecStartPre=/bin/sh -c 'echo 15 > /run/wfd-go-intent'
+ExecStartPre=/bin/rm -f /run/wfd-p2p.hold
+ExecStart=/bin/sh -c '/root/wfd-p2p.sh client; exec sleep infinity'
+Restart=no
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

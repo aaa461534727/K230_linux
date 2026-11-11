@@ -52,6 +52,20 @@ printk(走 default_message_loglevel=4) ⇒ 照样上串口。本板 `console=tty
 
 见主仓 `K230/src/miracast/driver/README.md` (补丁 1~4 各一节, 含抓包证据与回滚方式)。
 
+`0104-k230-group-capab-param.patch` (2026-11-10): 把 0100 里"对外强制 `group_capab=0x00`"
+改成模块参数 `k230_group_capab` —— 默认 `0x00` 保持旧行为 (client 形态不受影响),
+`-1` 保留 supplicant 真值 (0x0b), 用于 "板子当 GO" 形态实验。
+
+```bash
+modprobe 8189fs k230_group_capab=-1     # GO 实验
+modprobe 8189fs                          # 回默认 (0x00)
+cat /sys/module/8189fs/parameters/k230_group_capab
+```
+
+2026-11-10 实测产物: `8189fs.ko` 2,446,944 B md5 `7a1dc620c3409481632b76b9bf531baa`;
+param=-1 时 dmesg 不再出现 `K230P2P: group_capab 0x0b -> 0x00`。
+注意: 该开关只解驱动层, 手机仍可能把 GO 判给自己 (见 `K230/logs/20261110-0200-k230-go-intent-experiment.log`)。
+
 ## 应用与验证
 
 ```bash

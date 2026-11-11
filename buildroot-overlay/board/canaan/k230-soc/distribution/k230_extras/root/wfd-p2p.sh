@@ -97,6 +97,16 @@ PIDFILE="${WFD_PIDFILE:-/run/wfd-p2p.pid}"
 #   · 调试脚本要绕过: WFD_FORCE=1 sh wfd-p2p.sh start
 HOLD_FILE="${WFD_HOLD_FILE:-/run/wfd-p2p.hold}"
 PBC_PIDFILE="${WFD_PBC_PIDFILE:-/run/wfd-pbc.pid}"
+# ★ 2026-11-11: client 档暂停 PBC 续期的开关文件。
+#   之前这里是 kill_tree(PBC pid) —— 实测把 client 事件 watcher 自己也杀了:
+#   09:09:37 建组成功打出 "✅ 组已建立" 后立刻 `Killed`, 后面的
+#   prepare_client_net / start_sink_client 一行都没执行 ⇒ 没有 RTSP 拨号
+#   ⇒ 手机( GO )空等 18 s 后 GO_ENDING_SESSION。
+#   改成"只停续期、不杀进程": PBC 循环每 60 s 看一眼这个文件, 存在就跳过。
+PBC_PAUSE="${WFD_PBC_PAUSE:-/run/wfd-pbc.pause}"
+# 2026-11-10: GO-intent 档用文件传递 (让位/清理子进程可能不带 env)
+GO_INTENT="${WFD_GO_INTENT:-$(cat /run/wfd-go-intent 2>/dev/null || echo 0)}"
+case "$GO_INTENT" in ''|*[!0-9]*) GO_INTENT=0 ;; esac
 CTRL_DIR="${WFD_CTRL_DIR:-/run/wpa_supplicant}"
 P2P_CONF="${WFD_P2P_CONF:-/tmp/wfd-p2p.conf}"
 P2P_LOG="${WFD_P2P_LOG:-/tmp/wfd-p2p.log}"
@@ -175,6 +185,96 @@ DEVICE_NAME="${WFD_DEVICE_NAME:-K230-CAST}"
 log()  { printf '[wfd-p2p] %s\n' "$*"; }
 die()  { printf '[wfd-p2p] ✗ %s\n' "$*" >&2; exit 1; }
 
+# ---------------------------------------------------------------- AP 信道 (P3)
+# 2026-11-10 P3「运行期按 AP 信道重下发 listen_channel」—— 海奇最后一条没抄全的
+#   用户态机制: hccast_wifi_mgr.c:652 从 hostapd 反读 AP 信道,
+#   hccast_p2p_ctrl_nl.c:316-330 每次 P2P 初始化 `SET p2p_listen_channel`,
+#   AP 换了信道 P2P 就跟着换。我们这边 listen 只在 write_conf() 时按
+#   WFD_GO_FREQ (unit 里 2437) 静态写死 ⇒ 只有「AP 也恰好是 ch6 且永不变」才对得上。
+#   为什么必须同频 (单 radio 铁证, 2026-10-30 现场): radio 去 ch1 驻留听 P2P 时,
+#   wlan1 的 AP beacon TX packets 连续 3 s 不增长, 手机连 SSID 都完不成 4-way。
+#   信道来源两种都算「AP」:
+#     ① 板子自己的热点 (k230-shared-ap / carlife-ap.sh 起在 wlan1)
+#     ② 板子当 STA 连着的上游路由器 (wlan0 link) —— 同一个射频, P2P listen
+#        也必须落在它那条信道上
+#   只认 2.4G ch1~14 (8189fs 只有 2.4G); P2P 自己的 IFACE 要跳过,
+#   否则会把「我们正在 listen 的信道」当成 AP 信道, 变成自己跟自己对齐。
+AP_FOLLOW="${WFD_AP_FOLLOW:-1}"
+
+chan_of_if() {
+    _ci_dev="$1"
+    _ci_info=$(iw dev "$_ci_dev" info 2>/dev/null || true)
+    case "$_ci_info" in
+        *"type AP"*)
+            _ci_ch=$(printf '%s' "$_ci_info" | sed -n 's/.*channel \([0-9][0-9]*\).*/\1/p' | head -1)
+            if [ -z "${_ci_ch:-}" ]; then
+                # 并发时 (radio 被 P2P 的 listen 占着) 驱动**不报** AP 的 channel,
+                # 现场实测 wlan1 只输出 `type AP` 没有 channel 行。
+                # 回落到 hostapd 实际加载的那份 conf: AP 的信道就是启动时写进去的
+                # 值 (信道不可用 hostapd 直接 AP-FAIL, 不会静默换频)。
+                for _ci_cf in ${WFD_AP_CONF:-/tmp/carlife-hostapd.conf} /etc/hostapd.conf; do
+                    [ -f "$_ci_cf" ] || continue
+                    grep -q "^interface=$_ci_dev" "$_ci_cf" 2>/dev/null || continue
+                    _ci_ch=$(sed -n 's/^channel=\([0-9][0-9]*\).*/\1/p' "$_ci_cf" | head -1)
+                    [ -n "${_ci_ch:-}" ] && break
+                done
+            fi
+            printf '%s' "${_ci_ch:-}"
+            return 0 ;;
+    esac
+    _ci_fr=$(iw dev "$_ci_dev" link 2>/dev/null \
+        | sed -n 's/^[[:space:]]*freq: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    case "${_ci_fr:-}" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if [ "$_ci_fr" -ge 2412 ] && [ "$_ci_fr" -le 2484 ]; then
+        printf '%s' $(( (_ci_fr - 2407) / 5 ))
+    fi
+    return 0
+}
+
+# 输出 "<信道> <接口>"; 没有任何 AP/STA 在用无线时无输出 (返回 1)
+ap_channel_of() {
+    for _ac_d in ${WFD_AP_IFACE:-} wlan1 wlan0; do
+        [ -n "$_ac_d" ] || continue
+        [ "$_ac_d" = "$IFACE" ] && continue
+        [ -e "/sys/class/net/$_ac_d" ] || continue
+        _ac_ch=$(chan_of_if "$_ac_d")
+        if [ -n "${_ac_ch:-}" ]; then
+            printf '%s %s' "$_ac_ch" "$_ac_d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 启动时 (write_conf 之前) 按 AP 信道对齐 listen; 有 AP 就把它排到阶梯第一位,
+# 换信道也先回到 AP 所在信道。显式 WFD_LISTEN_CHANNEL 视为运营者钉死, 不跟随。
+ap_align_init() {
+    [ "$AP_FOLLOW" = "1" ] || return 0
+    [ -z "${WFD_LISTEN_CHANNEL:-}" ] || return 0
+    _ai_info=$(ap_channel_of 2>/dev/null || true)
+    if [ -z "${_ai_info:-}" ]; then
+        log "🔎 无线没有 AP/STA 在跑 ⇒ listen 沿用 ch$LISTEN_CHANNEL (WFD_GO_FREQ 推导)"
+        return 0
+    fi
+    _ai_ch=${_ai_info%% *}
+    _ai_dev=${_ai_info#* }
+    AP_SEEN_CH="$_ai_ch"
+    # AP 在用 ⇒ 信道阶梯收敛到 AP 信道: 单 radio 下 P2P 只能跟 AP 同频,
+    # 这时候还去 ch1/ch11 试探, 换过去就会把 AP 的 beacon 饿死 (2026-10-30 现场:
+    # wlan1 TX packets 连续 3 s 不涨, 手机连 SSID 都完不成)。AP 消失后再放开。
+    CHAN_LADDER="$_ai_ch"
+    if [ "$_ai_ch" = "$LISTEN_CHANNEL" ]; then
+        log "🔎 AP 信道 = ch$_ai_ch ($_ai_dev) ⇒ listen 已一致 (阶梯收敛到 ch$_ai_ch)"
+    else
+        log "🔎 按 AP 信道对齐: listen ch$LISTEN_CHANNEL → ch$_ai_ch ($_ai_dev) (阶梯收敛到 ch$_ai_ch)"
+        LISTEN_CHANNEL=$_ai_ch
+        GO_FREQ=$((2407 + _ai_ch * 5))
+    fi
+    return 0
+}
+
 # ⚠ 已验收基线: GO 位必须显示
 #   2026-10-22 实测: 隐藏 GO 位 (group_capab 0x0b→0x0a) 后, 手机投屏列表里直接消失;
 #   恢复 0x0b 后 beacon 与已验收版逐字节一致 (captures/20261022-1505-k230-v11-fix.pcap)
@@ -209,9 +309,13 @@ backup_conf() {
 
 write_conf() {
     _mode="${1:-go}"
+    # ★ P3: 先按 AP 实际信道对齐 listen (无 AP/STA 时原样不动, 行为与本轮 10/10 一致)
+    ap_align_init
     # client 模式必须让手机赢 GO 协商 (intent 0); go 模式用 autonomous group, 该值不生效
     if [ "$_mode" = "client" ]; then
-        _go_intent_line="p2p_go_intent=0"
+        # 2026-11-10: 第三档 —— 仍做 P2P listen, 但本端 intent 15, 让手机发起
+        # GO Negotiation 时由我们赢 (海奇形态); 只设 WFD_GO_INTENT 时启用。
+        _go_intent_line="p2p_go_intent=${GO_INTENT:-0}"
     else
         _go_intent_line="# p2p_go_intent 默认 7 (autonomous GO 不需要)"
     fi
@@ -492,6 +596,13 @@ start_supplicant() {
         _i=$((_i + 1)); sleep 0.2
     done
     rm -f "$CTRL_DIR/$IFACE" "$CTRL_DIR/p2p-dev-$IFACE" 2>/dev/null || true
+    # ★ 2026-11-10 取证修订: 以前直接 `: > $P2P_LOG` 清空。UI 每个按钮来回都要
+    #   重启本服务 ⇒ 上一轮的 P2P 事件 (PD / GO-NEG / ASSOC 失败原因) 全被抹掉,
+    #   失败轮次事后完全无法判因 (R5 就是"手机发了 PD 但没建组", 证据已丢)。
+    #   改成滚一份 .1: 只保留上一轮, 不占空间, 但足以复盘。
+    if [ -s "$P2P_LOG" ]; then
+        mv -f "$P2P_LOG" "${P2P_LOG}.1" 2>/dev/null || : > "$P2P_LOG"
+    fi
     : > "$P2P_LOG"
     # ★ 2026-11-02: 去掉 -dd。实测待命态下 -dd 每秒往 /tmp 写 ~11 KB 调试日志
     #   (30 s 2190 行), 单核板上白白吃掉 CPU; 排障需要时临时加回即可。
@@ -521,6 +632,8 @@ start_supplicant() {
 
 cmd_start() {
     need_root
+    # ★ 2026-11-11: 清掉上一轮遗留的 PBC 暂停标志 (否则新起的服务永远不续 wps_pbc)
+    rm -f "$PBC_PAUSE" 2>/dev/null || true
     # 自启与调试隔离 (2026-10-26): 调试时执行过 stop 就会留下 HOLD_FILE,
     #   自启看到它**空跑退出**, 绝不抢 wlan1 / 7236 / DRM。要恢复: 本脚本 resume。
     if [ -f "$HOLD_FILE" ] && [ "${WFD_FORCE:-0}" != "1" ]; then
@@ -695,11 +808,17 @@ start_pbc_watcher() {
     #   就把我们自己的 GO 组删掉去当 client, 手机当场连不上 (实测脚本化 GO 点上去无 Station)。
     #   GO 模式只需要一件事: 让 PBC 常驻就绪 (wps_pbc 只有 120 s 有效, 每 60 s 续一次),
     #   手机点选我们时直接作为 client 关联进来。
-    if [ "${WFD_GO_MODE:-0}" = "1" ]; then
+    if [ "${WFD_GO_MODE:-0}" = "1" ] || [ "${GO_INTENT:-0}" -gt 0 ]; then
+        # 2026-11-10: intent 档同样不能启用「让位」—— 那会在收到 GO-Neg/PD 时
+        # 删掉自己、转去当 client, 与"我们赢协商当 GO"目标相反。
         wpa wps_pbc >/dev/null 2>&1 || true
-        ( while :; do sleep 60; wpa wps_pbc >/dev/null 2>&1 || true; done ) &
+        ( while :; do
+            sleep 60
+            [ -f "$PBC_PAUSE" ] && continue
+            wpa wps_pbc >/dev/null 2>&1 || true
+          done ) &
         echo $! > "$PBC_PIDFILE"
-        log "GO 模式: PBC 常驻 (每 60 s 续, 不启用让位逻辑) pid=$(cat "$PBC_PIDFILE" 2>/dev/null)"
+        log "PBC 常驻 (GO_MODE=${WFD_GO_MODE:-0} GO_INTENT=${WFD_GO_INTENT:-0}, 不启用让位逻辑) pid=$(cat "$PBC_PIDFILE" 2>/dev/null)"
         return 0
     fi
     w="$(dirname "$0")/wfd-pbc-watcher.sh"
@@ -925,6 +1044,22 @@ PLAYER_PIDFILE="${WFD_PLAYER_PID:-/run/wfd-player.pid}"
 PLAYER_FIFO_MODE=0
 
 start_player() {
+    # 2026-11-10: 主界面在跑时屏归 LVGL —— 绝不接管 DRM。
+    #   开机时 /run/k230-ui/hold-screen 还不存在, 旧逻辑会 restart k230-screen
+    #   抢走 master, 用户看到的就是"UI 显示不完整/花屏"。
+    # ★ 2026-11-11 修「手机连上了但 K230 屏全黑」: 这里**必须把 PLAYER_FIFO_MODE
+    #   一起置 1**。原来只 return 不置位, 后面 start_sink_client 就按「老管线带
+    #   播放器」拼 PIPE_ONE (`... | v4l2_dec | drmplay`), 这条 drmplay 和
+    #   k230-screen 的常驻 drmplay 抢 CRTC:
+    #     /var/log/miracast-play.log 成片 `✗ SETCRTC(crtc=52 conn=54): Permission denied`
+    #   管线里的 drmplay 抢不到就退, 解码器随即 `发槽号失败: Broken pipe` 自杀
+    #   ⇒ RTSP 建链/PLAY 全成功、帧计数也在涨, 但屏上一个像素都没有 (现场 14:09~14:12)。
+    #   UI 场景的管道读者由 fifo keeper (wait 阶段) / k230-screen (video 阶段) 提供。
+    if systemctl is-active --quiet k230-ui 2>/dev/null; then
+        PLAYER_FIFO_MODE=1
+        log "⏸ k230-ui active: 屏归 LVGL, 跳过播放器/接管屏 (管线直写 $PLAYER_FIFO)"
+        return 0
+    fi
     # ★ 2026-11-07 (UI 待投屏改版): 屏暂时归 LVGL 主界面 (k230-ui), 后端还没切 video。
     #   这时**绝不碰 DRM / 不起 drmplay / 不拉起 k230-screen**, 否则两个进程抢
     #   DRM master ⇒ 黑屏/紫屏, 用户刚点的二级画布直接消失。
@@ -1018,6 +1153,8 @@ stop_blank() {
 start_blank() {
     # ★ 2026-11-07: 待投屏时屏归 LVGL, drmplay -B 会抢 DRM master, 必须跳过。
     [ -f /run/k230-ui/hold-screen ] && return 0
+    # 2026-11-10: 主界面在跑时同理, 绝不抢屏。
+    systemctl is-active --quiet k230-ui 2>/dev/null && return 0
     [ -x /usr/bin/drmplay ] || return 0
     # 2026-10-26: 常驻播放器已经在占 CRTC 并会自己刷黑, 再去起一个 -B 只会抢
     #   DRM master (现场症状: SETCRTC Permission denied + 紫屏/黑屏抖动)。
@@ -1058,6 +1195,17 @@ select_player() {
 }
 
 start_sink_client() {
+    # 2026-11-10: 串行化 —— GO 分支和 watcher 可能同时调这里, 两个实例抢 7236
+    #   ⇒ 后起的 bind 失败, 死循环。用 flock 把「停旧→起新」这一段上锁。
+    exec 9>/tmp/wfd-sink-start.lock
+    flock -w 10 9 2>/dev/null || log "⚠ start_sink_client 等锁超时 (继续)"
+    # 2026-11-10: 幂等 —— 已经在拨同一个对端时不要重启, 否则会把刚建立的
+    #   RTSP 握手掐断 (实测 10:58:57 拨通, 10:58:58 第二个实例起来, PLAY 永不到)。
+    if [ -n "$SINK_GO_IP" ] && pgrep -af "/usr/bin/wfd-sink" 2>/dev/null | grep -q -- "-c $SINK_GO_IP:$SINK_GO_PORT"; then
+        log "⏭ 已在拨号 $SINK_GO_IP:$SINK_GO_PORT, 跳过重复启动"
+        flock -u 9 2>/dev/null || true
+        return 0
+    fi
     # 只重启 wfd-sink / v4l2_dec; 播放器常驻 (start_player 幂等, 已在跑就不动)
     ps_off
     stop_sink_client
@@ -1213,6 +1361,8 @@ start_sink_client() {
     else
         log "▶ sink 服务端模式已启动: 监听 :$SINK_GO_PORT 等 source 拨入 → v4l2_dec → $PLAYER_BIN (pid $(cat "$SINK_PIPE_PID"))"
     fi
+    # 2026-11-10: 两条分支都要解锁 (之前只解锁客户端分支, 服务端分支把锁永久占住)
+    flock -u 9 2>/dev/null || true
 }
 
 start_client_watcher() {
@@ -1270,6 +1420,25 @@ start_client_watcher() {
                 { printf '%s\n%s\n' "${_gda:-$_ssid}" "$_ssid"; } > "$PEER_FILE" 2>/dev/null || true
                 log "   对端标识 (autotune): key=${_gda:-$_ssid} ssid=${_ssid:-?}"
                 if [ "$_role" = "client" ]; then
+                    # ★ 2026-11-10: 让位成 client 后必须停掉 PBC 常驻。
+                    #   场景: 对端 (K80 等) 也发 GO intent 15, 我们让位到 14 当
+                    #   client (见 wpa_supplicant 的 k230-yield-on-peer-max-intent)。
+                    #   此时如果 PBC 常驻还在, 它每 60 s 发一次 `wps_pbc` —— 我们
+                    #   已经在对方 GO 组里, 这条命令会把自己的关联打断: 现场实测
+                    #   建组成功、收了 418 帧后, 第 20 s 的 wps_pbc 打出
+                    #   `WPS-PBC-ACTIVE`, 7 ms 后就是
+                    #   `CTRL-EVENT-DISCONNECTED reason=3 locally_generated=1`,
+                    #   手机侧随即 AP-STA-DISCONNECTED → 拆组 → RTSP 断。
+                    #   注意**不能**调 stop_pbc_watcher: 它内部会
+                    #   `pkill -f "tail -n 0 -F $P2P_LOG"`, 把本 client watcher
+                    #   自己的 tail 一起带走。这里只按 pidfile 收掉 PBC 循环。
+                    #   GO 档 (努比亚, 我方当 GO) 仍需 PBC 常驻, 那条路径未改动。
+                    #   ★ 2026-11-11: 不能按 pidfile 杀 PBC 循环 —— kill_tree 的
+                    #   祖先保护只认主进程 ($$), 杀到 watcher 自己的父 shell 时照样
+                    #   下手, 实测建组瞬间把本 handler 一起带走, 后续拨号没执行。
+                    #   改成置暂停标志: PBC 循环在, 但不再发 wps_pbc。
+                    : > "$PBC_PAUSE"
+                    log "   client 档: 已暂停 PBC 续期 (wps_pbc 会打断已建立的 client 连接)"
                     prepare_client_net "$_gif"
                     log "   wfd-sink 主动连 rtsp://$SINK_GO_IP:$SINK_GO_PORT (GO=手机或 PC, 由上面判定)"
                     sleep 1
@@ -1295,8 +1464,16 @@ start_client_watcher() {
                         [ -f "$_pf" ] && { kill_tree "$(cat "$_pf" 2>/dev/null)"; rm -f "$_pf"; }
                     done
                     start_go_sink_watch
-                    SINK_GO_IP=""
-                    start_sink_client
+                    _goip=$(go_peer_ip || true)
+                    SINK_GO_IP="${_goip:-}"
+                    if [ -n "$SINK_GO_IP" ]; then
+                        log "✅ GO 档已有租约 → 直接按双模启动 ($SINK_GO_IP:$SINK_GO_PORT)"
+                        start_sink_client
+                    else
+                        # 2026-11-10: 没有租约时不起服务端管线 —— 这台手机会等 sink 拨,
+                        #   先起一个纯监听会占住 7236 并与随后的拨号实例打架。
+                        log "⏳ GO 档暂无租约, 等 source 关联后由 watcher 起双模"
+                    fi
                     start_go_supervisor
                 fi ;;
             *AP-STA-DISCONNECTED*)
@@ -1322,6 +1499,13 @@ start_client_watcher() {
                 wpa p2p_group_remove "${CLIENT_IF:-$IFACE}" >/dev/null 2>&1 || true
                 sleep 1
                 wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                # ★ 2026-11-11: 回到 listen 待命 → 恢复 PBC 续期 (否则下一台手机
+                #   发 PD 时没人回 wps_pbc)
+                if [ -f "$PBC_PAUSE" ]; then
+                    rm -f "$PBC_PAUSE"
+                    [ "${GO_INTENT:-0}" -gt 0 ] && wpa wps_pbc >/dev/null 2>&1 || true
+                    log "   PBC 续期已恢复 (回 listen 待命)"
+                fi
                 # 2026-10-27 现场 (11:09:01 手机 GO_ENDING_SESSION): 这里只杀不建 ⇒
                 #   断开后板上**一个 wfd-sink 都没有**, :7236 无人监听, 屏也停在最后一帧。
                 #   对端再点投屏时 RTSP 直接被人拒 ⇒ 主人实测「连好几次才成功」。
@@ -1339,6 +1523,11 @@ start_client_watcher() {
                 SINK_GO_IP=""
                 sleep 1
                 wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                if [ -f "$PBC_PAUSE" ]; then
+                    rm -f "$PBC_PAUSE"
+                    [ "${GO_INTENT:-0}" -gt 0 ] && wpa wps_pbc >/dev/null 2>&1 || true
+                    log "   PBC 续期已恢复 (建组失败回 listen)"
+                fi
                 # 2026-10-27: 同上 —— 失败后同样要留一个纯监听 pipeline,
                 #   否则手机紧接着重试时 :$SINK_GO_PORT 无人应答。
                 start_sink_client ;;
@@ -1370,6 +1559,17 @@ lease_ip_of() {
               | tr 'A-Z' 'a-z' | awk -v m="$_mac" '$5==m { print $1; exit }')
     fi
     printf '%s' "$_ip"
+}
+
+# 2026-11-10: GO 档自动拨号 —— 取当前 station 的 DHCP 租约 IP。
+#   背景: AP-STA-CONNECTED 可能早于 watcher 启动 (tail -n 0 漏事件), 纯监听
+#   pipeline 就一直等对端来拨, 而这台手机不会拨 ⇒ 靠 supervisor 每 3 s 补。
+go_peer_ip() {
+    _gif="${GO_IF:-$IFACE}"
+    _st=$(iw dev "$_gif" station dump 2>/dev/null | awk '/^Station/{print $2; exit}')
+    [ -n "$_st" ] || return 1
+    _lip=$(lease_ip_of "$_st")
+    [ -n "$_lip" ] && printf '%s' "$_lip"
 }
 
 # 按 pid 连同它的子进程一起杀掉 (GO watcher 是 `( tail | while )&` 子 shell,
@@ -1474,6 +1674,22 @@ start_go_supervisor() {
         _sif="${GO_IF:-$IFACE}"
         if pgrep -f "/usr/bin/wfd-sink" >/dev/null 2>&1; then
             _miss=0
+            # 2026-11-10: 纯监听但有 station + 租约 ⇒ 自动切成双模拨号 (只切一次)
+            # 判断「是否双模」只查真正 wfd-sink 进程参数, 不能用 pgrep -af 全匹配
+            #   (pipeline 的 sh -c 注释里含 `-c`, 会误判成已双模 ⇒ 永不切)。
+            _sup_dual=0
+            for _sp in $(pgrep -x wfd-sink 2>/dev/null); do
+                tr '\0' ' ' < "/proc/$_sp/cmdline" 2>/dev/null | grep -q -- " -c " && _sup_dual=1
+            done
+            if [ "$_sup_dual" -eq 0 ]; then
+                _aip=$(go_peer_ip)
+                if [ -n "$_aip" ]; then
+                    SINK_GO_IP="$_aip"
+                    log "🛠 看护: source 租约 $_aip 且当前纯监听 → 切双模拨号"
+                    start_sink_client
+                    continue
+                fi
+            fi
             # 管线三段必须齐全: 上屏进程单独死了 (抢 CRTC 失败 / 异常退出) 时
             # sink 还在监听、7236 也通, 但画面永远出不来 ⇒ 只能整条重起。
             if pgrep -x "$_plr" >/dev/null 2>&1 || pgrep -x ai2dplay >/dev/null 2>&1; then
@@ -1508,6 +1724,355 @@ start_go_supervisor() {
     log "GO 看护已启动 (pid $(cat "$GO_SUP_PID" 2>/dev/null), 每 3 s 兜底)"
 }
 
+# ---------------------------------------------------------------- 信道重试 (P2)
+# 2026-11-10 P2「连不上就换信道重来」—— 对齐海奇唯一还没抄过来的用户态机制。
+#   海奇驱动侧没有魔法, 它稳靠的是: 每次 P2P 初始化按 AP 信道重下发
+#   listen_channel; 连不上就整段 stop/start 换信道再试。
+#   我们过去把 listen 钉死在单个信道 (unit 里 WFD_GO_FREQ=2437 ⇒ ch6):
+#   手机那一次扫描没撞上 listen 窗口, 就永远是空等 —— 现场形态是手机显示
+#   「没有发现可用设备」, 板端连一个 PD 包都没收到 (10 轮里偶发 1 次)。
+#   这里把「换信道」做成运行期轻量动作, 不重启 supplicant / 不动管线 / 不碰 RTSP:
+#     p2p_stop_find → p2p_set listen_channel N → p2p_listen → 续 WPS-PBC
+#   组信道由 GO-Neg-Resp 的 Operating Channel 属性告知对端 (我们当 GO 时由我们定),
+#   所以换 listen 信道不会把组带到别的信道上去。
+#   触发条件: 可被发现 + 没有 STA + 没有租约 + 当前不是 GO 组, 且已空等 N 秒。
+CHAN_LADDER_BASE="${WFD_CHAN_LADDER:-6 1 11}"
+CHAN_LADDER="$CHAN_LADDER_BASE"
+CHAN_CYCLE_S="${WFD_CHAN_CYCLE_S:-45}"
+CHAN_MAX_CYCLES="${WFD_CHAN_MAX_CYCLES:-6}"
+
+chan_next_of() {
+    _cn_next=""
+    _cn_hit=0
+    for _cn_c in $CHAN_LADDER; do
+        if [ "$_cn_hit" -eq 1 ]; then _cn_next=$_cn_c; break; fi
+        [ "$_cn_c" = "$1" ] && _cn_hit=1
+    done
+    if [ -z "$_cn_next" ]; then
+        _cn_next=$(printf '%s\n' $CHAN_LADDER | head -1)
+    fi
+    printf '%s' "$_cn_next"
+}
+
+chan_apply() {
+    _ca_new="$1"
+    _ca_why="$2"
+    [ -n "${_ca_new:-}" ] || return 1
+    [ "$_ca_new" = "$LISTEN_CHANNEL" ] && return 0
+    log "🔁 ${_ca_why}: listen ch$LISTEN_CHANNEL → ch$_ca_new"
+    wpa p2p_stop_find >/dev/null 2>&1 || true
+    _ca_r=$(wpa p2p_set listen_channel "$_ca_new" 2>&1 | tail -1)
+    case "${_ca_r:-}" in
+        OK) log "   ↳ p2p_set listen_channel $_ca_new = OK" ;;
+        *)  log "   ✗ p2p_set listen_channel $_ca_new 未成功 (${_ca_r:-无应答})" ;;
+    esac
+    LISTEN_CHANNEL=$_ca_new
+    # 组也起在同一条信道上 (我们当 GO 时由我们定), 与 listen 保持一致
+    GO_FREQ=$((2407 + _ca_new * 5))
+    # conf 同步: 万一之后服务被重启, 不要再从已经证伪的旧信道开始
+    sed -i "s/^p2p_listen_channel=.*/p2p_listen_channel=$_ca_new/" "$P2P_CONF" 2>/dev/null || true
+    sed -i "s/^p2p_oper_channel=.*/p2p_oper_channel=$_ca_new/" "$P2P_CONF" 2>/dev/null || true
+    wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+    [ "${GO_INTENT:-0}" -gt 0 ] && start_pbc_watcher
+    return 0
+}
+
+chan_retry_once() {
+    _cr_new=$(chan_next_of "$LISTEN_CHANNEL")
+    chan_apply "$_cr_new" "信道重试 (第 $1 次): 连续 ${CHAN_CYCLE_S}s 无人来"
+}
+
+# ★ P3: 运行期跟随 AP —— AP 换了信道 (或投屏中途 AP 才起来) 就跟着换 listen。
+#   只在空闲待命态被调用 (没 STA、没租约、不是 GO 组), 换信道不会断流。
+chan_follow_ap() {
+    [ "$AP_FOLLOW" = "1" ] || return 0
+    [ -z "${WFD_LISTEN_CHANNEL:-}" ] || return 0
+    _cf_info=$(ap_channel_of 2>/dev/null || true)
+    if [ -z "${_cf_info:-}" ]; then
+        # AP 停了 ⇒ 放开阶梯, 回到「连不上就换信道」的探索模式
+        if [ -n "${AP_SEEN_CH:-}" ]; then
+            AP_SEEN_CH=""
+            CHAN_LADDER="$CHAN_LADDER_BASE"
+            log "🔎 AP 已停 ⇒ 信道阶梯恢复 ($CHAN_LADDER)"
+        fi
+        return 0
+    fi
+    _cf_ch=${_cf_info%% *}
+    _cf_dev=${_cf_info#* }
+    # 只有 AP 真的换了信道 (或投屏中途才起来) 才动; 没变就让信道阶梯照常试探,
+    # 否则会和阶梯互相拉扯 (阶梯刚换到 ch1, 跟随又拉回 ch6)。
+    [ "${AP_SEEN_CH:-}" = "$_cf_ch" ] && return 0
+    AP_SEEN_CH="$_cf_ch"
+    CHAN_LADDER="$_cf_ch"
+    chan_apply "$_cf_ch" "跟随 AP 信道 (${_cf_dev} ch$_cf_ch)"
+    return 0
+}
+
+# 2026-11-10 P0 (连接稳定性向海奇看齐): 主进程前台保活 —— 不再把性命交给后台 watcher。
+#   根因: cmd_client 结尾原先只有 `wait`, 而 client/GO/pbc watcher、GO supervisor、
+#         ps_off 循环全是 `( ... )&` 子 shell。多轮 P2P 组拆建时 :1323 的 kill_tree
+#         会互杀子 shell (11:14 现场三条 `sh[...]: Killed`), 或 tail -n 0 漏事件;
+#         只要这些子 shell 全退出, `wait` 立即返回 → 脚本退到 unit 的
+#         `exec sleep infinity` ⇒ systemd 显示 active, 但 :$SINK_GO_PORT 无人监听、
+#         组连上也没人拨号 (主人实测「每轮都得 restart 服务才连得上」)。
+#   做法: 前台 while 随主进程常驻 (kill_tree 有祖先链保护, 杀不到主进程), 每 3 s
+#         只按「状态」兜底, 不依赖任何事件: ① 端口没监听就重建 pipeline
+#         ② 检测到 source 租约但当前是纯监听就切双模拨号。与后台 watcher 并存,
+#         靠 start_sink_client 里的 flock + 幂等判断去重, 不会重复起实例。
+#         这样「服务起一次, 反复断开重连」不再需要 restart 服务。
+main_keepalive() {
+    _mk_tick=0
+    _mk_idle=0        # 连续「无 STA 却仍在 GO 组」的 tick 数 (防瞬时抖动误拆组)
+    _mk_nolisten=0    # 连续「:7236 无监听」的 tick 数 (避开 watcher 换模式空窗)
+    _mk_halfpipe=0    # 连续「有 sink 无解码器 / 解码器卡死」的 tick 数 (管线半死)
+    _mk_nojoin=0      # P2: 连续「可被发现但没人来」的秒数 (信道阶梯的计时器)
+    _mk_chan_i=0      # P2: 本次服务生命周期内已换过几次信道
+    _mk_off=$(stat -c %s "$P2P_LOG" 2>/dev/null || echo 0)   # P1: 事件通道读到的日志字节偏移
+    while :; do
+        sleep 1
+        _mk_tick=$((_mk_tick + 1))
+        # stop 之后留了 hold 旗标 → 不自愈回来 (保持 cmd_stop 语义)
+        [ -f "$HOLD_FILE" ] && return 0
+        # ★ 2026-11-10 P1「事件 watcher 保活改造」: 把连接响应从 P0 的「3 s 定时
+        #   巡检」拉回「事件到达即处理」。板上 /bin/sh 是 dash (不支持 read -t),
+        #   所以用「日志字节偏移 + tail -c」在**主进程前台**订阅 P2P_LOG 增量:
+        #   不依赖会死的后台 watcher, 也不受 kill_tree 互杀影响。
+        #   ① 命中「发现态丢失」类事件 → 立即重挂 p2p_listen (补 P0 的 no-connect)
+        #   ② 命中任意 P2P 状态事件 → 重置防抖计数, 本 tick 立即跑完整状态巡检
+        #      (补 P0 的「组建立了但 RTSP 没起」——不用等 3 s 轮询)
+        _mk_sz=$(stat -c %s "$P2P_LOG" 2>/dev/null || echo 0)
+        [ "$_mk_sz" -lt "$_mk_off" ] && _mk_off=0        # 日志被截断/重建
+        if [ "$_mk_sz" -gt "$_mk_off" ]; then
+            _mk_ev=$(tail -c +$((_mk_off + 1)) "$P2P_LOG" 2>/dev/null)
+            _mk_off=$_mk_sz
+            case "$_mk_ev" in
+                *P2P-LISTEN-STOPPED*|*P2P-FIND-STOPPED*|*P2P-GO-NEG-FAILURE*|*P2P-GROUP-FORMATION-FAILURE*)
+                    # 板子从「可被发现」掉出来了 → 立刻回 listen, 手机才扫得到
+                    log "🐕 事件通道: 发现态丢失 → 立即重挂 p2p_listen"
+                    wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true ;;
+            esac
+            case "$_mk_ev" in
+                *AP-STA-CONNECTED*|*AP-STA-DISCONNECTED*|*P2P-GROUP-STARTED*|*P2P-GROUP-REMOVED*|*WPS-SUCCESS*|*P2P-GO-NEG-SUCCESS*|*P2P-LISTEN-STOPPED*|*P2P-GO-NEG-FAILURE*|*P2P-GROUP-FORMATION-FAILURE*)
+                    _mk_idle=0      # 状态刚变, 旧的防抖累计作废, 本 tick 立即巡检
+                    ;;
+            esac
+            # ★ P2: 「对端确实出现过」的事件也清零换信道计时 —— 手机正在扫/正在
+            #   点/正在协商时绝不能换信道 (换 = 把即将建成的协商掐死)。实测形态:
+            #   手机要 40~50 s 才在我们的信道上出现, 固定 45 s 换信道正好撞上它
+            #   点「连接」的那一下 ⇒ 手机显示 K230-CAST、点了没反应。
+            #   注意: 失败类事件 (GO-NEG-FAILURE / FORMATION-FAILURE) **不**清零,
+            #   那种情况恰恰需要换信道再来一遍。
+            case "$_mk_ev" in
+                *P2P-DEVICE-FOUND*|*P2P-PROV-DISC*|*P2P-INVITATION*|*P2P-SD-*|*WPS-PBC*|*AP-STA-*|*P2P-GO-NEG-SUCCESS*|*WPS-SUCCESS*)
+                    _mk_nojoin=0 ;;
+            esac
+        fi
+        # ★ 2026-11-10 P1: watcher 存活守护。client watcher 只在 cmd_client 启动时
+        #   起一次, 中途死了无人重建 (P0 现场三个 pidfile 全 DEAD, 且是上一轮残留
+        #   的陈旧 pid); 而 GO watcher/supervisor 只在 P2P-GROUP-STARTED 事件里起,
+        #   事件本身又得靠 client watcher 读到 ⇒ 鸡生蛋。主进程每 1 s 查一次,
+        #   死了就重建, 让 Invitation / PBC / GO-Neg 继续有事件处理器。
+        _mk_cw=$(cat "$CLIENT_WATCH_PID" 2>/dev/null || echo 0)
+        case "$_mk_cw" in *[!0-9]*|"") _mk_cw=0 ;; esac
+        if [ "$_mk_cw" = "0" ] || ! kill -0 "$_mk_cw" 2>/dev/null; then
+            # 节流: 至少 5 s 才重建一次, 避免日志暂缺时每秒重建+刷屏
+            if [ $((_mk_tick - ${_mk_last_cw:-0})) -ge 5 ]; then
+                _mk_last_cw=$_mk_tick
+                log "🐕 主保活: client watcher 不在 (pid=${_mk_cw}) → 重建"
+                rm -f "$CLIENT_WATCH_PID"
+                start_client_watcher
+            fi
+        fi
+        # 2026-11-10 P0: GO 形态的命根子 /run/wfd-go-intent 必须恒为 15。
+        #   unit 的 ExecStartPre 只在 restart 时写一次; 现场实测该文件会被旧孤儿
+        #   清场带走 (10 轮全 FAIL 的根因: intent 丢 → 板子让位 role=client →
+        #   手机当 GO 又 IDLE 拆组, 从不出 PLAY)。放进主循环每 3 s 兜一次,
+        #   才能真正做到「服务起一次不 restart」。
+        if [ "${GO_INTENT:-0}" -gt 0 ]; then
+            _cur=$(cat /run/wfd-go-intent 2>/dev/null || echo 0)
+            [ "$_cur" = "$GO_INTENT" ] || { printf '%s\n' "$GO_INTENT" > /run/wfd-go-intent; \
+                log "🐕 主保活: /run/wfd-go-intent 被改($_cur) → 复位 $GO_INTENT (守 GO 形态)"; }
+        fi
+        # 主保活是 GO 形态专用 (本 unit GO_INTENT=15)。client 档 (intent=0) 拨号
+        #   方向相反, 全权交给 client watcher; 这里插手只会反复打断客户端管线。
+        #   ⇒ client 档只做心跳, 不碰管线。
+        if [ "${GO_INTENT:-0}" -gt 0 ]; then
+            _peer="$(go_peer_ip 2>/dev/null || true)"
+            _listen=0
+            ss -tln 2>/dev/null | grep -qE ":${SINK_GO_PORT}[[:space:]]" && _listen=1
+            # ★ 2026-11-10 实测修: 判断「是否双模」绝不能用
+            #   `pgrep -af /usr/bin/wfd-sink | grep " -c "` —— pipeline 外层是
+            #   `sh -c '<整段脚本>'`, 命令行文本里注释含 `v4l2_dec -c 裁内容区`,
+            #   会**误判成已双模** ⇒ 主保活永不切, sink 卡纯监听, 手机等拨超时断
+            #   (10 轮里 R6 起连续 FAIL 的根因)。只查真正 wfd-sink 进程的参数。
+            _dual=0
+            for _sp in $(pgrep -x wfd-sink 2>/dev/null); do
+                tr '\0' ' ' < "/proc/$_sp/cmdline" 2>/dev/null | grep -q -- " -c " && _dual=1
+            done
+            # ★ 2026-11-10 P1 实测修: 1 s 巡检会撞上 watcher 的 stop→rebind
+            #   换模式空窗 (7236 腾空几百 ms 是正常的), 若一见空就重建, 会和
+            #   watcher 反复互抢 → 密集「重建纯监听」刷屏、RTSP 会话被掐断
+            #   (8/10 里 R3/R4 抖动 FAIL 的来源)。改为「连续 3 tick (3 s) 无监听
+            #   且确实没有 wfd-sink 进程存活」才重建。
+            if [ "$_listen" -eq 0 ]; then
+                _mk_nolisten=$((_mk_nolisten + 1))
+                if [ "$_mk_nolisten" -ge 3 ] && ! pgrep -x wfd-sink >/dev/null 2>&1; then
+                    _mk_nolisten=0
+                    if [ -n "$_peer" ]; then
+                        SINK_GO_IP="$_peer"
+                        log "🐕 主保活: :$SINK_GO_PORT 持续无应答且无 sink → 按租约重建双模 ($_peer)"
+                    else
+                        SINK_GO_IP=""
+                        log "🐕 主保活: :$SINK_GO_PORT 持续无应答且无 sink → 重建纯监听 (等 source)"
+                    fi
+                    start_sink_client
+                    continue
+                fi
+                continue
+            fi
+            _mk_nolisten=0
+            # 有监听、有对端租约, 但当前是纯监听 → 这台手机等 sink 主动拨
+            if [ -n "$_peer" ] && [ "$_dual" -eq 0 ]; then
+                SINK_GO_IP="$_peer"
+                log "🐕 主保活: source 租约 $_peer 到位但当前纯监听 → 切双模拨号"
+                start_sink_client
+                continue
+            fi
+            # ★ 2026-11-10 实测修 (第 3 轮): 空闲归位必须用**本质判据**, 不能靠
+            #   /tmp/wfd-go-fallback 旗标 —— 现场旗标被清场带走 (no-flag), 但板子
+            #   仍卡在 GO 组 (wlan0 挂 192.168.49.1), 拆组分支从不触发; 而
+            #   wpa_state=COMPLETED 又不在「异常态」列表 ⇒ 重挂 listen 也不触发。
+            #   结果板子占着死组、没在 listen, 手机「没有发现可用设备」(10 轮里
+            #   4 个 no-connect 的根因)。
+            #   判据: station dump 有无真实 STA (租约未到 ≠ 手机走了) + wlan0 是否
+            #   还占 GO 地址。连续 2 次 (2 s, P1 起 tick=1s) 无 STA 才动作, 避开
+            #   建链瞬间抖动。P1 另有事件通道命中状态事件即清零本计数。
+            _has_sta=0
+            iw dev "${GO_IF:-$IFACE}" station dump 2>/dev/null | grep -q '^Station' && _has_sta=1
+            _is_go=0
+            # ★ 2026-11-10: 必须**精确匹配** GO 地址, 不能子串匹配。
+            #   client 档我们挂的是 192.168.49.128, 而 '192.168.49.1' 是它的前缀
+            #   ⇒ 老写法 grep -q '192.168.49.1' 恒为真, 于是「板子当 client 时
+            #   主保活误判自己占着 GO 地址」→ 建组 7 s 后自己拆组, 手机看到
+            #   AP-STA-DISCONNECTED / GROUP-REMOVED (K80 intent 让位场景实测)。
+            #   改成按 addr/prefix 整行匹配: GO 档 192.168.49.1/24 命中,
+            #   client 档 192.168.49.128/24 不再命中 —— 努比亚 (我方当 GO)
+            #   行为完全不变。
+            ip -4 -o addr show dev "${GO_IF:-$IFACE}" 2>/dev/null \
+                | awk '{print $4}' | grep -qx "${GO_IP}/24" && _is_go=1
+            # ★ 2026-11-10: 还要判「我们在任何一个组里」—— client 身份的老漏洞。
+            #   P2 信道阶梯的旧守卫是 `[ -z "$_peer" ] && [ "$_is_go" -eq 0 ]`,
+            #   而这两条在**当我们是 client 时同时成立**: client 档没有 station
+            #   (站表是空的 ⇒ _peer 空), 也没占 GO 地址 (⇒ _is_go=0) ⇒ 阶梯照跑。
+            #   现场 (K80 让位场景) 后果: 已经推流 60 s、frames=1799, 阶梯到点
+            #   `p2p_set listen_channel 6→1` 把正在使用的组信道改掉, 并顺手
+            #   start_pbc_watcher; 9 s 后 `P2P-GROUP-REMOVED reason=IDLE`,
+            #   手机侧 AP-STA-DISCONNECTED + RTSP 断流。
+            #   client 已关联时 wpa_state=COMPLETED (空闲待命时是 DISCONNECTED),
+            #   用它做「在组里」的通用判据; GO 档由 _is_go 覆盖, 互不影响。
+            _in_group=0
+            case "$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p' | head -1)" in
+                COMPLETED) _in_group=1 ;;
+            esac
+            if [ "$_has_sta" -eq 0 ]; then
+                _mk_idle=$((_mk_idle + 1))
+                # P1: 拆组降频到连续 5 次 (5 s), 避免刚建链瞬间被误拆。
+                #   快速响应已交给上方事件通道, 这里只做慢兜底。
+                if [ "$_mk_idle" -ge 5 ]; then
+                    _mk_idle=0
+                    if [ "$_is_go" -eq 1 ]; then
+                        # 无 STA 却仍占 GO 地址 ⇒ watcher 死了没拆组, 自己拆
+                        log "🐕 主保活: 无 STA 但 wlan0 仍占 GO 地址 → 拆组回 listen"
+                        wpa p2p_group_remove "${GO_IF:-$IFACE}" >/dev/null 2>&1 || true
+                        sleep 1
+                        wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true
+                        rm -f /tmp/wfd-go-fallback
+                        SINK_GO_IP=""
+                        start_sink_client
+                        continue
+                    fi
+                fi
+                # P1: wpa_state=DISCONNECTED **不能**当「没在 listen」判据
+                #   (实测手机能发现并连上时该值也是 DISCONNECTED)。快速重挂 listen
+                #   已交给事件通道 (基于真实 LISTEN-STOPPED/NEG-FAILURE 事件);
+                #   这里只留每 30 s 一次的保守兜底, 避免每 2 s 重挂打断 P2P 发现。
+                if [ $((_mk_tick % 30)) -eq 0 ]; then
+                    _ws=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p' | head -1)
+                    case "$_ws" in
+                        DISCONNECTED|INACTIVE|"")
+                            log "🐕 主保活: 30s 兜底, supplicant=$_ws → 重挂 p2p_listen"
+                            wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || true ;;
+                    esac
+                fi
+                # ★ P2 信道阶梯: 可被发现、没 STA、没租约、也不是 GO 组, 却一直没人来
+                #   ⇒ 手机大概率和我们错开了信道。按 6→1→11 轮着换 listen 信道再等。
+                #   只在「完全空闲的等待态」动手, 建组/推流期间绝不碰 (那是断流)。
+                if [ -z "$_peer" ] && [ "$_is_go" -eq 0 ] && [ "$_in_group" -eq 0 ]; then
+                    _mk_nojoin=$((_mk_nojoin + 1))
+                    if [ "$_mk_nojoin" -ge "$CHAN_CYCLE_S" ] && \
+                       [ "$_mk_chan_i" -lt "$CHAN_MAX_CYCLES" ]; then
+                        _mk_nojoin=0
+                        _mk_chan_i=$((_mk_chan_i + 1))
+                        chan_retry_once "$_mk_chan_i"
+                        continue
+                    fi
+                else
+                    _mk_nojoin=0
+                fi
+                # ★ P3 运行期跟随 AP 信道: 板子自己的热点 (wlan1) 或 STA 连着的
+                #   上游 AP 换了信道 ⇒ listen 立刻跟过去。只在空闲等待态做
+                #   (上面那个 if 条件内), 建组/推流期间绝不碰。5 s 采一次 iw 就够。
+                if [ $((_mk_tick % 5)) -eq 0 ] && [ -z "$_peer" ] && \
+                   [ "$_is_go" -eq 0 ] && [ "$_in_group" -eq 0 ]; then
+                    chan_follow_ap
+                fi
+            else
+                _mk_idle=0
+                _mk_nojoin=0
+                # 成功接上过 ⇒ 当前信道是有效的, 把换信道额度还回去 (下一轮若又
+                # 连不上, 才有额度再换); 信道本身保留, 不来回跳。
+                _mk_chan_i=0
+            fi
+        fi
+        # ★ 2026-11-11 管线完整性自愈 (「连上了但屏黑」的第二种现场形态):
+        #   wfd-sink 还活着, v4l2_dec 已经死了。解码器写管道/fifo 遇
+        #   `发槽号失败: Broken pipe` 后自行退出 (v4l2_dec.c 走 done), 而外层
+        #   while 卡在「等整条 pipeline 结束」—— sink 不退, 整条链就再也不重建。
+        #   现场 ps: 只有 `sh -c PLAYER...` + `/usr/bin/wfd-sink`, 没有解码器;
+        #   手机端 PLAY 成功、帧计数也涨, 屏却一直是黑。连续 3 s 确认后整条重来
+        #   (start_sink_client 幂等 + flock, 不会和 watcher 打架)。
+        #   ⚠ 判解码器不能用 `pgrep -f "v4l2_dec /dev/stdin"` —— pipeline 外层是
+        #   `sh -c '<整段脚本>'`, 命令行文本里就有这串, 会永远误判"解码器还在"。
+        #   与 _dual 一样只查真正 v4l2_dec 进程的参数 (苹果那路读 airplay.h264, 排除)。
+        # ★ 2026-11-10 实测修: 这条自愈**只能在有会话时**跑。空闲待命态下解码器
+        #   等不到码流本来就会自己退出, `wfd-sink` 一个人挂在 :7236 听着是**正常形态**;
+        #   以前不分有没有会话就判"管线半死", 结果每 14 s 重建一次整条管线 ⇒
+        #   监听 socket 反复拆建, 手机正好撞上那几百毫秒就投不上 (现场 journal
+        #   12 分钟里 6 条「有 sink 无解码器」, 全部发生在没人投的时候)。
+        #   判据用「:7236 上有 ESTABLISHED 会话」= 手机确实在推流, 此时缺解码器才是故障。
+        _mk_sess=0
+        ss -tn state established 2>/dev/null | awk -v p=":${SINK_GO_PORT}" 'NR>1 { for (i=1;i<=NF;i++) if (index($i,p)) { f=1 } } END { exit(f?0:1) }' && _mk_sess=1
+        _mk_has_dec=0
+        if [ "$_mk_sess" -eq 1 ] && pgrep -x wfd-sink >/dev/null 2>&1; then
+            for _dp in $(pgrep -x v4l2_dec 2>/dev/null); do
+                tr '\0' ' ' < "/proc/$_dp/cmdline" 2>/dev/null | grep -q -- " /dev/stdin " && _mk_has_dec=1
+            done
+        fi
+        if [ "$_mk_sess" -eq 1 ] && pgrep -x wfd-sink >/dev/null 2>&1 && [ "$_mk_has_dec" -eq 0 ]; then
+            _mk_halfpipe=$((_mk_halfpipe + 1))
+            if [ "$_mk_halfpipe" -ge 3 ]; then
+                _mk_halfpipe=0
+                log "🐕 主保活: 有 sink 无解码器 (管线半死) → 重建整条管线"
+                start_sink_client
+                continue
+            fi
+        else
+            _mk_halfpipe=0
+        fi
+        [ $((_mk_tick % 30)) -eq 0 ] && \
+            log "🐕 主保活心跳: :$SINK_GO_PORT 监听中, peer=${SINK_GO_IP:-无} (主进程存活, GO_INTENT=${GO_INTENT:-0}, tick=1s)"
+    done
+}
 cmd_client() {
     need_root
     ps_off
@@ -1549,6 +2114,8 @@ cmd_client() {
     # 听 0.3 s」的循环, sink 只在 30% 时间停在 ch6, PC/手机经常扫不到(表现为
     # "很久才连上"或"直接连不上"); listen 是 100% 驻留, 谁要连我们就发过来。
     wpa p2p_listen >/dev/null 2>&1 || wpa p2p_find >/dev/null 2>&1 || die "p2p_listen 失败, 看 $P2P_LOG"
+    # 2026-11-10: intent 档要 PBC 常驻 (手机点选时立刻回 wps_pbc), 但不能起让位。
+    [ "${GO_INTENT:-0}" -gt 0 ] && start_pbc_watcher
     start_client_watcher
 
     # 2026-10-27: 进 client 模式就先把**纯监听 pipeline** 拉起来 (:7236 常驻有人应答)。
@@ -1559,7 +2126,7 @@ cmd_client() {
     start_sink_client
     log "📡 已常驻监听 :$SINK_GO_PORT (空闲也不撤, 等 source 随时拨入)"
 
-    log "✅ 已进入 client 模式: P2P device (不建组), p2p_go_intent=0 ⇒ 对端(手机/PC)当 GO"
+    log "✅ 已进入 client 模式: P2P device (不建组), p2p_go_intent=${GO_INTENT:-0} ⇒ 对端(手机/PC)当 GO"
     log "现在用: 手机「无线投屏」/ Windows 10 「Win+K → 连接到无线显示器」里点 $DEVICE_NAME"
     log "  · 安卓 GO=192.168.49.1 → 静态 $CLIENT_IP; Windows GO=192.168.137.1 → DHCP 拿租约"
     log "  · Windows 侧注意: 只留一块支持无线显示器的网卡 (netsh wlan show drivers 有那一行为 是)"
@@ -1569,7 +2136,8 @@ cmd_client() {
     log "（前台驻留, Ctrl+C 或 $0 stop 结束）"
     # 开机/进入 client 模式后先把屏幕刷黑占住, 避免空闲时面板显示未定义内容 (紫色)
     start_blank
-    wait
+    # 2026-11-10 P0: 前台保活取代裸 `wait` —— 见 main_keepalive() 头注释。
+    main_keepalive
 }
 
 cmd_stop() {

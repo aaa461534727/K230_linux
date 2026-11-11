@@ -53,7 +53,7 @@ SCREEN_UNIT=${SCREEN_UNIT:-k230-screen}
 ARBITER_UNIT=${ARBITER_UNIT:-k230-source-arbiter}
 
 # 4 个按钮 -> 要起的 unit 列表
-UNITS_miracast=${UNITS_miracast:-k230-miracast}
+UNITS_miracast=${UNITS_miracast:-k230-miracast-goneg}
 UNITS_airplay=${UNITS_airplay:-k230-airplay}
 # CarLife 默认走**无线** (有线 USB 会把本板 USB 网卡切走 => SSH 断)
 UNITS_carlife=${UNITS_carlife:-k230-carlife-wifi}
@@ -539,7 +539,32 @@ mode_video() {
         return 1
     }
 
-    # 3) drmplay 已在读 => 现在才收 keeper, 之后只剩一个读者
+    # 3) 等 drmplay 真正打开管道成为读者, 再收 keeper。
+    #    ★ 2026-11-11 修「手机连上了但 K230 屏全黑」:
+    #    ensure_on 只保证 systemd 把进程拉起来, drmplay 打开 FIFO 是启动后的下一步。
+    #    这中间若先把 keeper 收掉, 会出现「零读者」窗口 —— 解码器往 fifo 写槽号
+    #    直接 EPIPE 自杀 (板端: `[dec] 发槽号失败: Broken pipe`), 管线只剩 wfd-sink,
+    #    表现就是 PLAY 成功、帧计数在涨、屏上却一个像素都没有。
+    #    判据: drmplay 的 fd0 已经指向 $FIFO (与 wfd-p2p.sh 的 player_ok 同口径)。
+    _mv_pid=$(cat /run/wfd-player.pid 2>/dev/null || echo 0)
+    _mv_try=0
+    while [ "$_mv_try" -lt 30 ]; do
+        if [ -z "${_mv_pid:-}" ] || [ "$_mv_pid" = 0 ] || ! kill -0 "$_mv_pid" 2>/dev/null; then
+            _mv_pid=$(pgrep -f "(drmplay|ai2dplay) .*-F $FIFO" 2>/dev/null | head -1)
+        fi
+        if [ -n "${_mv_pid:-}" ] && [ "$_mv_pid" != 0 ] && \
+           [ "$(readlink "/proc/$_mv_pid/fd/0" 2>/dev/null)" = "$FIFO" ]; then
+            break
+        fi
+        _mv_pid=$(cat /run/wfd-player.pid 2>/dev/null || echo 0)
+        _mv_try=$((_mv_try + 1))
+        sleep 0.1
+    done
+    if [ "$_mv_try" -ge 30 ]; then
+        log "⚠ $SCREEN_UNIT 3 s 内没打开 $FIFO (仍收 keeper; 主保活会兜底重建管线)"
+    else
+        log "🔁 drmplay(pid=$_mv_pid) 已接管 $FIFO → 收 keeper"
+    fi
     fifo_keeper_stop
 
     # 4) 服务是 wait 阶段起的, 这里只兜底确认

@@ -1,0 +1,35 @@
+--- a/src/p2p/p2p_go_neg.c
++++ b/src/p2p/p2p_go_neg.c
+@@ -1102,6 +1102,32 @@
+ 			return;
+ 		}
+ 
++		/*
++		 * K230 (2026-11-10): 对端也把 GO Intent 拉满到 15 时主动让位。
++		 *
++		 * 现象: REDMI K80 Ultra 点选 K230-CAST, PD (PBC) 正常来回, 但之后
++		 *   0.4 s 就 P2P-GO-NEGOTIATION-FAILURE —— 板端日志是
++		 *     P2P: * GO Intent: Intent 15 Tie breaker 1   (对端)
++		 *     P2P: Incompatible GO Intent
++		 *     P2P: * Status: 9                            (INCOMPATIBLE_PARAMS)
++		 *   因为 p2p_go_det() 在 own == peer == P2P_MAX_GO_INTENT 时直接
++		 *   return -1 (协议规定双方都是 15 就无法裁决), 于是连协商都起不来。
++		 *
++		 * 为什么此前一直没暴露: 努比亚发的是 GO Intent 0 (自愿当 client),
++		 *   p2p_go_det(15, 0) = 1 ⇒ 我方完胜当 GO, 从不进这条分支。
++		 *
++		 * 改法: **只在 peer 也是 15 时**把我们这边降到 14, 让对端当 GO,
++		 *   我们当 client (与"手机 GO / 板子 client"那条已验证链路一致)。
++		 *   peer < 15 时一行不动 —— 努比亚 (peer 0) 的判定与响应字节完全
++		 *   不变, 仍然是"我方 15 完胜当 GO"。
++		 */
++		if (p2p->go_intent == P2P_MAX_GO_INTENT &&
++		    (*msg.go_intent >> 1) == P2P_MAX_GO_INTENT) {
++			p2p_dbg(p2p, "K230P2P: peer also GO intent %d -> yield to %d (peer becomes GO)",
++				P2P_MAX_GO_INTENT, P2P_MAX_GO_INTENT - 1);
++			p2p->go_intent = P2P_MAX_GO_INTENT - 1;
++		}
++
+ 		go = p2p_go_det(p2p->go_intent, *msg.go_intent);
+ 		if (go < 0) {
+ 			p2p_dbg(p2p, "Incompatible GO Intent");

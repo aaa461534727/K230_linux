@@ -1,0 +1,25 @@
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -4964,6 +4964,12 @@
+  *   · 若对端 group_capab=0x82 (Win10 自报) 双方都是 GO, 协商无从谈起
+  * P2P Capability 属性布局: id(1) + len(2, LE) + dev_capab(1) + group_capab(1)。
+  * 就地改写 supplicant 传来的额外 IE 缓冲 (cfg80211 的请求内存), 空口立即生效。 */
++/* K230 (2026-11-10): group capability 可调 (0x00=旧行为, -1=保留 supplicant 真值) */
++#include <linux/moduleparam.h>
++static int k230_group_capab = 0x00;
++module_param(k230_group_capab, int, 0644);
++MODULE_PARM_DESC(k230_group_capab, "K230 P2P group capability rewrite (0..255; -1 = keep supplicant value)");
++
+ static void rtw_k230_force_group_capab(u8 *ies, size_t ies_len, u8 val)
+ {
+ 	size_t i = 0;
+@@ -5011,7 +5011,8 @@
+ 
+ 	/* 对端 (Win10 自报 group_capab=0x82) 与我们都宣称自己是 GO 时, 协商直接死掉;
+ 	 * 对齐海奇的做法: 对外报 0x00 (空闲设备), 由对端决定建组方式。 */
+-	rtw_k230_force_group_capab((u8 *)ies, ies_len, 0x00);
++	if (k230_group_capab >= 0)
++		rtw_k230_force_group_capab((u8 *)ies, ies_len, (u8)k230_group_capab);
+ 
+ 	p2p_ie = rtw_get_p2p_ie((u8 *)ies, ies_len, NULL, &p2p_ielen);
+ 

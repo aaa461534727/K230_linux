@@ -129,6 +129,40 @@ p2p_oper_channel=$LISTEN_CHANNEL
 
 ---
 
+## 1.5 `wpa_supplicant-2.11-k230-yield-on-peer-max-intent.patch` (2026-11-10)
+
+**解决的问题**: REDMI K80 Ultra 点投屏后 **0.4 s 就失败**, 手机侧
+`P2P-GO-NEG-FAILURE status=-1`; 板端日志 `* GO Intent: Intent 15 Tie breaker 1` →
+`P2P: Incompatible GO Intent` → `* Status: 9` (`P2P_SC_FAIL_INCOMPATIBLE_PARAMS`)。
+同一块板子对努比亚手机完全正常。
+
+**根因**: K80 发来的 GO Negotiation Request 里 `go_intent = 15` (满档), 而 0111 补丁让板端
+应答时也把 `p2p->go_intent` 抬到 15。`p2p_go_neg.c::p2p_go_det()` 在
+`own == peer == P2P_MAX_GO_INTENT(15)` 时**无法裁决**, 直接 `return -1`, 上层据 -1 回
+`P2P_SC_FAIL_INCOMPATIBLE_PARAMS`。努比亚发 `go_intent = 0` (自愿当 client),
+`p2p_go_det(15, 0) = 1` 我方完胜当 GO, 走的是另一条分支, 所以从不触发。
+
+**改了什么**: 在 `p2p_process_go_neg_req()` 里、`go = p2p_go_det(...)` **之前**加一段:
+peer 的 intent 也是 `P2P_MAX_GO_INTENT` 时, 把本端 `p2p->go_intent` 降到 14 (让 peer 当 GO)。
+```c
+if (p2p->go_intent == P2P_MAX_GO_INTENT &&
+    (*msg.go_intent >> 1) == P2P_MAX_GO_INTENT) {
+    p2p_dbg(p2p, "K230P2P: peer also GO intent %d -> yield to %d (peer becomes GO)", ...);
+    p2p->go_intent = P2P_MAX_GO_INTENT - 1;
+}
+```
+**只影响 peer 也发 15 的情形**; peer < 15 (努比亚 0 / 海奇实测手机 7) 时一行不动。
+
+**与海奇的对照**: 实测海奇被连时 `P2P-GO-NEG-SUCCESS role=GO` (手机当 GO), 且**从不回 Status 9**。
+让位到 14 后我们的形态与其一致: 板端 `P2P-GO-NEG-SUCCESS role=client` →
+`P2P-GROUP-STARTED ... client ip_addr=192.168.49.128 go_ip_addr=192.168.49.1`。
+
+**状态**: 补丁已入库 (SDK `buildroot-overlay/package/wpa_supplicant/0112-*.patch`),
+**尚未编进板端二进制**。板上现在靠 drop-in `zz-test14.conf` (`WFD_GO_INTENT=14`) 临时绕过,
+属实验态, 编好后必须删掉。
+
+---
+
 ## 2. 重新编译 (Buildroot SDK)
 
 ```bash

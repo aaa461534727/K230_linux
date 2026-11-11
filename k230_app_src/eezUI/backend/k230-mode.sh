@@ -62,7 +62,7 @@ pd=$(domain "$prev"); td=$(domain "$MODE")
 say "切换: $prev($pd) -> $MODE($td)"
 
 # 1) 停旧模式 (含蓝牙与投屏端)
-timeout 20 systemctl stop k230-miracast k230-airplay k230-carlife-wifi k230-carlife \
+timeout 20 systemctl stop k230-miracast k230-miracast-goneg k230-airplay k230-carlife-wifi k230-carlife \
     carplay-wireless carplay-airplayd carplay-arbiter \
     k230-bt-hid.path k230-bt-hid k230-bt-agent >/dev/null 2>&1
 [ "$td" != ap ] && timeout 15 systemctl stop k230-shared-ap >/dev/null 2>&1
@@ -87,8 +87,9 @@ fi
 case "$MODE" in
     miracast)
         rm -f /run/wfd-p2p.hold
-        systemctl start k230-miracast >/dev/null 2>&1
-        wait_active k230-miracast || { say "✗ k230-miracast 起不来"; exit 1; }
+        # 2026-11-10: Miracast 按钮 -> GO-negotiation 档 (海奇形态)
+        systemctl start k230-miracast-goneg >/dev/null 2>&1
+        wait_active k230-miracast-goneg || { say "✗ k230-miracast-goneg 起不来"; exit 1; }
         wait_7236 || { say "✗ :7236 没起来"; exit 1; }
         ;;
     carplay|carlife)
@@ -138,7 +139,7 @@ esac
 ok=0
 case "$MODE" in
     miracast)
-        active k230-miracast && ss -lnt 2>/dev/null | grep -q ':7236 ' && ok=1 ;;
+        active k230-miracast-goneg && ss -lnt 2>/dev/null | grep -q ':7236 ' && ok=1 ;;
     carlife)
         active k230-shared-ap && active k230-carlife-wifi && ok=1 ;;
     airplay)

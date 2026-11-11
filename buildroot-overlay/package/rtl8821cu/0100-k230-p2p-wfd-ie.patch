@@ -1,0 +1,72 @@
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -5356,6 +5356,46 @@
+ 	return 0;
+ }
+ #else
++#ifdef CONFIG_P2P
++/* K230 (2026-11-09): 上游 wpa_supplicant (cfg80211) 把 P2P IE / WFD IE 放在
++ * "额外 IE" 里 (start_ap 的 beacon_ies / proberesp_ies), 而原厂 start_ap 只把
++ * settings->beacon.head/tail 交给 rtw_add_beacon() ⇒ 这些 IE 全被丢掉。
++ * 后果: beacon / probe-resp 里没有 WFD IE ⇒ 手机「无线投屏」列表看不到本机;
++ * P2P IE 也只在驱动自己判定 GO 角色时才追加。
++ * 这里把额外 IE 交给驱动自己的解析函数 (它分别取 WPS/P2P/WFD IE 存起来),
++ * 并直接把角色置成 GO (不走 rtw_p2p_enable(), 它在 CONFIG_CONCURRENT_MODE 下
++ * 要求 iface_id == sel_p2p_iface, GO 跑在第二块 vif 上会失败)。
++ * type: 0x1=beacon 0x2=probe_resp 0x4=assoc_resp
++ */
++static void rtw_k230_p2p_apply_extra_ies(struct net_device *ndev, const u8 *ies,
++					 size_t ies_len, int type)
++{
++	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
++	struct wifidirect_info *pwdinfo = &(adapter->wdinfo);
++	u32 p2p_ielen = 0;
++	u8 *p2p_ie;
++
++	if (!ies || !ies_len)
++		return;
++
++	p2p_ie = rtw_get_p2p_ie((u8 *)ies, ies_len, NULL, &p2p_ielen);
++	pr_info("K230P2P: extra ies type=%d len=%zu p2p_ielen=%u\n",
++		type, ies_len, p2p_ielen);
++
++	if (type == 0x1 && p2p_ie && p2p_ielen > 0) {
++		rtw_p2p_set_role(pwdinfo, P2P_ROLE_GO);
++		rtw_p2p_set_state(pwdinfo, P2P_STATE_GONEGO_OK);
++		pwdinfo->intent = 15;
++#ifdef CONFIG_IOCTL_CFG80211
++		adapter_wdev_data(adapter)->p2p_enabled = _TRUE;
++#endif
++		adapter->stapriv.expire_to = 3;
++	}
++
++	rtw_cfg80211_set_mgnt_wpsp2pie(ndev, (char *)ies, ies_len, type);
++}
++#endif /* CONFIG_P2P */
++
+ static int cfg80211_rtw_start_ap(struct wiphy *wiphy, struct net_device *ndev,
+ 		struct cfg80211_ap_settings *settings)
+ {
+@@ -5364,6 +5404,9 @@
+ 
+ 	RTW_INFO(FUNC_NDEV_FMT" hidden_ssid:%d, auth_type:%d\n", FUNC_NDEV_ARG(ndev),
+ 		settings->hidden_ssid, settings->auth_type);
++	pr_info("K230P2P: start_ap enter head=%zu tail=%zu bies=%zu pries=%zu\n",
++		settings->beacon.head_len, settings->beacon.tail_len,
++		settings->beacon.beacon_ies_len, settings->beacon.proberesp_ies_len);
+ 
+ 	if (rtw_cfg80211_sync_iftype(adapter) != _SUCCESS) {
+ 		ret = -ENOTSUPP;
+@@ -5391,6 +5434,12 @@
+ 	adapter->mlmeextpriv.mlmext_info.hidden_ssid_mode = settings->hidden_ssid;
+ 	ret = rtw_add_beacon(adapter, settings->beacon.head, settings->beacon.head_len,
+ 		settings->beacon.tail, settings->beacon.tail_len);
++#ifdef CONFIG_P2P
++	rtw_k230_p2p_apply_extra_ies(ndev, settings->beacon.beacon_ies,
++		settings->beacon.beacon_ies_len, 0x1);
++	rtw_k230_p2p_apply_extra_ies(ndev, settings->beacon.proberesp_ies,
++		settings->beacon.proberesp_ies_len, 0x2);
++#endif
+ 
+ 	if (settings->ssid && settings->ssid_len) {
+ 		WLAN_BSSID_EX *pbss_network = &adapter->mlmepriv.cur_network.network;
